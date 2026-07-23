@@ -54,18 +54,23 @@ a new slot.
 
 ```
 src/
-  status_list.rs   StatusList struct, entry -> field mapping, Poseidon2 root, Display
-  committee.rs     Committee anchor, make_proof (prover), verify_proof (4 checks)
-  main.rs          demo: setup, N updates rotating the t signers, 2 security tests
+  status_list.rs   StatusList struct, entry -> field mapping, Poseidon2 root, wire format
+  committee.rs     Committee anchor, sign_and_prove (prover), verify_proof (4 checks)
+  params.rs        demo parameters (SLOT, N_MEMBERS, T, N_UPDATES, KEY_SLOTS, LOG_INV_RATE)
+  mem.rs           VmRSS / VmHWM probes
+  stats.rs         descriptive statistics for the benchmark records
+  main.rs          combined demo: setup, N updates, 2 security tests, BENCH record
+  bin/prover.rs    split deployment: signs and aggregates, writes artifacts, never verifies
+  bin/verifier.rs  split deployment: verify-only, calls setup_verifier() alone
 examples/
   footprint.rs     RAM cost of setup_prover vs setup_verifier
 docs/
   committee-status-list.md   design rationale
-benchmark.sh       multi-run benchmark (host stats + Raspberry CM4 projection)
+benchmark.sh       reproducible multi-run benchmark (env capture, tidy CSV, CI95)
 ```
 
-The demo constants live at the top of `src/main.rs`:
-`SLOT`, `N_MEMBERS`, `T`, `N_UPDATES`, `LOG_INV_RATE`.
+The demo constants live in `src/params.rs`. The `verifier` binary deliberately
+uses none of them: everything it needs comes from the committee anchor it loads.
 
 ---
 
@@ -76,9 +81,11 @@ All dependencies are **git-pinned** (no vendored clones):
 - `lean-multisig`, `backend` — from `leanEthereum/leanVM` at a fixed revision.
   leanVM ships its own field/hash backend and **does not depend on Plonky3**, so
   the whole tree resolves reproducibly.
-- `rand`, `sha3`, `postcard` — from crates.io.
+- `rand`, `sha3`, `postcard`, `serde` — from crates.io.
 
-`Cargo.lock` is committed; keep it to reproduce the exact build.
+`Cargo.lock` is currently listed in `.gitignore`. Since the leanVM dependencies
+are pinned by revision but their transitive tree is not, committing the lockfile
+is what makes a build reproducible — `benchmark.sh` warns when it is missing.
 
 `.cargo/config.toml` sets a large `RUST_MIN_STACK` (the prover uses a very deep
 stack) and `target-cpu=native`.
@@ -124,39 +131,146 @@ cargo run --release --example footprint -- prover   # or: verifier | none
 
 ---
 
+## Split deployment
+
+The demo above does everything in one process. In practice the two roles have
+very different costs, so they ship as two binaries:
+
+```sh
+cargo run --release --bin prover                # writes ./artifacts
+cargo run --release --bin verifier              # reads ./artifacts, exits 0 if all expectations hold
+```
+
+Both take the artifact directory as an optional first argument. The prover must
+run first — it produces `anchor.bin`, which the verifier needs.
+
+```
+artifacts/
+  anchor.bin           the committee: N public keys + threshold t. The trust anchor.
+  update-NN.bin        legitimate updates. The verifier MUST accept them.
+  attack-tampered.bin  tampered list carrying a valid proof of a different list.
+  attack-outsider.bin  quorum of keys outside the committee.
+```
+
+The name prefixes are the contract: `update-*` must be accepted, `attack-*` must
+be rejected. The verifier checks both and exits non-zero if either expectation is
+violated, so it drops into a script or CI:
+
+```sh
+cargo run --release --bin prover && cargo run --release --bin verifier
+```
+
+**Why bother:** a verify-only process calls `setup_verifier()` and nothing else.
+It skips the arena and the DFT twiddles, and — more importantly — it never runs
+`zk_alloc::enable_arena()`, which sets `M_TRIM_THRESHOLD = -1` so that a *prover*
+process never returns freed memory to the OS. The measured effect:
+
+| | prover | verifier | combined demo |
+|---|---|---|---|
+| resident after setup | 791 MB | **679 MB** | 746 MB |
+| peak RSS (median of runs) | 1088 MB | **696 MB** | 1042 MB |
+
+**33% less peak RAM** for a node that only verifies. The more useful property is
+the *slope*: the verifier's RSS is flat in the number of verifications (679 → 680
+MB over 10), while the prover's climbs monotonically and never comes back down.
+
+Since the verifier's only input is the anchor plus the published structure, the
+artifact directory can simply be copied to the target device:
+
+```sh
+scp -r artifacts/ pi@cm4:~/ && ssh pi@cm4 ./verifier ~/artifacts
+```
+
+Each `prover` run generates a **fresh random committee**, so artifacts from
+different runs are not interchangeable — start from a clean directory.
+
+---
+
 ## Benchmark
 
 ```sh
-./benchmark.sh                      # defaults: RUNS=10, WARMUP=1
+./benchmark.sh                                    # defaults: RUNS=20, WARMUP=2
 RUNS=30 WARMUP=3 ./benchmark.sh
-CM4_LOW=8 CM4_HIGH=15 ./benchmark.sh
+TARGETS="prover verifier" RUNS=50 ./benchmark.sh
+PROJECT_CM4=1 ./benchmark.sh                      # adds an explicitly-labelled ESTIMATE
 ```
 
-It builds `--release`, runs the binary `RUNS` times, parses the single-line
-`BENCH` record, prints min/median/mean/stddev/max per metric, saves a CSV, and
-adds a **linear projection** to a Raspberry Pi CM4. For real CM4 numbers, run
-`benchmark.sh` natively on the board (an aarch64/NEON path exists). The projection
-is an estimate, not a measurement. It warns if the CPU governor is not
-`performance`.
+It measures the three binaries independently — `prover`, `verifier` and
+`combined` (the single-process demo) — and writes to `bench-<timestamp>/`:
+
+| file | contents |
+|---|---|
+| `env.txt` | CPU, governor, turbo/SMT, THP, ASLR, toolchain, git commit, pinned leanVM rev, parameters — the reproducibility appendix |
+| `samples.csv` | tidy raw data, one row per individual update/verification |
+| `runs.csv` | one row per process run |
+| `summary.csv` / `.txt` | aggregates: n, min, q1, median, q3, max, mean, sd, CV%, CI95 |
+
+Design points that matter if you quote these numbers:
+
+- The verifier is measured against a **fixed artifact corpus**, generated once.
+  Regenerating it per run would fold the prover's variance into the verifier's.
+- The unit of analysis for per-update metrics is the **per-run median**
+  (n = RUNS). Updates inside one process share allocator and cache state and are
+  not independent; `samples.csv` keeps every raw observation if you prefer to
+  report the pooled distribution.
+- Quantiles use linear interpolation (type 7); CI95 uses Student's *t* with
+  df = n−1.
+- Peak RSS is cross-checked against `/usr/bin/time -v`, independently of the
+  process's own `/proc/self/status` reading.
+- The script **refuses to print any timing** if a run reports a violated security
+  expectation.
+- It warns when the CPU governor is not `performance`, when `Cargo.lock` is
+  missing, and when GNU `time` is unavailable.
+
+The CM4 projection is opt-in and is a **linear extrapolation, not a
+measurement**. For real numbers, run `benchmark.sh` natively on the board (an
+aarch64/NEON path exists).
 
 ### Reference numbers
 
 Indicative, `N=10, t=7`, host **AMD Ryzen 7 4800H** (8c/16t, governor
-`schedutil` → slightly noisy):
+`schedutil` → slightly noisy). Medians across runs:
 
-| metric | value |
+| metric | prover | verifier | combined |
+|---|---|---|---|
+| setup (once/process) | ~5.3 s | ~5.2 s | ~5.2 s |
+| sign (7 XMSS) / update | ~50 ms | — | ~50 ms |
+| **prove / update** | **~297 ms** | — | ~286 ms |
+| verify / update | — | **~30 ms** | ~31 ms |
+| proof size | ~170 KB | ~170 KB | ~170 KB |
+| resident after setup | 791 MB | **679 MB** | 746 MB |
+| peak RSS (VmHWM) | 1088 MB | **696 MB** | 1042 MB |
+
+Where the memory actually goes — measured with `--example footprint`:
+
+| component | RSS |
 |---|---|
-| setup (once/process) | ~5.3 s (`setup_verifier` ~5.2 s dominates; prover extra ~60 ms) |
-| sign (7 XMSS) / update | ~47 ms |
-| **prove / update** | **~287 ms** (per-update range ~240–335 ms) |
-| verify / update | ~31 ms |
-| proof size | ~165 KB |
-| RAM resident after setup | ~730–758 MB |
-| peak RAM (VmHWM) | ~1029–1058 MB |
+| aggregation bytecode (`setup_verifier`, **retained**) | ~678 MB |
+| + arena + DFT twiddles (`setup_prover`) | ~783 MB |
+| + proving working set, 10 updates @ t=7 | ~1085 MB |
+| status list + committee + proof bytes | **< 1 MB** |
+
+The ~678 MB is `Bytecode.instructions_multilinear`, the multilinear encoding of
+leanVM's unrolled aggregation program. It is *retained*, not a transient
+compilation cost, so there is no fork-and-drop trick — and it is **not** driven
+by `MAX_XMSS_AGGREGATED` (that constant only appears in asserts), so it cannot be
+shrunk from this repository. Treat it as a fixed floor for anyone who verifies.
 
 **Scaling:** prove-time and RAM grow with **`t`** (more XMSS verifications in the
-circuit → bigger trace → bigger WHIR commitment + FFT buffers; in power-of-two
-steps due to trace padding), **not** with the number of updates. Setup cost and
+circuit → bigger trace → bigger WHIR commitment + FFT buffers), **not** with the
+number of updates. The growth is a **step function**: the trace is padded to a
+power of two, so `t = 5..=8` all cost the same. Measured, `t=7` vs `t=8` vs `t=4`:
+
+| t | prove / update | peak RSS | proof |
+|---|---|---|---|
+| 4 | 206 ms | 956 MB | 146 878 B |
+| 7 | 298 ms | 1055 MB | 169 624 B |
+| 8 | 298 ms | 1074 MB | 169 690 B |
+
+So `t=7` pays for a quorum of 8 without using it: raising the threshold to 8
+costs nothing in prove time, proof size or RAM (only signing, which is outside
+the circuit, grows linearly in `t`). Dropping to `t=4` cuts prove time by 31% but
+peak RSS by only 9%, because the ~678 MB floor dominates. Setup cost and
 resident-after-setup are independent of `t`.
 
 **Raspberry Pi CM4 (BCM2711, 2 GB)** — linear projection x8..x15 (estimate):
@@ -168,11 +282,18 @@ board** (~1 GB free for the OS); a **1 GB board is excluded**. RAM is the gate.
 
 ## Security tests
 
-`main.rs` ends with two attacks that **must be rejected**:
+Two attacks that **must be rejected**:
 
 - **A — tampered list + valid proof of another list:** rejected by the
   `message == status_list_root` binding (check 2).
 - **B — proof from signers outside the committee:** rejected by the
   membership check (check 1).
 
-Both print `rejected = true` and the run reports `security OK: true`.
+In the combined demo both print `rejected = true` and the run reports
+`security OK: true`. In the split deployment the same two attacks are written by
+`prover` as `attack-*.bin` and rejected by `verifier`, which exits non-zero if
+either is accepted — so the negative tests are checked by a process that knows
+nothing but the anchor.
+
+Not covered: a **sub-threshold quorum** (check 3), i.e. `t-1` legitimate members
+signing the correct list. That path has no test.

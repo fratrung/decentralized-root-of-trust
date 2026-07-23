@@ -9,7 +9,11 @@
 
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::{Committee, make_proof, verify_proof};
+use decentralized_root_of_trust::committee::{Committee, make_proof, sign_and_prove, verify_proof};
+use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::params::{
+    KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
+};
 use decentralized_root_of_trust::status_list::{
     Algorithms, StatusList, hash_any, status_list_root_fe,
 };
@@ -19,32 +23,6 @@ use lean_multisig::{
 };
 use rand::RngExt;
 use rand::rngs::ThreadRng;
-
-const SLOT: u32 = 43;
-const N_MEMBERS: usize = 10;
-const T: usize = 7;
-const N_UPDATES: usize = 10;
-const LOG_INV_RATE: usize = 2;
-
-fn status_mb(field: &str) -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| {
-                l.strip_prefix(field)
-                    .map(|v| v.trim().trim_end_matches(" kB").trim().to_string())
-            })
-        })
-        .and_then(|kb| kb.parse::<u64>().ok())
-        .map(|kb| kb / 1024)
-        .unwrap_or(0)
-}
-fn rss_now_mb() -> u64 {
-    status_mb("VmRSS:")
-}
-fn peak_rss_mb() -> u64 {
-    status_mb("VmHWM:")
-}
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -77,7 +55,7 @@ fn run_flow(
     signers: &[usize],
     list: Vec<[u8; 32]>,
     slot: u32,
-    committee: Committee,
+    committee: &Committee,
     rng: &mut ThreadRng,
 ) -> (StatusList, Duration, Duration, Duration) {
     let message = status_list_root_fe(&list);
@@ -113,16 +91,14 @@ fn make_signed_proof(
     slot: u32,
     rng: &mut ThreadRng,
 ) -> Vec<u8> {
-    let message = status_list_root_fe(list);
-    let mut raws = Vec::new();
-    for &i in signers {
-        let (sk, pk) = &keypairs[i];
-        raws.push((
-            pk.clone(),
-            xmss_sign(rng, sk, &message, slot).expect("signing failed"),
-        ));
-    }
-    make_proof(raws, message, slot, LOG_INV_RATE)
+    sign_and_prove(
+        keypairs,
+        signers,
+        status_list_root_fe(list),
+        slot,
+        LOG_INV_RATE,
+        rng,
+    )
 }
 
 fn main() {
@@ -144,9 +120,11 @@ fn main() {
     let mut keypairs: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..N_MEMBERS {
         let seed: [u8; 32] = rng.random();
-        keypairs.push(xmss_key_gen(seed, SLOT, SLOT + 64, false).expect("keygen failed"));
+        keypairs.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("keygen failed"));
     }
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
+    // The fixed trust anchor, built once and shared by every verification below.
+    let committee = Committee::new(members, T);
     println!("committee N={N_MEMBERS} t={T}; {N_UPDATES} updates rotating the signers\n");
 
     // ---- N_UPDATES updates, rotating the `t` signers over the `N` members ----
@@ -168,7 +146,7 @@ fn main() {
             &signers,
             list.clone(),
             slot,
-            Committee::new(members.clone(), T),
+            &committee,
             &mut rng,
         );
         let rss = rss_now_mb();
@@ -202,18 +180,18 @@ fn main() {
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION")); // row not authorized by the committee
     let sl_tampered = StatusList::new(Algorithms::WotsXmss, tampered, honest_slot, good_proof);
-    let tamper_rejected = !verify_proof(Committee::new(members.clone(), T), &sl_tampered);
+    let tamper_rejected = !verify_proof(&committee, &sl_tampered);
 
     // B) proof from signers OUTSIDE the committee (keys not in it).
     let mut outsiders: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..T {
         let seed: [u8; 32] = rng.random();
-        outsiders.push(xmss_key_gen(seed, SLOT, SLOT + 64, false).expect("outsider keygen"));
+        outsiders.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("outsider keygen"));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
     let out_proof = make_signed_proof(&outsiders, &quorum, &out_list, SLOT, &mut rng);
     let sl_outsider = StatusList::new(Algorithms::WotsXmss, out_list, SLOT, out_proof);
-    let outsider_rejected = !verify_proof(Committee::new(members.clone(), T), &sl_outsider);
+    let outsider_rejected = !verify_proof(&committee, &sl_outsider);
 
     let sec_ok = tamper_rejected && outsider_rejected;
 

@@ -1,8 +1,10 @@
 use std::fmt;
 
 use backend::*;
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
+#[derive(Serialize, Deserialize)]
 pub enum Algorithms {
     WotsXmss,
 }
@@ -39,6 +41,7 @@ pub fn status_list_root_fe(list: &[[u8; 32]]) -> [KoalaBear; 8] {
     acc
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct StatusList {
     pub alg: Algorithms,
     status_list: Vec<[u8; 32]>,
@@ -80,6 +83,25 @@ impl StatusList {
     /// or `setup_verifier()` MUST be called first.
     pub fn proof(&self) -> Result<lean_multisig::SingleMessageAggregateSignature, String> {
         postcard::from_bytes(&self.zk_proof).map_err(|e| format!("proof not deserializable: {e}"))
+    }
+
+    /// Wire encoding of the published object — this is what would go into the DHT.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("status list serialization failed")
+    }
+
+    /// Inverse of [`StatusList::to_bytes`].
+    ///
+    /// Rejects trailing bytes, so the encoding is canonical: a published object
+    /// has exactly one valid byte representation. That matters as soon as the
+    /// structure is content-addressed, as it is in a DHT.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let (value, rest) = postcard::take_from_bytes::<Self>(bytes)
+            .map_err(|e| format!("status list not deserializable: {e}"))?;
+        if !rest.is_empty() {
+            return Err(format!("{} trailing byte(s) after status list", rest.len()));
+        }
+        Ok(value)
     }
 }
 
