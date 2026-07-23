@@ -1,0 +1,7 @@
+# Required by the leanVM prover: proof generation uses a very deep stack
+# (leanVM sets the same value in its own .cargo/config).
+[env]
+RUST_MIN_STACK = "536870912"
+
+[target.'cfg(all())']
+rustflags = ["-C", "target-cpu=native"]
