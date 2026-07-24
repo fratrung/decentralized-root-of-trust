@@ -30,15 +30,25 @@ pub fn entry_to_field(entry: &[u8; 32]) -> [KoalaBear; 8] {
     poseidon16_compress_pair(&poseidon16_compress(lo), &poseidon16_compress(hi))
 }
 
-/// Poseidon2 "hash-tree root" of the status list: a fold over its entries.
-/// The output is already `[F; 8]`, i.e. the native message format of leanVM's
-/// XMSS. This is the message the committee signs and the proof is bound to.
-pub fn status_list_root_fe(list: &[[u8; 32]]) -> [KoalaBear; 8] {
+/// Poseidon2 "hash-tree root" of the status list *and its version*: a fold over
+/// the entries, closed by one more compression that mixes in the version. The
+/// output is already `[F; 8]`, i.e. the native message format of leanVM's XMSS.
+/// This is the message the committee signs and the proof is bound to.
+///
+/// Folding the version in (Option B) is what makes the cleartext `version` field
+/// trustworthy: a proof attests to `(list, version)` jointly, so the version
+/// cannot be altered after the fact without breaking verification. The version is
+/// split into 16-bit limbs so each stays below the KoalaBear modulus — a bare
+/// `u32` can exceed it and alias two distinct versions to the same field value.
+pub fn status_list_root_fe(list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
     let mut acc = [KoalaBear::ZERO; 8];
     for e in list {
         acc = poseidon16_compress_pair(&acc, &entry_to_field(e));
     }
-    acc
+    let mut ver = [KoalaBear::ZERO; 8];
+    ver[0] = KoalaBear::from_u32(version & 0xFFFF);
+    ver[1] = KoalaBear::from_u32(version >> 16);
+    poseidon16_compress_pair(&acc, &ver)
 }
 
 #[derive(Serialize, Deserialize)]

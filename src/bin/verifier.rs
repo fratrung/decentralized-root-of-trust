@@ -12,13 +12,19 @@
 //! Files named `update-*` must verify; files named `attack-*` must be rejected.
 //! Exits non-zero if any expectation is violated.
 //!
+//! It then runs the DHT freshness layer: `select_freshest` picks the newest valid
+//! record, and a persistent high-water mark (`verifier-highwater.state`, keyed to
+//! the anchor; override with `VERIFIER_STATE`) refuses any replay of an older but
+//! still-valid record. That mark is local verifier state — never publish it.
+//!
 //! Usage: cargo run --release --bin verifier -- [dir]      (default ./artifacts)
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::{Committee, verify_proof};
+use decentralized_root_of_trust::committee::{Committee, select_freshest, verify_proof};
+use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::stats::Series;
 use decentralized_root_of_trust::status_list::StatusList;
@@ -131,6 +137,71 @@ fn main() -> ExitCode {
                 "rejected"
             }
         );
+    }
+
+    // ---- DHT freshness layer + persistent anti-rollback ----
+    // Two stages that compose: crypto first, freshness second.
+    //   1. `select_freshest` picks the newest *valid* record among the ones a
+    //      lookup returned (updates + a hostile inflated-version forgery).
+    //   2. the high-water mark refuses anything not strictly newer than what this
+    //      verifier has already accepted, across restarts.
+    // Stage 2 is what stops a replay: an old status list still verifies (that is
+    // stateless), so without the mark a peer could serve it and re-grant access a
+    // node had lost. The mark is local verifier state, keyed to this anchor.
+    println!("\nDHT freshness + anti-rollback");
+    let state_path = std::env::var_os("VERIFIER_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("verifier-highwater.state"));
+    let mut hwm = HighWaterMark::load(&state_path, &anchor);
+    match hwm.current() {
+        Some(v) => println!("  high-water mark (persisted): version {v}"),
+        None => println!("  high-water mark: none yet for this committee"),
+    }
+
+    let mut candidates: Vec<Vec<u8>> = artifacts(dir, "update-")
+        .iter()
+        .map(|p| std::fs::read(p).expect("cannot read update"))
+        .collect();
+    if let Ok(forgery) = std::fs::read(dir.join("attack-version.bin")) {
+        candidates.push(forgery); // a hostile peer advertising a fake-fresh version
+    }
+    match select_freshest(&committee, &candidates) {
+        Some(sl) => match hwm.try_advance(sl.version()) {
+            Decision::Accepted => {
+                println!("  selected version {} -> accepted, high-water advanced", sl.version())
+            }
+            Decision::Stale(hw) => println!(
+                "  selected version {} -> not newer than high-water {}, nothing to do",
+                sl.version(),
+                hw
+            ),
+        },
+        None => {
+            println!("  no valid record among {} candidates <- BUG", candidates.len());
+            failures += 1;
+        }
+    }
+
+    // Rollback attack: a hostile peer replays an old but validly signed record. It
+    // passes verification (stateless) yet must be refused as stale by the mark.
+    if hwm.current().is_some()
+        && let Ok(stale) = std::fs::read(dir.join("update-01.bin"))
+        && let Some(sl) = select_freshest(&committee, std::slice::from_ref(&stale))
+    {
+        match hwm.try_advance(sl.version()) {
+            Decision::Stale(hw) => println!(
+                "  rollback: replayed version {} refused (high-water {})",
+                sl.version(),
+                hw
+            ),
+            Decision::Accepted => {
+                println!(
+                    "  rollback: replayed version {} ACCEPTED <- SECURITY FAILURE",
+                    sl.version()
+                );
+                failures += 1;
+            }
+        }
     }
 
     let verify = Series::new(verify_ts.iter().map(|d| ms(*d)));

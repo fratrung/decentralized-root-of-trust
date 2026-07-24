@@ -80,8 +80,12 @@ fn main() {
     for i in 0..N_UPDATES {
         list.push(hash_any(rng.random::<[u8; 32]>()));
         let signers: Vec<usize> = (0..T).map(|j| (i + j) % N_MEMBERS).collect();
+        // `slot` is the XMSS epoch (bounded by KEY_SLOTS); `version` is the
+        // application counter, bound into the signed message so the cleartext
+        // field cannot be forged. Independent by design.
         let slot = SLOT + i as u32;
-        let message = status_list_root_fe(&list);
+        let version = i as u32;
+        let message = status_list_root_fe(&list, version);
 
         // Signing and proving are timed apart: signing is `t` plain XMSS
         // signatures outside the circuit and scales linearly in `t`, proving is
@@ -102,7 +106,7 @@ fn main() {
         let proof = make_proof(raws, message, slot, LOG_INV_RATE);
         let prove_time = t_prove.elapsed();
 
-        let sl = StatusList::new(Algorithms::WotsXmss, list.clone(), slot, proof);
+        let sl = StatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
         let bytes = sl.to_bytes();
         write(outdir, &format!("update-{i:02}.bin"), &bytes);
 
@@ -113,10 +117,11 @@ fn main() {
             .map(|&j| char::from(b'A' + j as u8))
             .collect();
         println!(
-            "  update {:2}/{}  signers {}  slot {}  sign={:>7.1?}  prove={:>8.1?}  {} B  RAM={} MB",
+            "  update {:2}/{}  signers {}  v{}  slot {}  sign={:>7.1?}  prove={:>8.1?}  {} B  RAM={} MB",
             i + 1,
             N_UPDATES,
             who,
+            version,
             slot,
             sign_time,
             prove_time,
@@ -142,14 +147,15 @@ fn main() {
     // ---- Forgeries the verifier must reject. Built here only because this is
     // the process that owns signing keys; conceptually these are the attacker's.
     let attack_slot = SLOT + N_UPDATES as u32;
+    let attack_version = N_UPDATES as u32;
     let quorum: Vec<usize> = (0..T).collect();
 
     // A) a valid proof of the honest list, attached to a list with an extra row.
-    //    Defeated by check 2 (message == status_list_root).
+    //    Defeated by check 2 (message binds the list).
     let good_proof = sign_and_prove(
         &keypairs,
         &quorum,
-        status_list_root_fe(&list),
+        status_list_root_fe(&list, attack_version),
         attack_slot,
         LOG_INV_RATE,
         &mut rng,
@@ -159,7 +165,7 @@ fn main() {
     write(
         outdir,
         "attack-tampered.bin",
-        &StatusList::new(Algorithms::WotsXmss, tampered, attack_slot, good_proof).to_bytes(),
+        &StatusList::new(Algorithms::WotsXmss, tampered, attack_version, good_proof).to_bytes(),
     );
 
     // B) a perfectly valid quorum of keys that are NOT in the committee.
@@ -173,7 +179,7 @@ fn main() {
     let out_proof = sign_and_prove(
         &outsiders,
         &quorum,
-        status_list_root_fe(&out_list),
+        status_list_root_fe(&out_list, 0),
         SLOT,
         LOG_INV_RATE,
         &mut rng,
@@ -181,7 +187,27 @@ fn main() {
     write(
         outdir,
         "attack-outsider.bin",
-        &StatusList::new(Algorithms::WotsXmss, out_list, SLOT, out_proof).to_bytes(),
+        &StatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof).to_bytes(),
+    );
+
+    // C) a valid proof of (list, version) re-labelled with an inflated version, as
+    //    a hostile DHT peer would do to look freshest. Defeated by check 2 (message
+    //    binds the version). It is also the decoy the verifier's freshness
+    //    selection must try first and then skip.
+    let spoof_slot = SLOT + N_UPDATES as u32 + 1;
+    let signed_version = (N_UPDATES - 1) as u32; // the true latest
+    let versioned_proof = sign_and_prove(
+        &keypairs,
+        &quorum,
+        status_list_root_fe(&list, signed_version),
+        spoof_slot,
+        LOG_INV_RATE,
+        &mut rng,
+    );
+    write(
+        outdir,
+        "attack-version.bin",
+        &StatusList::new(Algorithms::WotsXmss, list.clone(), 999_999, versioned_proof).to_bytes(),
     );
 
     let (sg_min, sg_med, sg_max) = sign.min_med_max();
@@ -192,7 +218,7 @@ fn main() {
         b[b.len() / 2]
     };
 
-    println!("\n{N_UPDATES} updates + 2 forgeries written");
+    println!("\n{N_UPDATES} updates + 3 forgeries written");
     println!("setup_prover           : {setup_time:.2?}");
     println!("sign  min/med/max      : {sg_min:.1} / {sg_med:.1} / {sg_max:.1} ms");
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");

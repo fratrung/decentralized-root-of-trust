@@ -44,22 +44,29 @@ host-specific: benchmark numbers are not portable across machines.
 One data flow, three binaries over it:
 
 ```
-Vec<[u8;32]> --status_list_root_fe--> [KoalaBear;8] --t x xmss_sign--> t sigs
+(Vec<[u8;32]>, version) --status_list_root_fe--> [KoalaBear;8] --t x xmss_sign--> t sigs
     --aggregate_single_message_signatures--> SNARK --postcard--> StatusList.zk_proof
 ```
 
 Library:
 - `src/status_list.rs` — the published object and its digest. `entry_to_field`
-  maps each 32-byte entry to `[F;8]`; `status_list_root_fe` folds them into the
-  root. **The fold is a Merkle–Damgård chain, not a tree**, despite the "root"
-  naming: `acc = compress_pair(acc, entry(e))` from `[0;8]`. Cost is O(n)
-  sequential and there are no per-entry inclusion proofs. It allocates nothing
-  on the heap, so a large list could be streamed rather than held in RAM.
-- `src/committee.rs` — the anchor, `sign_and_prove`/`make_proof`, and the whole
-  of `verify_proof`.
+  maps each 32-byte entry to `[F;8]`; `status_list_root_fe(list, version)` folds
+  the entries into the root and then closes with one more compression that mixes
+  in the `version` (16-bit limbs, injective). **The fold is a Merkle–Damgård
+  chain, not a tree**, despite the "root" naming: `acc = compress_pair(acc,
+  entry(e))` from `[0;8]`. Cost is O(n) sequential and there are no per-entry
+  inclusion proofs. It allocates nothing on the heap, so a large list could be
+  streamed rather than held in RAM.
+- `src/committee.rs` — the anchor, `sign_and_prove`/`make_proof`, the whole of
+  `verify_proof`, and `select_freshest` (the DHT-layer freshness selection:
+  newest declared version first, verify, fall back on failure).
 - `src/params.rs` — demo parameters (`SLOT`, `N_MEMBERS`, `T`, `N_UPDATES`,
   `KEY_SLOTS`, `LOG_INV_RATE`), shared by `main.rs` and `prover`. The `verifier`
   deliberately imports none of them.
+- `src/freshness.rs` — `HighWaterMark`, the persistent anti-rollback gate. Strict
+  monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
+  committee rotation resets it, persisted with a write-then-rename. Lives *outside*
+  `verify_proof`, which stays pure.
 - `src/mem.rs`, `src/stats.rs` — RSS probes and descriptive statistics shared by
   every binary.
 
@@ -104,8 +111,10 @@ signed this message at this slot". Every link to trust is a cleartext check
 outside the circuit, in `verify_proof` (`src/committee.rs`):
 
 1. every signer ∈ committee — membership against the fixed anchor;
-2. `agg.info.message == status_list_root_fe(list)` — **the critical binding**;
-   without it a valid proof of a *different* list can be attached to this one;
+2. `agg.info.message == status_list_root_fe(list, version)` — **the critical
+   binding**; it ties the proof to both the list (without it a valid proof of a
+   *different* list can be attached) and the `version` (without it the cleartext
+   version field is forgeable — see the versioning note below);
 3. `pubkeys.len() >= t` — quorum;
 4. the SNARK verifies.
 
@@ -120,17 +129,25 @@ silently exploitable and the current tests would still pass for check 3.
 ### Known gaps in the model (deliberate, not bugs to fix silently)
 
 - Verification is **stateless**: an old but legitimate (list, proof) pair verifies
-  forever. There is no rollback/replay protection.
-- `StatusList::version` and `StatusList::alg` are never verified — `version()` is
-  not called anywhere, `alg` only appears in `Display`. In particular
-  `agg.info.slot` is never compared against `version()`.
+  forever. Rollback is stopped one layer up, not by `verify_proof`:
+  `select_freshest` picks the newest valid record, then `HighWaterMark`
+  (`freshness.rs`) refuses anything not strictly newer than the last accepted
+  version, persisted across restarts. The mark is per-object; the demo carries a
+  single status list so it keeps a single mark in the artifact dir. Committee
+  rotation (the anchor changing) is a separate, deferred protocol.
+- `StatusList::version` **is** verified now: it is folded into the signed message
+  (Option B), so `verify_proof` recomputes `status_list_root_fe(list, version())`
+  and a tampered version fails check 2. `StatusList::alg` is still never verified
+  (only appears in `Display`). The XMSS `slot` is decoupled from `version` by
+  design and is not compared against it.
 - `StatusList::proof()` decodes the *inner leanVM aggregate* with
   `postcard::from_bytes`, which accepts trailing bytes. (The *outer* wire format,
   `StatusList::from_bytes` / `Committee::from_bytes`, is canonical — it rejects
   them.) leanVM offers `SingleMessageAggregateSignature::from_bytes` for the
   inner one.
-- Only checks 1 and 2 have security tests; a sub-threshold quorum (check 3) is
-  untested.
+- Checks 1 and 2 have security tests (attacks A/B for the list binding and
+  membership, attack C for the version binding). A sub-threshold quorum (check 3)
+  and a cross-time rollback (an old but validly signed version) are untested.
 
 ## leanVM constraints that shape this code
 

@@ -55,10 +55,12 @@ fn run_flow(
     signers: &[usize],
     list: Vec<[u8; 32]>,
     slot: u32,
+    version: u32,
     committee: &Committee,
     rng: &mut ThreadRng,
 ) -> (StatusList, Duration, Duration, Duration) {
-    let message = status_list_root_fe(&list);
+    // The signed message binds both the list and its version (Option B).
+    let message = status_list_root_fe(&list, version);
 
     let t_sign = Instant::now();
     let mut raws: Vec<(XmssPublicKey, XmssSignature)> = Vec::new();
@@ -73,7 +75,7 @@ fn run_flow(
     let zk_proof = make_proof(raws, message, slot, LOG_INV_RATE);
     let prove_time = t_prove.elapsed();
 
-    let status_list = StatusList::new(Algorithms::WotsXmss, list, slot, zk_proof);
+    let status_list = StatusList::new(Algorithms::WotsXmss, list, version, zk_proof);
 
     let t_verify = Instant::now();
     let ok = verify_proof(committee, &status_list);
@@ -83,18 +85,21 @@ fn run_flow(
     (status_list, sign_time, prove_time, verify_time)
 }
 
-/// Signs `list` with `signers` at `slot` and returns just the proof bytes.
+/// Signs `(list, version)` with `signers` at `slot` and returns just the proof
+/// bytes. `version` is bound into the message, so a proof made here is only valid
+/// for that exact version.
 fn make_signed_proof(
     keypairs: &[(XmssSecretKey, XmssPublicKey)],
     signers: &[usize],
     list: &[[u8; 32]],
     slot: u32,
+    version: u32,
     rng: &mut ThreadRng,
 ) -> Vec<u8> {
     sign_and_prove(
         keypairs,
         signers,
-        status_list_root_fe(list),
+        status_list_root_fe(list, version),
         slot,
         LOG_INV_RATE,
         rng,
@@ -140,12 +145,18 @@ fn main() {
         list.push(hash_any(rng.random::<[u8; 32]>()));
         // t signers out of N, rotating the window at each update.
         let signers: Vec<usize> = (0..T).map(|j| (i + j) % N_MEMBERS).collect();
+        // `slot` is the XMSS epoch (stateful, bounded by KEY_SLOTS); `version` is
+        // the application counter bound into the signed message. They are
+        // independent — the version keeps climbing across a future committee
+        // re-key, when the slot window would reset.
         let slot = SLOT + i as u32;
+        let version = i as u32;
         let (sl, s, p, v) = run_flow(
             &keypairs,
             &signers,
             list.clone(),
             slot,
+            version,
             &committee,
             &mut rng,
         );
@@ -156,10 +167,11 @@ fn main() {
             .map(|&j| char::from(b'A' + j as u8))
             .collect();
         println!(
-            "  update {:2}/{}  signers {}  slot {}  prove={:>8.1?}  verify={:>8.1?}  RAM={} MB  OK",
+            "  update {:2}/{}  signers {}  v{}  slot {}  prove={:>8.1?}  verify={:>8.1?}  RAM={} MB  OK",
             i + 1,
             N_UPDATES,
             who,
+            version,
             slot,
             p,
             v,
@@ -172,14 +184,16 @@ fn main() {
     }
     let updates_total = t_updates.elapsed();
 
-    // ---- SECURITY TESTS (both must be REJECTED) ----
-    // A) tampered list carrying a valid proof of a DIFFERENT list.
+    // ---- SECURITY TESTS (all must be REJECTED) ----
     let honest_slot = SLOT + N_UPDATES as u32;
+    let honest_version = N_UPDATES as u32;
     let quorum: Vec<usize> = (0..T).collect();
-    let good_proof = make_signed_proof(&keypairs, &quorum, &list, honest_slot, &mut rng);
+
+    // A) tampered list carrying a valid proof of a DIFFERENT list.
+    let good_proof = make_signed_proof(&keypairs, &quorum, &list, honest_slot, honest_version, &mut rng);
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION")); // row not authorized by the committee
-    let sl_tampered = StatusList::new(Algorithms::WotsXmss, tampered, honest_slot, good_proof);
+    let sl_tampered = StatusList::new(Algorithms::WotsXmss, tampered, honest_version, good_proof);
     let tamper_rejected = !verify_proof(&committee, &sl_tampered);
 
     // B) proof from signers OUTSIDE the committee (keys not in it).
@@ -189,11 +203,21 @@ fn main() {
         outsiders.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("outsider keygen"));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
-    let out_proof = make_signed_proof(&outsiders, &quorum, &out_list, SLOT, &mut rng);
-    let sl_outsider = StatusList::new(Algorithms::WotsXmss, out_list, SLOT, out_proof);
+    let out_proof = make_signed_proof(&outsiders, &quorum, &out_list, SLOT, 0, &mut rng);
+    let sl_outsider = StatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof);
     let outsider_rejected = !verify_proof(&committee, &sl_outsider);
 
-    let sec_ok = tamper_rejected && outsider_rejected;
+    // C) version spoof: a VALID proof of (list, version) re-labelled with a
+    //    different version. Defeated only by the version binding of check 2 —
+    //    before Option B, when `version` was cleartext-only, this was ACCEPTED.
+    let spoof_slot = SLOT + N_UPDATES as u32 + 1;
+    let signed_version = 5u32;
+    let versioned_proof =
+        make_signed_proof(&keypairs, &quorum, &list, spoof_slot, signed_version, &mut rng);
+    let sl_spoofed = StatusList::new(Algorithms::WotsXmss, list.clone(), signed_version + 1000, versioned_proof);
+    let version_rejected = !verify_proof(&committee, &sl_spoofed);
+
+    let sec_ok = tamper_rejected && outsider_rejected && version_rejected;
 
     // summary
     let rss_peak = peak_rss_mb();
@@ -202,9 +226,10 @@ fn main() {
     let (vf_min, vf_med, vf_max) = dur_stats(&verify_ts);
     let proof_med = usize_median(&proof_sizes);
 
-    println!("\n Security (expected: both REJECTED)");
+    println!("\n Security (expected: all REJECTED)");
     println!("A) tampered list + valid proof : rejected = {tamper_rejected}");
     println!("B) proof from outside signers  : rejected = {outsider_rejected}");
+    println!("C) valid proof, spoofed version: rejected = {version_rejected}");
     println!("=> security OK: {sec_ok}");
 
     println!("\n Setup (one-time per process)");
