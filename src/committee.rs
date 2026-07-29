@@ -1,7 +1,7 @@
 use backend::KoalaBear;
 use lean_multisig::{
-    XmssPublicKey, XmssSecretKey, XmssSignature, aggregate_single_message_signatures, xmss_sign,
-    verify_single_message_aggregate,
+    XmssPublicKey, XmssSecretKey, XmssSignature, aggregate_single_message_signatures,
+    verify_single_message_aggregate, xmss_sign,
 };
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ use crate::status_list::{StatusList, status_list_root_fe};
 /// The FIXED trust anchor, embedded once in every verifier — the replacement for
 /// the old single root-of-trust public key. It is the only thing a verifier must
 /// know a priori; *who* signed a given update travels inside the proof.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Committee {
     members: Vec<XmssPublicKey>,
     t: usize,

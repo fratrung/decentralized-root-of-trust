@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::committee::{Committee, make_proof, sign_and_prove};
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
-use decentralized_root_of_trust::params::{
-    KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
-};
+use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::stats::Series;
 use decentralized_root_of_trust::status_list::{
     Algorithms, StatusList, hash_any, status_list_root_fe,
@@ -39,7 +37,9 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) {
 }
 
 fn main() {
-    let outdir = std::env::args().nth(1).unwrap_or_else(|| "artifacts".into());
+    let outdir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "artifacts".into());
     let outdir = Path::new(&outdir);
     std::fs::create_dir_all(outdir).expect("cannot create output directory");
 

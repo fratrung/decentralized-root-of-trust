@@ -1,6 +1,11 @@
+pub mod atomic_slot_counter;
 pub mod committee;
 pub mod freshness;
 pub mod mem;
 pub mod params;
+pub mod snark_prover_node;
+pub mod snark_verifier_node;
 pub mod stats;
 pub mod status_list;
+pub mod signer_node;
+pub mod verifier_node;

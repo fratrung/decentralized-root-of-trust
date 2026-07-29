@@ -6,20 +6,20 @@
 pub const SLOT: u32 = 43;
 
 /// Committee size `N`.
-pub const N_MEMBERS: usize = 10;
+pub const N_MEMBERS: usize = 200;
 
 /// Threshold `t`: minimum number of distinct committee members per update.
 ///
 /// The proving trace is padded to a power of two, so `t = 5..=8` all cost the
 /// same (measured: `t=7` and `t=8` are indistinguishable in prove time, proof
 /// size and RAM; `t=4` is the next step down).
-pub const T: usize = 7;
+pub const T: usize = 128;
 
 /// Number of sequential updates the demo performs.
 ///
 /// Bounded by the keygen window below: keys are generated for
 /// `SLOT..=SLOT + KEY_SLOTS`, and the security tests consume one extra slot.
-pub const N_UPDATES: usize = 10;
+pub const N_UPDATES: usize = 20;
 
 /// Width of the XMSS slot window each committee key is generated for.
 pub const KEY_SLOTS: u32 = 64;

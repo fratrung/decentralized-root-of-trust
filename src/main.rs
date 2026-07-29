@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::committee::{Committee, make_proof, sign_and_prove, verify_proof};
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
-use decentralized_root_of_trust::params::{
-    KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
-};
+use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::status_list::{
     Algorithms, StatusList, hash_any, status_list_root_fe,
 };
@@ -190,7 +188,14 @@ fn main() {
     let quorum: Vec<usize> = (0..T).collect();
 
     // A) tampered list carrying a valid proof of a DIFFERENT list.
-    let good_proof = make_signed_proof(&keypairs, &quorum, &list, honest_slot, honest_version, &mut rng);
+    let good_proof = make_signed_proof(
+        &keypairs,
+        &quorum,
+        &list,
+        honest_slot,
+        honest_version,
+        &mut rng,
+    );
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION")); // row not authorized by the committee
     let sl_tampered = StatusList::new(Algorithms::WotsXmss, tampered, honest_version, good_proof);
@@ -212,9 +217,20 @@ fn main() {
     //    before Option B, when `version` was cleartext-only, this was ACCEPTED.
     let spoof_slot = SLOT + N_UPDATES as u32 + 1;
     let signed_version = 5u32;
-    let versioned_proof =
-        make_signed_proof(&keypairs, &quorum, &list, spoof_slot, signed_version, &mut rng);
-    let sl_spoofed = StatusList::new(Algorithms::WotsXmss, list.clone(), signed_version + 1000, versioned_proof);
+    let versioned_proof = make_signed_proof(
+        &keypairs,
+        &quorum,
+        &list,
+        spoof_slot,
+        signed_version,
+        &mut rng,
+    );
+    let sl_spoofed = StatusList::new(
+        Algorithms::WotsXmss,
+        list.clone(),
+        signed_version + 1000,
+        versioned_proof,
+    );
     let version_rejected = !verify_proof(&committee, &sl_spoofed);
 
     let sec_ok = tamper_rejected && outsider_rejected && version_rejected;

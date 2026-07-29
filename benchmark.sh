@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Reproducible benchmark of the committee status list, split-deployment aware.
 #
-# Measures three targets independently:
+# Measures four targets independently:
 #   prover    signs + aggregates N updates          (src/bin/prover.rs)
 #   verifier  verifies a FIXED artifact corpus      (src/bin/verifier.rs)
 #   combined  the single-process demo, for contrast (src/main.rs)
+#   raw_agg   crude multisig baseline, NO SNARK      (src/bin/raw_agg.rs)
+#             t raw XMSS sign+verify per update; work = verify (scales with t),
+#             proof_size = the raw aggregate size (t signatures on the wire)
 #
 # Produces, in $OUTDIR:
 #   env.txt      full environment capture (reproducibility appendix)
@@ -26,7 +29,7 @@ set -euo pipefail
 
 RUNS="${RUNS:-20}"
 WARMUP="${WARMUP:-2}"
-TARGETS="${TARGETS:-prover verifier combined}"
+TARGETS="${TARGETS:-prover verifier combined raw_agg}"
 OUTDIR="${OUTDIR:-bench-$(date +%Y%m%d-%H%M%S)}"
 PROJECT_CM4="${PROJECT_CM4:-0}"
 CM4_LOW="${CM4_LOW:-8}"
@@ -48,7 +51,7 @@ SUMMARY_TXT="$OUTDIR/summary.txt"
 # ---------------------------------------------------------------- build ----
 echo "building --release ..."
 cargo build --release >/dev/null 2>&1
-for b in prover verifier decentralized-root-of-trust; do
+for b in prover verifier decentralized-root-of-trust raw_agg; do
   [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
 done
 
@@ -143,6 +146,7 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
     prover)   rm -rf "$SCRATCH/pout"; cmd=("$BIN_DIR/prover" "$SCRATCH/pout") ;;
     verifier) cmd=("$BIN_DIR/verifier" "$CORPUS") ;;
     combined) cmd=("$BIN_DIR/decentralized-root-of-trust") ;;
+    raw_agg)  cmd=("$BIN_DIR/raw_agg") ;;
     *) echo "unknown target: $target" >&2; exit 1 ;;
   esac
   if [ -n "$TIME_BIN" ]; then
@@ -164,6 +168,7 @@ emit_run_row() { # $1 target  $2 run index
   local tag
   case "$target" in
     prover) tag='^PROVER ' ;; verifier) tag='^VERIFIER ' ;; combined) tag='^BENCH ' ;;
+    raw_agg) tag='^RAW_AGG ' ;;
   esac
   local line; line="$(grep "$tag" "$SCRATCH/out.txt" || true)"
   [ -n "$line" ] || { echo "run $run ($target): record line missing" >&2; exit 1; }
@@ -177,6 +182,13 @@ emit_run_row() { # $1 target  $2 run index
       setup=v["setup_ms"]; med=v["verify_med_ms"]; mean=v["verify_mean_ms"]; sd=v["verify_sd_ms"]
       lo=v["verify_min_ms"]; hi=v["verify_max_ms"]; tot=v["verify_total_ms"]
       pb=""; rs=v["rss_setup_mb"]; rm=v["rss_verify_max_mb"]; pk=v["peak_rss_mb"]; f=v["failures"]
+    } else if (t=="raw_agg") {
+      # Baseline: work = verify (scales with t); proof_size = raw aggregate bytes;
+      # setup = keygen; the tamper sanity check drives the failure gate.
+      setup=v["keygen_ms"]; med=v["verify_med_ms"]; mean=v["verify_mean_ms"]; sd=v["verify_sd_ms"]
+      lo=v["verify_min_ms"]; hi=v["verify_max_ms"]; tot=v["verify_total_ms"]
+      pb=v["agg_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+      f=(v["tamper_rejected"]=="1")?0:1
     } else {
       setup=v["setup_total_ms"]; med=v["upd_prove_med_ms"]; mean=""; sd=""
       lo=v["upd_prove_min_ms"]; hi=v["upd_prove_max_ms"]; tot=v["updates_total_ms"]
@@ -195,6 +207,9 @@ emit_run_row() { # $1 target  $2 run index
         printf "%s,%d,%s,sign,%s,%s,%s\n",  t,r,v["idx"],v["sign_ms"], v["bytes"],v["rss_mb"]
         printf "%s,%d,%s,prove,%s,%s,%s\n", t,r,v["idx"],v["prove_ms"],v["bytes"],v["rss_mb"]
       } else if (v["target"]=="verifier") {
+        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
+      } else if (v["target"]=="raw_agg") {
+        printf "%s,%d,%s,sign,%s,%s,%s\n",   t,r,v["idx"],v["sign_ms"],  v["bytes"],v["rss_mb"]
         printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
       }
     }' "$SCRATCH/out.txt" >> "$SAMPLES"
@@ -274,6 +289,9 @@ label() {
     prover:work_per_item)   echo "prove / update" ;;
     verifier:work_per_item) echo "verify / update" ;;
     combined:work_per_item) echo "prove / update" ;;
+    raw_agg:work_per_item)  echo "verify / update (raw)" ;;
+    raw_agg:setup)          echo "keygen (once/process)" ;;
+    raw_agg:proof_size)     echo "aggregate size (t sigs)" ;;
     *:work_total)           echo "work total / run" ;;
     *:setup)                echo "setup (once/process)" ;;
     *:proof_size)           echo "proof size" ;;
@@ -302,10 +320,13 @@ label() {
       "$t" "$(label "$t" "$m")" "$u" "$n" $d "$mn" $d "$md" $d "$mx" $d "$mean" $d "$sd" "$cv" $d "$ci"
   done
 
-  # Headline comparison: the reason the split exists.
-  vp="$(col verifier 13 | stats | awk '{print $4}')"
-  cp="$(col combined 13 | stats | awk '{print $4}')"
-  if [ -n "$vp" ] && [ -n "$cp" ]; then
+  # Headline comparison: the reason the split exists. Guard on the RAW columns,
+  # not on stats() output: stats() emits "0" for an empty column, so testing its
+  # result would pass with c=0 and divide by zero when a run omits these targets.
+  vp_raw="$(col verifier 13)"; cp_raw="$(col combined 13)"
+  if [ -n "$vp_raw" ] && [ -n "$cp_raw" ]; then
+    vp="$(printf '%s\n' "$vp_raw" | stats | awk '{print $4}')"
+    cp="$(printf '%s\n' "$cp_raw" | stats | awk '{print $4}')"
     echo
     echo "SPLIT VS COMBINED (median peak RSS)"
     awk -v v="$vp" -v c="$cp" 'BEGIN{
@@ -329,8 +350,12 @@ label() {
   echo "  * Per-update samples within a run are not independent (shared allocator"
   echo "    and cache state). The table's unit is the per-run median; samples.csv"
   echo "    holds every raw observation if you need the pooled distribution."
-  echo "  * Prove cost is a step function of t (trace padded to a power of two),"
-  echo "    not of the number of updates."
+  echo "  * Prove cost is driven by t, not by the number of updates. At small t the"
+  echo "    trace padding to a power of two makes it a step function (t=5..=8 all"
+  echo "    cost the same); from a few dozen signers upward the linear term"
+  echo "    dominates and prove time is ~linear in t (measured: 406 ms at t=70,"
+  echo "    718 ms at t=128 -- a flat ~5.7 ms per aggregated signature). Do not"
+  echo "    extrapolate the step behaviour past small t."
 
   if [ "$PROJECT_CM4" = 1 ]; then
     echo

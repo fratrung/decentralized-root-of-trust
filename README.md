@@ -285,8 +285,10 @@ TARGETS="prover verifier" RUNS=50 ./benchmark.sh
 PROJECT_CM4=1 ./benchmark.sh                      # adds an explicitly-labelled ESTIMATE
 ```
 
-It measures the three binaries independently — `prover`, `verifier` and
-`combined` (the single-process demo) — and writes to `bench-<timestamp>/`:
+It measures four targets independently — `prover`, `verifier`, `combined` (the
+single-process demo) and `raw_agg` (the no-proof baseline: `t` individual
+`xmss_sign`/`xmss_verify` calls, which is what the SNARK has to beat) — and
+writes to `bench-<timestamp>/`:
 
 | file | contents |
 |---|---|
@@ -318,8 +320,52 @@ aarch64/NEON path exists).
 
 ### Reference numbers
 
-Indicative, `N=10, t=7`, host **AMD Ryzen 7 4800H** (8c/16t), CPU governor
-`performance`. Medians across n=30 runs; every row has CV ≤ 3.6%:
+Host **AMD Ryzen 7 4800H** (8c/16t), CPU governor `performance`, medians across
+n=30 runs.
+
+**Current defaults — `N=200, t=128`, 20 updates:**
+
+Each *update* is one publication of a new status-list version. Three distinct
+phases are timed separately, and "/ update" always means **per published update**,
+never per signature:
+
+| phase | what it does |
+|---|---|
+| `sign` | the `t` quorum members each produce one XMSS signature |
+| `prove` | those `t` signatures are aggregated into one SNARK (SNARK path only) |
+| `verify` | a relying party checks the evidence for **one** update: decode, committee membership of the `t` signers, message/version binding, quorum ≥ `t`, then the aggregate itself |
+
+| metric | prover | verifier | combined | raw XMSS (no proof) |
+|---|---|---|---|---|
+| setup (once/process) | ~5.21 s | ~5.11 s | ~5.09 s | none |
+| sign / update (`t` sigs) | 917 ms | — | 917 ms | 950 ms |
+| **prove / update** | ~718 ms&nbsp;† | — | **718 ms** | — |
+| **verify / update** | — | **31.3 ms** | 31.3 ms | 54.3 ms |
+| bytes / update | 234 208 B | — | 233 846 B | 193 357 B |
+| resident after setup | 792 MB | **676 MB** | 755 MB | 3 MB |
+| peak RSS (VmHWM) | 2053 MB | **692 MB** | 2014 MB | **3 MB** |
+
+The `sign` row is the one that is easy to misread: **both paths pay it**. The
+SNARK aggregates genuine XMSS signatures, it does not replace them. So the
+marginal cost of proving is +76% on top of a production cost both schemes share
+(950 ms → ~1 670 ms), not "718 ms against zero".
+
+Committee keygen (200 keys × 65 slots) is a further ~3.65 s, paid once and
+outside every figure above. Raw XMSS needs **no setup at all** — it is pure
+Poseidon2, with no WHIR bytecode to materialise. That absence is itself a result.
+
+† The `prover` target's own reading was contaminated by external CPU contention:
+runs 1–6 sit at 1212–1275 ms, runs 8–30 at 690–776 ms. `setup_ms` stayed flat
+(CV 2.3%) across all 30, which is how you tell contention from a regression — the
+single-threaded setup is unaffected while the multi-threaded prove is not. The
+independent `combined` target reports 718.12 ms at CV 3.6%, agreeing with the
+clean prover window (median 719.1 ms) to 0.1%. Quote 718 ms.
+
+prove/update is strongly governor-sensitive: on `schedutil` the same measurement
+inflates by ~60% because the CPU underclocks the sustained prover — always pin
+`performance` before quoting prove time. Memory does not depend on the governor.
+
+**Small committee — `N=10, t=7`:**
 
 | metric | prover | verifier | combined |
 |---|---|---|---|
@@ -330,9 +376,46 @@ Indicative, `N=10, t=7`, host **AMD Ryzen 7 4800H** (8c/16t), CPU governor
 | resident after setup | 786 MB | **676 MB** | 754 MB |
 | peak RSS (VmHWM) | 1082 MB | **694 MB** | 1049 MB |
 
-prove/update is strongly governor-sensitive: the same measurement on `schedutil`
-reports ~270 ms because the CPU underclocks the sustained prover — always pin
-`performance` before quoting prove time. Memory does not depend on the governor.
+### Where the SNARK starts paying off
+
+The `raw_agg` baseline costs **0.424 ms and 1 511 B per signature**, both strictly
+linear in `t`. The SNARK's verify cost and proof size grow roughly
+*logarithmically*, and its verifier memory does not grow at all. Measured across
+the two operating points:
+
+| | t=70 | t=128 | Δ for +83% signers |
+|---|---|---|---|
+| verify, SNARK | 29.91 ms | 31.33 ms | **+4.7%** |
+| proof size | 222 238 B | 234 208 B | **+5.4%** |
+| peak RSS, verifier | 691.5 MB | 692.0 MB | **+0.07%** |
+| verify, raw | 28.31 ms | 54.29 ms | +92% |
+| aggregate size, raw | 105 750 B | 193 357 B | +83% |
+
+That +0.07% is the property the whole construction exists for: **verification cost
+is independent of committee size**, because the verifier touches only the anchor
+root and never the members' public keys. The break-even points follow:
+
+- **Verify time: `t ≈ 74`** — crossed. At `t=128` the SNARK verifies **1.73×
+  faster** than checking the signatures individually.
+- **Proof size: `t ≈ 158`** — not yet crossed. At `t=128` the proof is still
+  1.21× *larger* than the raw bundle. `t=256` is the first configuration that
+  wins on both axes (projected ~3.3× on verify, ~1.56× on size).
+- **Verifier RAM: never.** 692 MB against 3 MB is a fixed floor the SNARK never
+  recovers, at any `t`. Irrelevant on a server, disqualifying on a small board.
+
+Counting production cost too, the SNARK wins on *total system* CPU once the
+number of relying parties `V` exceeds ~30:
+
+```
+raw   :  950 + 54.6·V
+SNARK : 1635 + 31.9·V      →  break-even at V ≈ 30
+```
+
+The `t` signatures are common to both sides and largely cancel; what remains is
+that proving is a fixed cost paid **once** by whoever publishes an update, while
+verification is the cost that **multiplies** across every relying party. In a
+decentralised root of trust those number in the thousands, so the break-even is
+not close.
 
 Where the memory actually goes — measured with `--example footprint`:
 
@@ -351,8 +434,10 @@ shrunk from this repository. Treat it as a fixed floor for anyone who verifies.
 
 **Scaling:** prove-time and RAM grow with **`t`** (more XMSS verifications in the
 circuit → bigger trace → bigger WHIR commitment + FFT buffers), **not** with the
-number of updates. The growth is a **step function**: the trace is padded to a
-power of two, so `t = 5..=8` all cost the same. Measured, `t=7` vs `t=8` vs `t=4`:
+number of updates. How they grow depends on the regime.
+
+*At small `t`* the growth is a **step function**: the trace is padded to a power
+of two, so `t = 5..=8` all cost the same. Measured, `t=7` vs `t=8` vs `t=4`:
 
 | t | prove / update | peak RSS | proof |
 |---|---|---|---|
@@ -367,14 +452,37 @@ size do not depend on the governor.)
 So `t=7` pays for a quorum of 8 without using it: raising the threshold to 8
 costs nothing in prove time, proof size or RAM (only signing, which is outside
 the circuit, grows linearly in `t`). Dropping to `t=4` cuts prove time by 31% but
-peak RSS by only 9%, because the ~678 MB floor dominates. Setup cost and
-resident-after-setup are independent of `t`.
+peak RSS by only 9%, because the ~678 MB floor dominates.
+
+*At large `t`* the padding is no longer what dominates, and prove time becomes
+essentially **linear**: 406.5 ms at `t=70` against 718.1 ms at `t=128`, where a
+linear extrapolation from `t=70` predicts 743 ms — within 3.4%. Equivalently, a
+flat **~5.7 ms per aggregated signature** (5.81 at `t=70`, 5.61 at `t=128`). Peak
+RSS grows sub-linearly over the same interval (1451 → 2053 MB, +41% for +83% in
+`t`) because the ~678 MB bytecode floor does not move.
+
+**Do not extrapolate the step behaviour past a few dozen signers** — it is an
+artifact of a small trace, not a property of the scheme. Setup cost,
+resident-after-setup and the *verifier's* RSS remain independent of `t` in both
+regimes.
 
 **Raspberry Pi CM4 (BCM2711, 2 GB)** — linear projection x8..x15 (estimate, from
-the `performance` host figures): setup ~40–76 s (one-time at boot), prove
-~1.4–2.6 s/update, verify ~0.22–0.42 s, 10 updates ~14–26 s. RAM does **not**
-scale with CPU: peak ~1 GB **fits the 2 GB board** (~1 GB free for the OS); a
-**1 GB board is excluded**. RAM is the gate.
+the `performance` host figures). RAM does **not** scale with CPU, and it is the
+gate, so the verdict depends on `t`:
+
+| | `N=10, t=7` | `N=200, t=128` |
+|---|---|---|
+| setup (one-time at boot) | ~40–76 s | ~41–78 s |
+| prove / update | ~1.4–2.6 s | ~5.7–10.8 s |
+| verify / update | ~0.22–0.42 s | ~0.25–0.47 s |
+| peak RSS, **prover** | ~1.08 GB — fits 2 GB | **2.05 GB — does not fit** |
+| peak RSS, **verifier** | 0.69 GB — fits | 0.69 GB — fits |
+
+At the small-committee point a 2 GB board can run either role (~1 GB left for the
+OS) and a **1 GB board is excluded outright**. At the current `t=128` defaults the
+**proving role no longer fits any CM4**, while the verify-only role still fits
+comfortably and is unchanged — which is the deployment split this repository is
+built around: prove on a server, verify on the board.
 
 ---
 

@@ -51,7 +51,9 @@ fn artifacts(dir: &Path, prefix: &str) -> Vec<PathBuf> {
 }
 
 fn main() -> ExitCode {
-    let dir = std::env::args().nth(1).unwrap_or_else(|| "artifacts".into());
+    let dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "artifacts".into());
     let dir = Path::new(&dir);
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
 
@@ -65,8 +67,8 @@ fn main() -> ExitCode {
     // The fixed trust anchor. A production verifier embeds this at compile time;
     // loading it from a file changes nothing about the trust model, as long as
     // the anchor itself is authentic.
-    let anchor = std::fs::read(dir.join("anchor.bin"))
-        .unwrap_or_else(|e| panic!("cannot read anchor: {e}"));
+    let anchor =
+        std::fs::read(dir.join("anchor.bin")).unwrap_or_else(|e| panic!("cannot read anchor: {e}"));
     let committee = Committee::from_bytes(&anchor).expect("malformed anchor");
     println!(
         "anchor: N={} t={} ({} B)\n",
@@ -168,7 +170,10 @@ fn main() -> ExitCode {
     match select_freshest(&committee, &candidates) {
         Some(sl) => match hwm.try_advance(sl.version()) {
             Decision::Accepted => {
-                println!("  selected version {} -> accepted, high-water advanced", sl.version())
+                println!(
+                    "  selected version {} -> accepted, high-water advanced",
+                    sl.version()
+                )
             }
             Decision::Stale(hw) => println!(
                 "  selected version {} -> not newer than high-water {}, nothing to do",
@@ -177,7 +182,10 @@ fn main() -> ExitCode {
             ),
         },
         None => {
-            println!("  no valid record among {} candidates <- BUG", candidates.len());
+            println!(
+                "  no valid record among {} candidates <- BUG",
+                candidates.len()
+            );
             failures += 1;
         }
     }
