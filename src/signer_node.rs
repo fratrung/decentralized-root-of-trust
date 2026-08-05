@@ -92,7 +92,31 @@ impl SignerNode {
             .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))?;
         Ok((slot, signature))
     }
+
+    /// Signs `message` at the slot the *protocol* assigned to this round —
+    /// `Committee::slot_for(version)` — instead of the next slot this member
+    /// happens to be on. The slot is not returned: the caller derived it.
+    ///
+    /// The ordering guarantee of [`SignerNode::sign`] is unchanged, and so is its
+    /// consequence: reserving burns the slot whatever happens next.
+    ///
+    /// [`AtomicSlotCounterError::AlreadySpent`] is a normal failure here, not a
+    /// fault. It means this member is past that round, so it **abstains** rather
+    /// than signing a second message under a spent slot. It catches up as soon as
+    /// the published version passes its counter.
+    pub fn sign_at<R: rand::CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        message: &[KoalaBear; 8],
+        slot: u32,
+    ) -> Result<XmssSignature, SignerNodeError> {
+        self.a_slot_counter.reserve_at(slot)?;
+        xmss_sign(rng, &self.sk, message, slot)
+            .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))
+    }
 }
+
+// Test
 
 #[cfg(test)]
 mod tests {
@@ -179,7 +203,9 @@ mod tests {
         assert_eq!(signer.remaining_slots(), 0);
         assert!(matches!(
             signer.sign(&mut rng, &message),
-            Err(SignerNodeError::Slot(AtomicSlotCounterError::Exhausted { .. }))
+            Err(SignerNodeError::Slot(
+                AtomicSlotCounterError::Exhausted { .. }
+            ))
         ));
     }
 }

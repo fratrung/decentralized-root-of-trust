@@ -1,35 +1,41 @@
 //! Baseline: the **crude** aggregate-signature path, with no SNARK at all.
 //!
 //! This is the yardstick the SNARK-aggregated prover/verifier are measured
-//! against. Here an "aggregate" is nothing clever — it is just the bundle of the
-//! `t` individual XMSS signatures a quorum produces for one update. There is no
-//! proof to build and no proof to check: each update is signed with `t`
-//! `xmss_sign` calls and verified with `t` `xmss_verify` calls, using the raw
-//! leanVM APIs directly.
+//! against. Here an "aggregate" is nothing clever — it is the `t` individual XMSS
+//! signatures a quorum produces for one update, published together with a bitmap
+//! naming their signers. There is no proof to build and no proof to check.
+//!
+//! Unlike the SNARK path this runs the **real node types**: every signer is a
+//! `SignerNode` spending slots through its own durable `AtomicSlotCounter`, and
+//! the verifier is a `VerifierNode` checking a `StatusList` against the anchor.
+//! So `sign` here includes one `fsync` pair per signature that `prover.rs` never
+//! pays. Compare *verify* and *size* freely; compare *sign* knowing that.
 //!
 //! Note what this binary does **not** call: neither `setup_prover()` nor
 //! `setup_verifier()`. Raw XMSS sign/verify are pure Poseidon2 — no circuit, no
 //! arena, no FFT twiddles. That absence is itself a result: it is the fixed cost
 //! the SNARK path pays and this one does not.
 //!
-//! What the comparison exposes is the trade the SNARK makes. The crude path has
-//! trivially cheap per-signature verification, but the wire payload grows with
-//! `t` (you ship `t` full signatures) and the verifier's work grows with `t`
-//! (you check `t` of them). The SNARK collapses both to a single constant-size
-//! proof and one verification, at the price of an expensive prover. This file
-//! quantifies the "before".
+//! The trade it quantifies: verification per signature is trivially cheap, but
+//! both the payload and the verifier's work grow with `t`, where the SNARK
+//! collapses both to a constant at the price of an expensive prover.
 //!
 //! Usage: cargo run --release --bin raw_agg          (always --release)
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use decentralized_root_of_trust::atomic_slot_counter::AtomicSlotCounter;
+use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::params::{KEY_SLOTS, N_MEMBERS, N_UPDATES, SLOT, T};
+use decentralized_root_of_trust::signer_node::SignerNode;
 use decentralized_root_of_trust::stats::Series;
-use decentralized_root_of_trust::status_list::{hash_any, status_list_root_fe};
-use lean_multisig::{
-    XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign, xmss_verify,
+use decentralized_root_of_trust::status_list::{
+    Algorithms, StatusList, hash_any, status_list_root_fe,
 };
+use decentralized_root_of_trust::verifier_node::VerifierNode;
+use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -41,6 +47,14 @@ fn main() {
     // sets it to collect one row per update.
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
 
+    // Slot state lives outside the repo and is wiped on the way out: these keys
+    // are generated fresh every run, so their counters are meaningless the moment
+    // the process exits. A real node does the opposite — its counter outlives it,
+    // and deleting one while its key survives is how slots get reused.
+    let state_dir = std::env::temp_dir().join(format!("raw-agg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).expect("cannot create slot state dir");
+
     let rss_baseline = rss_now_mb();
 
     // ---- One-time cost: generate the committee's N keys. ----
@@ -49,66 +63,82 @@ fn main() {
     println!("raw_agg: keygen (no SNARK setup, no circuit)...");
     let mut rng = rand::rng();
     let t_keygen = Instant::now();
-    let mut keypairs: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::with_capacity(N_MEMBERS);
-    for _ in 0..N_MEMBERS {
+    let mut signers: Vec<SignerNode> = Vec::with_capacity(N_MEMBERS);
+    let mut members: Vec<XmssPublicKey> = Vec::with_capacity(N_MEMBERS);
+    for i in 0..N_MEMBERS {
         let seed: [u8; 32] = rng.random();
-        keypairs.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("keygen failed"));
+        let (sk, pk) = xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("keygen failed");
+        let path: PathBuf = state_dir.join(format!("member-{i:04}"));
+        let counter =
+            AtomicSlotCounter::create(&path, &pk, SLOT, SLOT + KEY_SLOTS).expect("slot state");
+        members.push(pk.clone());
+        signers.push(SignerNode::new(pk, sk, counter));
     }
     let keygen_time = t_keygen.elapsed();
     let rss_after_keygen = rss_now_mb();
 
+    // The fixed trust anchor. `SLOT` is the genesis: every round derives its slot
+    // from it, so no signer ever chooses one.
+    let committee = Committee::new(members, T, SLOT);
+    let verifier = VerifierNode::new(committee.clone());
+
     println!("committee N={N_MEMBERS} t={T}; {N_UPDATES} updates rotating the signers");
-    println!("aggregate = {T} raw XMSS signatures (no proof)\n");
+    println!(
+        "aggregate = {T} raw XMSS signatures + a {}-byte signer bitmap (no proof)\n",
+        N_MEMBERS.div_ceil(8)
+    );
 
     // ---- N_UPDATES updates. For each: t signers sign the (list, version) root,
-    //      the t signatures ARE the aggregate, then all t are verified. ----
+    //      the signatures plus their bitmap ARE the record, then it is verified. ----
     let mut list: Vec<[u8; 32]> = Vec::new();
     let mut sign_ms = Vec::new();
     let mut verify_ms = Vec::new();
     let mut agg_bytes = Vec::new();
-    let mut total_verified = 0usize;
-    let mut total_expected = 0usize;
+    let mut accepted = 0usize;
     let mut rss_updates_max = rss_after_keygen;
 
     for i in 0..N_UPDATES {
         list.push(hash_any(rng.random::<[u8; 32]>()));
         // t signers out of N, rotating the window at each update.
-        let signers: Vec<usize> = (0..T).map(|j| (i + j) % N_MEMBERS).collect();
-        // slot is the XMSS epoch (stateful, one per update); version is the
-        // application counter, both bound into the signed message.
-        let slot = SLOT + i as u32;
+        let quorum: Vec<usize> = (0..T).map(|j| (i + j) % N_MEMBERS).collect();
         let version = i as u32;
+        // Derived from the anchor, never negotiated — which is what lets members
+        // that sat out earlier rounds rejoin without the committee losing
+        // agreement on the slot.
+        let slot = committee.slot_for(version).expect("slot overflow");
         let message = status_list_root_fe(&list, version);
 
-        // Sign: t plain XMSS signatures, no circuit. Scales linearly in t.
+        // Sign: t plain XMSS signatures, no circuit — plus the durable slot burn
+        // that precedes each one.
         let t_sign = Instant::now();
-        let mut raws: Vec<(XmssPublicKey, XmssSignature)> = Vec::with_capacity(signers.len());
-        for &k in &signers {
-            let (sk, pk) = &keypairs[k];
-            raws.push((
-                pk.clone(),
-                xmss_sign(&mut rng, sk, &message, slot).expect("signing failed"),
-            ));
-        }
+        let raws: Vec<(usize, XmssSignature)> = quorum
+            .iter()
+            .map(|&k| {
+                let sig = signers[k]
+                    .sign_at(&mut rng, &message, slot)
+                    .expect("signing failed");
+                (k, sig)
+            })
+            .collect();
         let sign_time = t_sign.elapsed();
 
-        // The crude aggregate is exactly this bundle. Its serialized size is the
-        // wire payload — the honest analog of the SNARK's proof_bytes, and the
+        let record = StatusList::new(Algorithms::WotsXmss, list.clone(), version, N_MEMBERS, raws)
+            .expect("well-formed quorum");
+        // The wire payload — the honest analog of the SNARK's proof_bytes, and the
         // number that grows with t while the SNARK's stays constant.
-        let wire = postcard::to_allocvec(&raws).expect("aggregate serialization failed");
+        let wire = record.to_bytes();
 
-        // Verify: t independent xmss_verify calls, all of which must pass.
+        // Verify the way a peer would: decode off the wire, then check against the
+        // anchor alone. Decoding is timed with verification because on an
+        // untrusted transport it is part of the cost an attacker can force.
         let t_verify = Instant::now();
-        let mut ok = 0usize;
-        for (pk, sig) in &raws {
-            if xmss_verify(pk, &message, sig, slot).is_ok() {
-                ok += 1;
-            }
-        }
+        let ok = match StatusList::from_bytes(&wire) {
+            Ok(sl) => verifier.verify_status_list(&sl),
+            Err(_) => false,
+        };
         let verify_time = t_verify.elapsed();
-        total_verified += ok;
-        total_expected += raws.len();
-        assert_eq!(ok, raws.len(), "a legitimate signature failed to verify");
+        assert!(ok, "a legitimate update failed to verify");
+        accepted += 1;
 
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
@@ -136,15 +166,92 @@ fn main() {
         agg_bytes.push(wire.len());
     }
 
-    // ---- Sanity check: verification is not a no-op. A signature checked against
-    //      the WRONG message (a version bump the signer never signed) must fail. ----
-    let signers: Vec<usize> = (0..T).map(|j| j % N_MEMBERS).collect();
-    let slot = SLOT;
-    let good = status_list_root_fe(&list, 0);
-    let (sk0, pk0) = &keypairs[signers[0]];
-    let sig0 = xmss_sign(&mut rng, sk0, &good, slot).expect("signing failed");
-    let wrong = status_list_root_fe(&list, 999);
-    let tamper_rejected = xmss_verify(pk0, &wrong, &sig0, slot).is_err();
+    // ---- Sanity checks: verification is not a no-op. ----
+    // Each forgery is built from a *genuine* quorum, so what fails is the binding
+    // under test and nothing else.
+    let version = N_UPDATES as u32;
+    let slot = committee.slot_for(version).expect("slot overflow");
+    let message = status_list_root_fe(&list, version);
+    let honest: Vec<(usize, XmssSignature)> = (0..T)
+        .map(|k| {
+            (
+                k,
+                signers[k]
+                    .sign_at(&mut rng, &message, slot)
+                    .expect("signing failed"),
+            )
+        })
+        .collect();
+
+    // A) a row nobody authorized, appended to a list carrying a real quorum.
+    let mut tampered = list.clone();
+    tampered.push(hash_any(b"FAKE-REVOCATION"));
+    let tamper_rejected = !verifier.verify_status_list(
+        &StatusList::new(
+            Algorithms::WotsXmss,
+            tampered,
+            version,
+            N_MEMBERS,
+            honest.clone(),
+        )
+        .expect("well-formed"),
+    );
+
+    // B) the same quorum re-labelled with a later version, as a hostile peer would
+    //    do to look freshest. The version is folded into the message AND fixes the
+    //    slot, so both bindings break at once.
+    let relabel_rejected = !verifier.verify_status_list(
+        &StatusList::new(
+            Algorithms::WotsXmss,
+            list.clone(),
+            version + 1,
+            N_MEMBERS,
+            honest.clone(),
+        )
+        .expect("well-formed"),
+    );
+
+    // C) below threshold: t - 1 signatures, every one of them valid.
+    let short: Vec<(usize, XmssSignature)> = honest.iter().take(T - 1).cloned().collect();
+    let short_rejected = !verifier.verify_status_list(
+        &StatusList::new(
+            Algorithms::WotsXmss,
+            list.clone(),
+            version,
+            N_MEMBERS,
+            short,
+        )
+        .expect("well-formed"),
+    );
+
+    // D) an outsider claiming a member's seat. There is no other way in: a record
+    //    names signers by index, so a non-member is unnameable rather than merely
+    //    rejected.
+    let (out_sk, out_pk) =
+        xmss_key_gen(rng.random(), SLOT, SLOT + KEY_SLOTS, false).expect("keygen");
+    let out_counter =
+        AtomicSlotCounter::create(state_dir.join("outsider"), &out_pk, SLOT, SLOT + KEY_SLOTS)
+            .expect("slot state");
+    let mut outsider = SignerNode::new(out_pk, out_sk, out_counter);
+    let mut infiltrated = honest;
+    infiltrated[0] = (
+        0,
+        outsider
+            .sign_at(&mut rng, &message, slot)
+            .expect("signing failed"),
+    );
+    let outsider_rejected = !verifier.verify_status_list(
+        &StatusList::new(
+            Algorithms::WotsXmss,
+            list.clone(),
+            version,
+            N_MEMBERS,
+            infiltrated,
+        )
+        .expect("well-formed"),
+    );
+
+    let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
 
     // ---- Summary ----
     let sign = Series::new(sign_ms);
@@ -161,15 +268,17 @@ fn main() {
     let per_sig_sign_us = sg_med * 1000.0 / T as f64;
     let per_sig_verify_us = vf_med * 1000.0 / T as f64;
 
-    println!("\n{total_verified}/{total_expected} signatures verified (all updates)");
-    println!("tamper check (wrong message rejected): {tamper_rejected}");
+    println!("\n{accepted}/{N_UPDATES} updates accepted by the verifier node");
+    println!(
+        "forgeries rejected (tampered / relabelled / short quorum / outsider): {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected}"
+    );
 
     println!("\nkeygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
     println!("--- per update (t={T}): min / median / max ---");
-    println!("sign     : {sg_min:.1} / {sg_med:.1} / {sg_max:.1} ms");
-    println!("verify   : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
+    println!("sign     : {sg_min:.1} / {sg_med:.1} / {sg_max:.1} ms   (incl. durable slot burn)");
+    println!("verify   : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms   (incl. wire decode)");
     println!("per signature : sign {per_sig_sign_us:.1} us  verify {per_sig_verify_us:.1} us");
-    println!("aggregate size (median) : {agg_med} bytes  ({T} signatures)");
+    println!("record size (median) : {agg_med} bytes  ({T} signatures + bitmap)");
 
     println!("\nRAM (raw-multisig process, no SNARK)");
     println!("baseline (pre-keygen)  : {rss_baseline} MB");
@@ -179,7 +288,7 @@ fn main() {
 
     // One-line machine-readable record, same convention as prover.rs / verifier.rs.
     // benchmark.sh maps work = verify (the metric that scales with t, unlike the
-    // constant-time SNARK verify) and proof_size = the raw aggregate size.
+    // constant-time SNARK verify) and proof_size = the raw record size.
     println!(
         "\nRAW_AGG keygen_ms={:.3} n_members={N_MEMBERS} t={T} n_updates={} \
          sign_med_ms={sg_med:.3} sign_mean_ms={:.3} sign_sd_ms={:.3} sign_min_ms={sg_min:.3} \
@@ -198,6 +307,16 @@ fn main() {
         verify.stddev(),
         verify.sum(),
         peak_rss_mb(),
-        tamper_rejected as u8,
+        all_rejected,
     );
+
+    // Counters die with the keys they belong to; see the note at the top.
+    drop(signers);
+    drop(outsider);
+    let _ = std::fs::remove_dir_all(&state_dir);
+
+    if !all_rejected {
+        eprintln!("\na forgery was accepted");
+        std::process::exit(1);
+    }
 }

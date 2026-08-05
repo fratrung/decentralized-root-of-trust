@@ -20,7 +20,7 @@ use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::stats::Series;
 use decentralized_root_of_trust::status_list::{
-    Algorithms, StatusList, hash_any, status_list_root_fe,
+    Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
 };
 use lean_multisig::{
     XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover, xmss_key_gen, xmss_sign,
@@ -63,7 +63,11 @@ fn main() {
         keypairs.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("keygen failed"));
     }
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
-    write(outdir, "anchor.bin", &Committee::new(members, T).to_bytes());
+    write(
+        outdir,
+        "anchor.bin",
+        &Committee::new(members, T, SLOT).to_bytes(),
+    );
 
     println!("committee N={N_MEMBERS} t={T}; {N_UPDATES} updates rotating the signers");
     println!("writing artifacts to {}/\n", outdir.display());
@@ -106,7 +110,7 @@ fn main() {
         let proof = make_proof(raws, message, slot, LOG_INV_RATE);
         let prove_time = t_prove.elapsed();
 
-        let sl = StatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
+        let sl = SnarkStatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
         let bytes = sl.to_bytes();
         write(outdir, &format!("update-{i:02}.bin"), &bytes);
 
@@ -165,7 +169,8 @@ fn main() {
     write(
         outdir,
         "attack-tampered.bin",
-        &StatusList::new(Algorithms::WotsXmss, tampered, attack_version, good_proof).to_bytes(),
+        &SnarkStatusList::new(Algorithms::WotsXmss, tampered, attack_version, good_proof)
+            .to_bytes(),
     );
 
     // B) a perfectly valid quorum of keys that are NOT in the committee.
@@ -187,14 +192,24 @@ fn main() {
     write(
         outdir,
         "attack-outsider.bin",
-        &StatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof).to_bytes(),
+        &SnarkStatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof).to_bytes(),
     );
 
     // C) a valid proof of (list, version) re-labelled with an inflated version, as
     //    a hostile DHT peer would do to look freshest. Defeated by check 2 (message
     //    binds the version). It is also the decoy the verifier's freshness
     //    selection must try first and then skip.
-    let spoof_slot = SLOT + N_UPDATES as u32 + 1;
+    //
+    //    The forgery is built slot-consistent on purpose: signed at the slot the
+    //    inflated version derives to, so check 3 passes and check 2 is the one that
+    //    fires. A sloppier forgery would be caught a step earlier and this artifact
+    //    would silently stop testing the version binding it exists for.
+    //
+    //    Note how far the inflation can go: `slot = genesis + version` means an
+    //    attacker needs a key covering that slot, so the reachable versions stop at
+    //    the end of the key window. KEY_SLOTS is the largest lie available.
+    let spoof_version = KEY_SLOTS;
+    let spoof_slot = SLOT + spoof_version;
     let signed_version = (N_UPDATES - 1) as u32; // the true latest
     let versioned_proof = sign_and_prove(
         &keypairs,
@@ -207,7 +222,13 @@ fn main() {
     write(
         outdir,
         "attack-version.bin",
-        &StatusList::new(Algorithms::WotsXmss, list.clone(), 999_999, versioned_proof).to_bytes(),
+        &SnarkStatusList::new(
+            Algorithms::WotsXmss,
+            list.clone(),
+            spoof_version,
+            versioned_proof,
+        )
+        .to_bytes(),
     );
 
     let (sg_min, sg_med, sg_max) = sign.min_med_max();

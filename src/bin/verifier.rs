@@ -27,7 +27,7 @@ use decentralized_root_of_trust::committee::{Committee, select_freshest, verify_
 use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::stats::Series;
-use decentralized_root_of_trust::status_list::StatusList;
+use decentralized_root_of_trust::status_list::SnarkStatusList;
 use lean_multisig::setup_verifier;
 
 fn ms(d: Duration) -> f64 {
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
         // part of the cost an attacker can force, and it is not free — leanVM
         // recomputes the bytecode claim while deserializing.
         let t = Instant::now();
-        let ok = match StatusList::from_bytes(&bytes) {
+        let ok = match SnarkStatusList::from_bytes(&bytes) {
             Ok(sl) => verify_proof(&committee, &sl),
             Err(e) => {
                 println!("  {name:<22} DECODE FAILED: {e}");
@@ -125,7 +125,7 @@ fn main() -> ExitCode {
     for path in artifacts(dir, "attack-") {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let bytes = std::fs::read(&path).expect("cannot read attack artifact");
-        let accepted = StatusList::from_bytes(&bytes)
+        let accepted = SnarkStatusList::from_bytes(&bytes)
             .map(|sl| verify_proof(&committee, &sl))
             .unwrap_or(false);
         if accepted {

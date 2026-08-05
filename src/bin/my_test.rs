@@ -1,5 +1,5 @@
 use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
-use decentralized_root_of_trust::status_list::{StatusList, hash_any, status_list_root_fe};
+use decentralized_root_of_trust::status_list::{SnarkStatusList, hash_any, status_list_root_fe};
 use decentralized_root_of_trust::{committee::Committee, snark_prover_node::PQSNARKProverModule};
 use lean_multisig::{
     XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign, xmss_verify,
@@ -40,7 +40,7 @@ fn main() {
     }
 
     let members: Vec<XmssPublicKey> = committe_members.iter().map(|(_, pk)| pk.clone()).collect();
-    let committee = Committee::new(members, 15);
+    let committee = Committee::new(members, 15, SLOT);
     println!(
         "Committee of {} members, with threshold of {}",
         N_COMMITTEE_MEMBERS,
@@ -55,6 +55,9 @@ fn main() {
     let mut list: Vec<[u8; 32]> = Vec::new();
     list.push(data);
     let version: u32 = 1;
+    // Derived, never chosen: every member and every verifier reaches this same
+    // slot from the anchor plus the version alone.
+    let slot = committee.slot_for(version).expect("slot overflow");
 
     let message = status_list_root_fe(&list, version);
 
@@ -69,7 +72,7 @@ fn main() {
 
         raws_signatures.push((
             signer.1.clone(),
-            xmss_sign(&mut rng, &signer.0, &message, SLOT).expect("signing failed"),
+            xmss_sign(&mut rng, &signer.0, &message, slot).expect("signing failed"),
         ));
         idx_signer += 1;
     }
@@ -79,7 +82,7 @@ fn main() {
     println!("Test Verifica firma aggregata");
     let mut verified_signature = 0;
     for s in raws_signatures.iter() {
-        let _ = match xmss_verify(&s.0, &message, &s.1, SLOT) {
+        let _ = match xmss_verify(&s.0, &message, &s.1, slot) {
             Ok(()) => verified_signature += 1,
             Err(e) => {
                 println!("Error: {:#?}", e);
@@ -97,10 +100,10 @@ fn main() {
     let snark_proof =
         prover_node
             .prover_snark_module
-            .make_proof(raws_signatures, &list, SLOT, version, 2);
+            .make_proof(raws_signatures, &list, slot, version, 2);
 
     println!("PQ SNARK Proof generated");
-    let status_list = StatusList::new(
+    let status_list = SnarkStatusList::new(
         decentralized_root_of_trust::status_list::Algorithms::WotsXmss,
         list,
         version,

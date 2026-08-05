@@ -2,7 +2,12 @@
 //! `prover` binary. The `verifier` binary deliberately uses **none** of these:
 //! everything it needs comes from the committee anchor it loads.
 
-/// First XMSS slot. XMSS is stateful: each update must consume a fresh slot.
+/// Genesis slot: the one round 0 is signed at. Every later round derives its slot
+/// as `SLOT + version`, so the whole committee agrees without coordinating.
+///
+/// It goes into the anchor (`Committee::genesis_slot`), which is what makes the
+/// derivation authenticated rather than a convention each node has to be trusted
+/// to follow.
 pub const SLOT: u32 = 43;
 
 /// Committee size `N`.

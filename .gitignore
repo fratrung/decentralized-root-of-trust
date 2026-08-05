@@ -4,5 +4,3 @@ Cargo.lock
 .claude/
 artifacts/
 bench-*/
-bin/my_test.rs
-bin/my_test_*

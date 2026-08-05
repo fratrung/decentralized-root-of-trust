@@ -2,7 +2,7 @@ use lean_multisig::{setup_verifier, verify_single_message_aggregate};
 
 use crate::{
     committee::Committee,
-    status_list::{StatusList, status_list_root_fe},
+    status_list::{SnarkStatusList, status_list_root_fe},
 };
 
 pub struct PQSNARKVerifierModule {
@@ -19,13 +19,11 @@ impl PQSNARKVerifierModule {
         }
     }
 
-    
     pub fn committee_as_ref(&self) -> &Committee {
         &self.committee
     }
-    
 
-    pub fn verify(&self, status_list: &StatusList) -> bool {
+    pub fn verify(&self, status_list: &SnarkStatusList) -> bool {
         let agg = match status_list.proof() {
             Ok(a) => a,
             Err(_) => return false,

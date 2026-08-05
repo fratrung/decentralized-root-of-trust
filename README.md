@@ -9,34 +9,45 @@ It replaces a *single-key* root of trust with a **`t`-of-`N` committee**, while
 keeping the property that **anyone** can verify the list knowing a single fixed
 trust anchor (the committee), without fetching anything in real time.
 
-See [`docs/committee-status-list.md`](docs/committee-status-list.md) for the full
-design rationale.
+
+![The committee signs one status-list root at a slot derived from the anchor; the quorum is then published either as raw signatures with a signer bitmap, or as one aggregated SNARK proof. Both are checked against the same anchor.](docs/architecture.png)
+
+Editable source: [`docs/architecture.svg`](docs/architecture.svg). The README
+points at the PNG because SVG rendering in the GitHub mobile app is unreliable.
 
 ---
 
 ## Trust model
 
-- The list is published (e.g. in a DHT) together with a **proof** that replaces
-  the old single signature.
+- The list is published (e.g. in a DHT) together with **evidence of a quorum**
+  that replaces the old single signature.
 - The fixed **trust anchor** each verifier embeds is the **committee**: its `N`
-  public keys and the threshold `t`.
+  public keys, the threshold `t`, and the genesis slot.
 - An update is authorized when **at least `t`** distinct committee members sign
   the new list root. *Which* subset signs may change at every update — the
   anchor does not.
 
-Verification is four checks (three outside the circuit, negligible cost):
+The evidence comes in two interchangeable forms, described in
+[Two published forms](#two-published-forms). Both are checked in five steps:
 
 1. every signer ∈ committee (membership);
-2. the proof is bound to **this** list *and this version*
+2. the evidence is bound to **this** list *and this version*
    (`message == status_list_root(list, version)`);
-3. quorum reached (`#signers ≥ t`);
-4. the SNARK aggregate verifies (one verification, independent of `t`).
+3. the slot is the one the anchor assigns to this version
+   (`slot == genesis_slot + version`);
+4. quorum reached (`#signers ≥ t`);
+5. the signatures — or the one aggregate that stands for them — verify.
 
-Check (2) is the security-critical binding: `verify_single_message_aggregate`
-only attests "these keys signed *this* message"; the verifier must recompute that
-message from the list *and version* it holds and compare. See
+Check (2) is the security-critical binding: a signature only attests "this key
+signed *this* message"; the verifier must recompute that message from the list
+*and version* it holds and compare. See
 [Versioning and freshness](#versioning-and-freshness) for why the version is part
 of the message and not a field next to it.
+
+Check (3) pins policy rather than integrity — the slot is already authenticated
+inside every signature, since it feeds the leaf hash, the WOTS tweaks and the
+Merkle path directions. What it forbids is a quorum re-signing one version at
+slots of its own choosing. See [Slot derivation](#slot-derivation).
 
 ---
 
@@ -50,6 +61,101 @@ a new slot.
 > Note: the standalone `leanSig` XMSS (Poseidon1, `[u8; 32]`, `LOG_LIFETIME = 18`)
 > is a **different, incompatible** parametrization and **cannot** be fed to
 > leanVM's aggregator. This project therefore signs with leanVM's XMSS only.
+
+A key is generated for a **window** `slot_start..=slot_end`, and the window is
+baked into its identity: leaves outside it are pseudorandom fillers
+(`gen_random_node`) that feed the Merkle root, so regenerating the same seed with
+a wider window yields a *different* public key. A window cannot be extended — an
+exhausted key can only be replaced. `remaining_slots()` is what a node watches to
+start that replacement in time, since a key with no slots left cannot even sign
+its own successor.
+
+---
+
+## Two published forms
+
+Both carry the same payload and the same signed message. They differ only in how
+the quorum is evidenced, and a verifier accepts either.
+
+| | `StatusList` | `SnarkStatusList` |
+|---|---|---|
+| evidence | the `t` raw signatures + a signer bitmap | one aggregated SNARK proof |
+| naming the signers | `ceil(N/8)` = 25 B bitmap | public keys inside the aggregate |
+| prover | none | 750 ms · 2.1 GB |
+| verifier setup | none | ~5 s · 651 MB resident |
+| verify | `t` × `xmss_verify`, linear in `t` | one check, flat in `t` |
+| payload at `t=128` | ≈ 189 KB | ≈ 234 KB |
+| entry point | `committee::verify_quorum` | `committee::verify_proof` |
+
+A signer is named by its **index into the committee's member list**. The anchor
+already fixes and authenticates that order, so the index is a stable identifier
+that costs one bit. Against a list of identifiers — public keys, DIDs, names —
+the bitmap buys three things:
+
+- **Structural distinctness.** A bit is set or it is not, so a member cannot
+  appear twice. With a list you must remember to reject duplicates, and
+  forgetting turns `t`-of-`N` into "one member signs `t` times".
+- **A canonical encoding.** One signer set has exactly one bitmap, where a list
+  of `t` identifiers has `t!` orderings — all valid, all distinct on the wire,
+  which breaks deduplication once records are content-addressed in a DHT.
+- **No key material on the wire.** Membership stops being a check at all: an
+  index *is* a member, so a non-member is unnameable rather than merely rejected.
+
+Two encodings of one signer set would still be possible if the bits past member
+`N-1` were free, so `verify_quorum` requires them clear, and `from_bytes` rejects
+a bitmap whose population disagrees with the number of signatures.
+
+What the bitmap does **not** hide is the participation pattern: anyone holding the
+anchor learns who signed, and correlating records over time reveals which members
+are always present. That is disclosure of behaviour, not of secrets, and it is
+unavoidable — a verifier cannot check a signature without knowing whose key to
+check it against. Note this leaks *less* than the SNARK path, whose aggregate
+carries the signers' full public keys.
+
+---
+
+## Slot derivation
+
+XMSS is stateful, so each update must consume a fresh slot, and leanVM's
+aggregation requires all `t` signatures of one update to sit at **the same** slot.
+Letting each member advance a counter of its own cannot satisfy that once
+`t < N`: the members who sit out a round do not advance, so by the next round they
+disagree about the slot and aggregation becomes impossible — not eventually, but
+by round two.
+
+So the slot is **derived, never negotiated**, the way a validator computes its
+slot from the clock:
+
+```
+slot = committee.genesis_slot() + version
+```
+
+`genesis_slot` lives in the anchor, which makes the derivation authenticated
+rather than a convention each node must be trusted to follow. `Committee::slot_for`
+is the only place it is computed — signer and verifier must agree bit for bit, and
+two independent `genesis + version` expressions are two places to drift.
+
+Three consequences:
+
+- **`AtomicSlotCounter::reserve_at`** replaces "give me my next slot" with "give me
+  *this* slot". Above the counter it burns every slot up to the requested one in a
+  single durable write: a member that missed six rounds skips six slots rather
+  than reclaiming them. Skipping is free — the window is `2^32` wide — while reuse
+  costs the key.
+- **Below the counter it refuses** (`AlreadySpent`), which doubles as the
+  anti-double-sign guard: a version this member already signed maps to a spent
+  slot and is unreachable, with no extra state to keep. Being refused is normal —
+  the member abstains and the quorum proceeds without it. That is what `t < N` is
+  for.
+- **A failed round consumes a version.** If a round does not reach `t`, the
+  members who did sign have already burned that slot, so the retry moves to the
+  next version. `version` therefore counts *rounds attempted*, and the published
+  sequence has gaps. Nothing downstream breaks: `try_advance` requires strictly
+  greater, not consecutive.
+
+It also bounds an attack. To forge a slot-consistent record at an inflated
+version, an attacker needs a key covering `genesis + version` — so the reachable
+lie stops at the end of the key window, not at `u32::MAX`.
 
 ---
 
@@ -137,20 +243,26 @@ and the second run loads the mark from disk.
 
 ```
 src/
-  status_list.rs   StatusList struct, entry -> field mapping, versioned Poseidon2 root, wire format
-  committee.rs     Committee anchor, sign_and_prove, verify_proof (4 checks), select_freshest
-  freshness.rs     HighWaterMark: persistent, anchor-scoped anti-rollback gate
-  params.rs        demo parameters (SLOT, N_MEMBERS, T, N_UPDATES, KEY_SLOTS, LOG_INV_RATE)
-  mem.rs           VmRSS / VmHWM probes
-  stats.rs         descriptive statistics for the benchmark records
-  main.rs          combined demo: setup, N updates, 2 security tests, BENCH record
-  bin/prover.rs    split deployment: signs and aggregates, writes artifacts, never verifies
-  bin/verifier.rs  split deployment: verify-only, calls setup_verifier() alone
+  status_list.rs        StatusList (raw + bitmap) and SnarkStatusList, versioned Poseidon2 root, wire format
+  committee.rs          Committee anchor, slot_for, sign_and_prove, verify_proof / verify_quorum, select_freshest
+  atomic_slot_counter.rs durable monotonic slot allocator: reserve, reserve_at, fsync + cross-process lock
+  signer_node.rs        one member: XMSS keypair + its counter; sign (local slot) and sign_at (protocol slot)
+  verifier_node.rs      one relying party: holds the anchor, verifies either record form
+  freshness.rs          HighWaterMark: persistent, anchor-scoped anti-rollback gate
+  params.rs             demo parameters (SLOT, N_MEMBERS, T, N_UPDATES, KEY_SLOTS, LOG_INV_RATE)
+  mem.rs                VmRSS / VmHWM probes
+  stats.rs              descriptive statistics for the benchmark records
+  main.rs               combined demo: setup, N updates, 3 security tests, BENCH record
+  bin/prover.rs         split deployment: signs and aggregates, writes artifacts, never verifies
+  bin/verifier.rs       split deployment: verify-only, calls setup_verifier() alone
+  bin/raw_agg.rs        the same protocol without a SNARK, through SignerNode / VerifierNode
+  bin/my_test_2.rs      smallest end-to-end walkthrough of the raw path: VC -> JCS -> entry -> quorum -> verify
 examples/
-  footprint.rs     RAM cost of setup_prover vs setup_verifier
+  footprint.rs          RAM cost of setup_prover vs setup_verifier
 docs/
   committee-status-list.md   design rationale
-benchmark.sh       reproducible multi-run benchmark (env capture, tidy CSV, CI95)
+  architecture.svg / .png    the diagram at the top of this file
+benchmark.sh            reproducible multi-run benchmark (env capture, tidy CSV, CI95)
 ```
 
 The demo constants live in `src/params.rs`. The `verifier` binary deliberately
@@ -179,7 +291,9 @@ stack) and `target-cpu=native`.
 ## Build & run
 
 ```sh
-cargo run --release
+cargo run --release --bin decentralized-root-of-trust   # the SNARK demo, one process
+cargo run --release --bin raw_agg                       # the same protocol, no SNARK
+cargo run --release --bin my_test_2                     # smallest raw walkthrough, VC to verdict
 ```
 
 Example output (shape):
@@ -335,7 +449,7 @@ never per signature:
 | `prove` | those `t` signatures are aggregated into one SNARK (SNARK path only) |
 | `verify` | a relying party checks the evidence for **one** update: decode, committee membership of the `t` signers, message/version binding, quorum ≥ `t`, then the aggregate itself |
 
-| metric | prover | verifier | combined | raw XMSS (no proof) |
+| metric | prover | verifier | combined | raw XMSS (no proof) ‡ |
 |---|---|---|---|---|
 | setup (once/process) | ~5.21 s | ~5.11 s | ~5.09 s | none |
 | sign / update (`t` sigs) | 917 ms | — | 917 ms | 950 ms |
@@ -364,6 +478,19 @@ clean prover window (median 719.1 ms) to 0.1%. Quote 718 ms.
 prove/update is strongly governor-sensitive: on `schedutil` the same measurement
 inflates by ~60% because the CPU underclocks the sustained prover — always pin
 `performance` before quoting prove time. Memory does not depend on the governor.
+
+‡ **The raw column predates the bitmap record and needs a re-run.** `raw_agg` now
+goes through `SignerNode` / `VerifierNode` and the `StatusList` type, which moves
+two numbers in opposite directions (single-run figures, not n=30 medians):
+
+| | old `Vec<(pubkey, signature)>` | now `StatusList` |
+|---|---|---|
+| sign / update | 950 ms | **1140 ms** — every signature now burns its slot durably first (one `fsync` pair each), a cost `prover.rs` never pays |
+| bytes / update | 193 357 B | **188 731 B** — the `t` public keys are gone, replaced by a 25-byte bitmap |
+| verify / update | 54.3 ms | **52.5 ms** — including the wire decode |
+
+Compare *verify* and *size* across the two paths freely; compare *sign* knowing
+only one side pays for durability. Re-run `./benchmark.sh` for quotable medians.
 
 **Small committee — `N=10, t=7`:**
 
@@ -498,6 +625,11 @@ Three attacks that **must be rejected**:
   version binding in check 2. Before the version was signed, this was accepted —
   it is the regression test for [versioning](#versioning-and-freshness).
 
+  The forgery is deliberately built **slot-consistent**: signed at the slot its
+  inflated version derives to, so check 3 passes and check 2 is what fires. A
+  sloppier forgery would be caught one step earlier and the artifact would
+  silently stop testing the binding it exists for.
+
 In the combined demo all three print `rejected = true` and the run reports
 `security OK: true`. In the split deployment the same attacks are written by
 `prover` as `attack-*.bin` and rejected by `verifier`, which exits non-zero if any
@@ -511,5 +643,15 @@ high-water mark, not by `verify_proof`: `verifier` accepts the newest update, th
 replays an old one and shows it refused
 (see [Versioning and freshness](#versioning-and-freshness)).
 
-Not covered: a **sub-threshold quorum** (check 3), i.e. `t-1` legitimate members
-signing the correct list. That path has no test.
+The raw path runs its own four in `raw_agg`, each built from a *genuine* quorum so
+that only the binding under test can fail: tampered list, re-labelled version,
+**sub-threshold quorum** (`t-1` valid signatures), and an outsider occupying a
+member's seat. The binary exits non-zero if any is accepted.
+
+`cargo test` adds the cases that are awkward to stage in a binary: a member
+supplying the whole quorum by itself, signatures re-attributed to other indices,
+padding bits set past member `N-1`, and the wire encoding being independent of the
+order the signers were collected in.
+
+Still untested: a sub-threshold quorum on the **SNARK** path (check 4). The raw
+path covers it; the aggregated one does not.

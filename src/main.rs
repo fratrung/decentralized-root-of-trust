@@ -13,7 +13,7 @@ use decentralized_root_of_trust::committee::{Committee, make_proof, sign_and_pro
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::status_list::{
-    Algorithms, StatusList, hash_any, status_list_root_fe,
+    Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
 };
 use lean_multisig::{
     XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover, setup_verifier, xmss_key_gen,
@@ -46,7 +46,7 @@ fn usize_median(v: &[usize]) -> usize {
 }
 
 /// One round: the `signers` sign the root of `list` at `slot`, the signatures
-/// are aggregated into ONE proof, the StatusList is built and verified against
+/// are aggregated into ONE proof, the SnarkStatusList is built and verified against
 /// the `committee`. Returns (status_list, sign_time, prove_time, verify_time).
 fn run_flow(
     keypairs: &[(XmssSecretKey, XmssPublicKey)],
@@ -56,7 +56,7 @@ fn run_flow(
     version: u32,
     committee: &Committee,
     rng: &mut ThreadRng,
-) -> (StatusList, Duration, Duration, Duration) {
+) -> (SnarkStatusList, Duration, Duration, Duration) {
     // The signed message binds both the list and its version (Option B).
     let message = status_list_root_fe(&list, version);
 
@@ -73,7 +73,7 @@ fn run_flow(
     let zk_proof = make_proof(raws, message, slot, LOG_INV_RATE);
     let prove_time = t_prove.elapsed();
 
-    let status_list = StatusList::new(Algorithms::WotsXmss, list, version, zk_proof);
+    let status_list = SnarkStatusList::new(Algorithms::WotsXmss, list, version, zk_proof);
 
     let t_verify = Instant::now();
     let ok = verify_proof(committee, &status_list);
@@ -127,7 +127,7 @@ fn main() {
     }
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
     // The fixed trust anchor, built once and shared by every verification below.
-    let committee = Committee::new(members, T);
+    let committee = Committee::new(members, T, SLOT);
     println!("committee N={N_MEMBERS} t={T}; {N_UPDATES} updates rotating the signers\n");
 
     // ---- N_UPDATES updates, rotating the `t` signers over the `N` members ----
@@ -198,7 +198,8 @@ fn main() {
     );
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION")); // row not authorized by the committee
-    let sl_tampered = StatusList::new(Algorithms::WotsXmss, tampered, honest_version, good_proof);
+    let sl_tampered =
+        SnarkStatusList::new(Algorithms::WotsXmss, tampered, honest_version, good_proof);
     let tamper_rejected = !verify_proof(&committee, &sl_tampered);
 
     // B) proof from signers OUTSIDE the committee (keys not in it).
@@ -209,7 +210,7 @@ fn main() {
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
     let out_proof = make_signed_proof(&outsiders, &quorum, &out_list, SLOT, 0, &mut rng);
-    let sl_outsider = StatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof);
+    let sl_outsider = SnarkStatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof);
     let outsider_rejected = !verify_proof(&committee, &sl_outsider);
 
     // C) version spoof: a VALID proof of (list, version) re-labelled with a
@@ -225,7 +226,7 @@ fn main() {
         signed_version,
         &mut rng,
     );
-    let sl_spoofed = StatusList::new(
+    let sl_spoofed = SnarkStatusList::new(
         Algorithms::WotsXmss,
         list.clone(),
         signed_version + 1000,

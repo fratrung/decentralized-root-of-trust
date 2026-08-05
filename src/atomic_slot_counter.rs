@@ -36,7 +36,6 @@ use std::path::{Path, PathBuf};
 use lean_multisig::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 
-
 /// Writes `next_free` so that it survives a power cut, then returns.
 ///
 /// The four steps are all load-bearing:
@@ -75,8 +74,7 @@ fn acquire_lock(state_path: &Path) -> Result<File, AtomicSlotCounterError> {
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
-    file.try_lock()
-        .map_err(|_| AtomicSlotCounterError::Busy)?;
+    file.try_lock().map_err(|_| AtomicSlotCounterError::Busy)?;
     Ok(file)
 }
 
@@ -115,6 +113,10 @@ fn parse(s: &str, key_tag: &str) -> Result<u32, AtomicSlotCounterError> {
 pub enum AtomicSlotCounterError {
     /// The key's slot window is used up. Only a re-key fixes this.
     Exhausted { next: u32, end: u32 },
+    /// A protocol-chosen slot lies in this member's past. Returned only by
+    /// [`AtomicSlotCounter::reserve_at`], and the one variant here that is not a
+    /// malfunction: the member simply sits this round out.
+    AlreadySpent { requested: u32, next: u32 },
     /// The state file is missing, malformed, or belongs to a different key.
     /// Refusing here is the whole point: see the module docs.
     State(String),
@@ -130,6 +132,10 @@ impl std::fmt::Display for AtomicSlotCounterError {
             Self::Exhausted { next, end } => write!(
                 f,
                 "slot window exhausted (next {next} > end {end}); re-key required"
+            ),
+            Self::AlreadySpent { requested, next } => write!(
+                f,
+                "slot {requested} already spent (next free {next}); abstaining from this round"
             ),
             Self::State(m) => write!(f, "unusable slot state: {m}"),
             Self::Busy => write!(f, "another process holds this key"),
@@ -279,9 +285,50 @@ impl AtomicSlotCounter {
         self.next += 1;
         Ok(slot)
     }
+
+    /// Reserves the slot the *protocol* chose, rather than the next local one.
+    ///
+    /// Per-member counters stop working once `t < N`: the members that sit out a
+    /// round do not advance, so by the next one they disagree about the slot, and
+    /// an aggregate over one shared slot becomes impossible. Deriving the slot
+    /// from shared state — `slot = genesis + version` — removes the disagreement
+    /// instead of reconciling it.
+    ///
+    /// Above `next`, every slot up to `requested` is burned in one durable write:
+    /// a member that missed six rounds skips six slots rather than reclaiming
+    /// them. Skipping is free (the window is `2^32` wide), reuse costs the key.
+    ///
+    /// Below `next` the answer is [`AtomicSlotCounterError::AlreadySpent`], which
+    /// doubles as the anti-double-sign guard: a version this member already signed
+    /// maps to a spent slot and is unreachable, with no extra state to keep. Being
+    /// refused is a normal outcome — the member abstains and the quorum proceeds
+    /// without it, which is what `t < N` is for.
+    pub fn reserve_at(&mut self, requested: u32) -> Result<u32, AtomicSlotCounterError> {
+        if requested > self.end {
+            return Err(AtomicSlotCounterError::Exhausted {
+                next: requested,
+                end: self.end,
+            });
+        }
+        if requested < self.next {
+            return Err(AtomicSlotCounterError::AlreadySpent {
+                requested,
+                next: self.next,
+            });
+        }
+        if requested >= self.durable {
+            // Same batching rule as `reserve`, clamped so the record never claims
+            // slots outside the key's window.
+            let target = requested
+                .saturating_add(self.batch)
+                .min(self.end.saturating_add(1));
+            persist(&self.path, &self.key_tag, target)?;
+            self.durable = target;
+        }
+        self.next = requested + 1;
+        Ok(requested)
+    }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -368,6 +415,66 @@ mod tests {
         assert!(matches!(
             c.reserve(),
             Err(AtomicSlotCounterError::Exhausted { .. })
+        ));
+    }
+
+    /// The protocol-driven path: a member follows the round number, skipping the
+    /// slots of the rounds it missed instead of replaying them.
+    #[test]
+    fn protocol_slots_jump_forward_and_never_back() {
+        let path = scratch("at");
+        let (_, pk) = key(7);
+        let mut c = AtomicSlotCounter::create(&path, &pk, 100, 140).unwrap();
+
+        assert_eq!(c.reserve_at(100).unwrap(), 100);
+        // Missed rounds 101..104: those slots are burned, not banked.
+        assert_eq!(c.reserve_at(105).unwrap(), 105);
+        assert_eq!(c.next_slot(), 106);
+
+        // A round already behind us is refused — including the one just signed,
+        // which is the anti-double-sign guard.
+        assert!(matches!(
+            c.reserve_at(103),
+            Err(AtomicSlotCounterError::AlreadySpent { .. })
+        ));
+        assert!(matches!(
+            c.reserve_at(105),
+            Err(AtomicSlotCounterError::AlreadySpent { .. })
+        ));
+        // A refusal must not move the counter: the member abstained, nothing more.
+        assert_eq!(c.next_slot(), 106);
+
+        // Past the key's window is exhaustion, a different failure entirely.
+        assert!(matches!(
+            c.reserve_at(141),
+            Err(AtomicSlotCounterError::Exhausted { .. })
+        ));
+
+        // The refusal survives a restart, which is the only thing that matters.
+        drop(c);
+        let mut c = AtomicSlotCounter::open(&path, &pk, 140).unwrap();
+        assert!(matches!(
+            c.reserve_at(105),
+            Err(AtomicSlotCounterError::AlreadySpent { .. })
+        ));
+        assert_eq!(c.reserve_at(106).unwrap(), 106);
+    }
+
+    /// `reserve` and `reserve_at` share one counter, so mixing them is safe:
+    /// whichever ran last, the next slot is still strictly ahead of every slot
+    /// already handed out.
+    #[test]
+    fn protocol_and_local_reservations_share_one_counter() {
+        let path = scratch("mixed");
+        let (_, pk) = key(7);
+        let mut c = AtomicSlotCounter::create(&path, &pk, 100, 140).unwrap();
+
+        assert_eq!(c.reserve().unwrap(), 100);
+        assert_eq!(c.reserve_at(110).unwrap(), 110);
+        assert_eq!(c.reserve().unwrap(), 111);
+        assert!(matches!(
+            c.reserve_at(111),
+            Err(AtomicSlotCounterError::AlreadySpent { .. })
         ));
     }
 
