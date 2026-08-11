@@ -23,11 +23,37 @@ pub const T: usize = 128;
 /// Number of sequential updates the demo performs.
 ///
 /// Bounded by the keygen window below: keys are generated for
-/// `SLOT..=SLOT + KEY_SLOTS`, and the security tests consume one extra slot.
+/// `SLOT..=SLOT + KEY_SLOTS` (**both bounds inclusive**), the updates consume
+/// slots `SLOT..SLOT + N_UPDATES`, and the security tests consume **two** more —
+/// `SLOT + N_UPDATES` for the tampered-list forgery and `SLOT + KEY_SLOTS`, the
+/// last slot of the window, for the slot-consistent version forgery. So the real
+/// bound is `N_UPDATES < KEY_SLOTS`, not `N_UPDATES <= KEY_SLOTS`.
 pub const N_UPDATES: usize = 20;
 
 /// Width of the XMSS slot window each committee key is generated for.
 pub const KEY_SLOTS: u32 = 64;
+
+// The bound above, enforced rather than described. `main.rs` and `prover.rs` hold
+// the committee secret keys and sign by plain arithmetic on these two constants —
+// they do not go through `AtomicSlotCounter`, so nothing at runtime would notice a
+// collision.
+//
+// `N_UPDATES == KEY_SLOTS` is the dangerous value, and it fails silently: the
+// updates end at `SLOT + KEY_SLOTS - 1`, then the tampered-list forgery derives
+// `SLOT + N_UPDATES` and the version forgery derives `SLOT + KEY_SLOTS` — the same
+// slot, still inside the key window (`xmss_key_gen`'s range is inclusive at both
+// ends), so `t` members sign two different messages there and the demo prints
+// `security OK: true` while the secret keys are being destroyed.
+//
+// One past that (`N_UPDATES == KEY_SLOTS + 1`) is loud instead — the forgery slot
+// falls outside the window and `xmss_sign` fails — but relying on that is relying
+// on the *second* mistake to catch the first.
+const _: () = assert!(
+    N_UPDATES < KEY_SLOTS as usize,
+    "N_UPDATES must be < KEY_SLOTS: the two security-test forgeries consume the \
+     slots above the update range, and at N_UPDATES == KEY_SLOTS they collide, \
+     making the committee sign twice at one XMSS slot"
+);
 
 /// WHIR inverse rate. Trades prover memory against proof size and soundness
 /// margin — changing it changes the security level, so measure before touching.

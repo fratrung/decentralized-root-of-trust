@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::{Committee, select_freshest, verify_proof};
+use decentralized_root_of_trust::committee::{
+    Committee, select_freshest, select_freshest_above, verify_proof,
+};
 use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::stats::Series;
@@ -167,7 +169,24 @@ fn main() -> ExitCode {
     if let Ok(forgery) = std::fs::read(dir.join("attack-version.bin")) {
         candidates.push(forgery); // a hostile peer advertising a fake-fresh version
     }
-    match select_freshest(&committee, &candidates) {
+    // The mark is passed *into* the selection, not merely consulted after it. A
+    // record at or below the mark would verify and then be refused as stale, so
+    // paying for its proof first buys nothing — and the stale case is the common
+    // one, since a node polling an unchanged list hits it every round.
+    let floor = hwm.current();
+    // How many candidates the floor removes, counted by *decoding* only — no proof
+    // is verified to produce this number. That is the point: the diagnostic below
+    // must not undo the saving it is reporting on.
+    let pruned = match floor {
+        Some(f) => candidates
+            .iter()
+            .filter(|b| {
+                SnarkStatusList::from_bytes(b).is_ok_and(|sl: SnarkStatusList| sl.version() <= f)
+            })
+            .count(),
+        None => 0,
+    };
+    match select_freshest_above(&committee, &candidates, floor) {
         Some(sl) => match hwm.try_advance(sl.version()) {
             Decision::Accepted => {
                 println!(
@@ -175,12 +194,36 @@ fn main() -> ExitCode {
                     sl.version()
                 )
             }
-            Decision::Stale(hw) => println!(
-                "  selected version {} -> not newer than high-water {}, nothing to do",
-                sl.version(),
-                hw
-            ),
+            // Unreachable while `floor` comes from this same mark: anything the
+            // floor let through is strictly above it, and the gate applies the same
+            // rule. Reaching it means the filter and the gate disagree, which is a
+            // bug in one of them and not a quiet "nothing to do".
+            Decision::Stale(hw) => {
+                println!(
+                    "  selected version {} -> not newer than high-water {hw} <- BUG (the floor let it through)",
+                    sl.version()
+                );
+                failures += 1;
+            }
         },
+        // Nothing came back, and the two reasons are not the same thing: the floor
+        // may have removed everything worth verifying (a re-run over an unchanged
+        // corpus — correct, and the case the floor exists for), or nothing verified
+        // at all with no floor in play (a bug). `pruned` tells them apart without
+        // verifying anything, which is the whole point — re-running the selection
+        // unfloored to produce a nicer message would undo the saving being reported.
+        //
+        // The condition is `pruned > 0`, not "everything was pruned": the planted
+        // forgery declares a version *above* the mark, so it always survives the
+        // floor and always fails to verify. That is the artifact doing its job, not
+        // a bug. And this branch is not where a broken update would be caught
+        // anyway — every update is verified individually in the loop above, which
+        // prints `REJECTED <- BUG` and counts a failure for each one.
+        None if pruned > 0 => println!(
+            "  nothing newer than high-water {}: {pruned} of {} candidates pruned before verifying any proof",
+            floor.expect("a non-zero prune count requires a floor"),
+            candidates.len()
+        ),
         None => {
             println!(
                 "  no valid record among {} candidates <- BUG",
@@ -192,11 +235,20 @@ fn main() -> ExitCode {
 
     // Rollback attack: a hostile peer replays an old but validly signed record. It
     // passes verification (stateless) yet must be refused as stale by the mark.
-    if hwm.current().is_some()
-        && let Ok(stale) = std::fs::read(dir.join("update-01.bin"))
-        && let Some(sl) = select_freshest(&committee, std::slice::from_ref(&stale))
-    {
-        match hwm.try_advance(sl.version()) {
+    //
+    // Every way of *not* running this test is itself a failure. The chain used to
+    // be one `if let` sequence, so a missing artifact — the corpus regenerated with
+    // a single update, a renamed file — skipped the whole check with no output and
+    // nothing added to `failures`. A security test that silently declines to run is
+    // worse than one that fails, because the summary still reads clean.
+    let replayed = artifacts(dir, "update-")
+        .into_iter()
+        .next()
+        .and_then(|p| std::fs::read(&p).ok())
+        .and_then(|bytes| select_freshest(&committee, std::slice::from_ref(&bytes)));
+
+    match (hwm.current(), replayed) {
+        (Some(_), Some(sl)) => match hwm.try_advance(sl.version()) {
             Decision::Stale(hw) => println!(
                 "  rollback: replayed version {} refused (high-water {})",
                 sl.version(),
@@ -209,6 +261,14 @@ fn main() -> ExitCode {
                 );
                 failures += 1;
             }
+        },
+        (None, _) => {
+            println!("  rollback: NOT TESTED (no high-water mark) <- SECURITY FAILURE");
+            failures += 1;
+        }
+        (_, None) => {
+            println!("  rollback: NOT TESTED (no replayable update) <- SECURITY FAILURE");
+            failures += 1;
         }
     }
 

@@ -43,6 +43,23 @@ fn main() {
     let outdir = Path::new(&outdir);
     std::fs::create_dir_all(outdir).expect("cannot create output directory");
 
+    // Clear artifacts from a previous run rather than writing over them. A shorter
+    // run leaves the tail of a longer one behind, and those files were signed by a
+    // *different* committee — the verifier correctly rejects them and counts
+    // failures, which reads as a security regression rather than as the stale
+    // directory it is. The docs say "start from a clean directory"; this makes it
+    // true instead of asking.
+    for entry in std::fs::read_dir(outdir).expect("cannot read output directory") {
+        let path = entry.expect("cannot read directory entry").path();
+        let stale = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n == "anchor.bin" || n.starts_with("update-") || n.starts_with("attack-")
+        });
+        if stale {
+            std::fs::remove_file(&path)
+                .unwrap_or_else(|e| panic!("cannot remove stale {}: {e}", path.display()));
+        }
+    }
+
     // Raw per-update records for the benchmark harness; off by default so
     // interactive runs stay readable.
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
@@ -63,11 +80,11 @@ fn main() {
         keypairs.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("keygen failed"));
     }
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
-    write(
-        outdir,
-        "anchor.bin",
-        &Committee::new(members, T, SLOT).to_bytes(),
-    );
+    // Kept rather than built inline and dropped: every slot below is derived
+    // through `slot_for`, so the anchor stays the only place `genesis + version`
+    // is ever computed — signer and verifier cannot drift apart.
+    let committee = Committee::new(members, T, SLOT);
+    write(outdir, "anchor.bin", &committee.to_bytes());
 
     println!("committee N={N_MEMBERS} t={T}; {N_UPDATES} updates rotating the signers");
     println!("writing artifacts to {}/\n", outdir.display());
@@ -86,9 +103,10 @@ fn main() {
         let signers: Vec<usize> = (0..T).map(|j| (i + j) % N_MEMBERS).collect();
         // `slot` is the XMSS epoch (bounded by KEY_SLOTS); `version` is the
         // application counter, bound into the signed message so the cleartext
-        // field cannot be forged. Independent by design.
-        let slot = SLOT + i as u32;
+        // field cannot be forged. Independent by design, and the slot is derived
+        // through the anchor rather than spelled out a second time.
         let version = i as u32;
+        let slot = committee.slot_for(version).expect("slot overflow");
         let message = status_list_root_fe(&list, version);
 
         // Signing and proving are timed apart: signing is `t` plain XMSS
@@ -116,15 +134,17 @@ fn main() {
 
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
-        let who: String = signers
-            .iter()
-            .map(|&j| char::from(b'A' + j as u8))
-            .collect();
+        // The signer window as a range rather than one character per member: at
+        // N=200 the old `b'A' + index` mapping ran off the printable range into
+        // Latin-1 and C1 control codes, and past N_UPDATES = 64 it would have
+        // overflowed the u8 outright — a panic in debug, a silent wrap in release.
         println!(
-            "  update {:2}/{}  signers {}  v{}  slot {}  sign={:>7.1?}  prove={:>8.1?}  {} B  RAM={} MB",
+            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  sign={:>7.1?}  prove={:>8.1?}  {} B  RAM={} MB",
             i + 1,
             N_UPDATES,
-            who,
+            signers[0],
+            signers[signers.len() - 1],
+            signers.len(),
             version,
             slot,
             sign_time,
@@ -150,8 +170,8 @@ fn main() {
 
     // ---- Forgeries the verifier must reject. Built here only because this is
     // the process that owns signing keys; conceptually these are the attacker's.
-    let attack_slot = SLOT + N_UPDATES as u32;
     let attack_version = N_UPDATES as u32;
+    let attack_slot = committee.slot_for(attack_version).expect("slot overflow");
     let quorum: Vec<usize> = (0..T).collect();
 
     // A) a valid proof of the honest list, attached to a list with an extra row.
@@ -209,7 +229,7 @@ fn main() {
     //    attacker needs a key covering that slot, so the reachable versions stop at
     //    the end of the key window. KEY_SLOTS is the largest lie available.
     let spoof_version = KEY_SLOTS;
-    let spoof_slot = SLOT + spoof_version;
+    let spoof_slot = committee.slot_for(spoof_version).expect("slot overflow");
     let signed_version = (N_UPDATES - 1) as u32; // the true latest
     let versioned_proof = sign_and_prove(
         &keypairs,
@@ -233,6 +253,12 @@ fn main() {
 
     let (sg_min, sg_med, sg_max) = sign.min_med_max();
     let (pv_min, pv_med, pv_max) = prove.min_med_max();
+    // Same reasoning as `main.rs::dur_stats`: an empty series means no update was
+    // ever produced, and a silent 0 would be reported as a measurement.
+    assert!(
+        !proof_bytes.is_empty(),
+        "no proofs were produced (N_UPDATES = 0?); refusing to report a size"
+    );
     let proof_med = {
         let mut b = proof_bytes.clone();
         b.sort_unstable();

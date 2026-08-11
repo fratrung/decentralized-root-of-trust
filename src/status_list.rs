@@ -114,8 +114,23 @@ impl SnarkStatusList {
     ///
     /// Requires the aggregation bytecode to be initialized: `setup_prover()`
     /// or `setup_verifier()` MUST be called first.
+    ///
+    /// Rejects trailing bytes, like every other decoder here. It used to accept
+    /// them (`postcard::from_bytes` never calls `finalize`), and `zk_proof` is a
+    /// length-prefixed `Vec<u8>`, so padding it produced a byte-different record
+    /// that still verified — one logical update with unboundedly many encodings,
+    /// each a distinct key in a content-addressed DHT. That unbounded family is
+    /// closed; see [`SnarkStatusList::from_bytes`] for the narrower one that
+    /// remains.
     pub fn proof(&self) -> Result<lean_multisig::SingleMessageAggregateSignature, String> {
-        postcard::from_bytes(&self.zk_proof).map_err(|e| format!("proof not deserializable: {e}"))
+        let (value, rest) = postcard::take_from_bytes::<
+            lean_multisig::SingleMessageAggregateSignature,
+        >(&self.zk_proof)
+        .map_err(|e| format!("proof not deserializable: {e}"))?;
+        if !rest.is_empty() {
+            return Err(format!("{} trailing byte(s) after proof", rest.len()));
+        }
+        Ok(value)
     }
 
     /// Wire encoding of the published object — this is what would go into the DHT.
@@ -125,9 +140,25 @@ impl SnarkStatusList {
 
     /// Inverse of [`SnarkStatusList::to_bytes`].
     ///
-    /// Rejects trailing bytes, so the encoding is canonical: a published object
-    /// has exactly one valid byte representation. That matters as soon as the
-    /// structure is content-addressed, as it is in a DHT.
+    /// Rejects trailing bytes, which closes the *unbounded* source of alternative
+    /// encodings — padding a length-prefixed field is free and repeatable.
+    ///
+    /// It does **not** make the encoding canonical, and the difference matters for
+    /// a content-addressed DHT. postcard's varint decoder errors only when the last
+    /// permitted byte would overflow the type, so a non-minimal `87 00` decodes to
+    /// the same `7` as `07`; the `version` field, every `Vec` length prefix and the
+    /// `Algorithms` discriminant all admit that padding. A re-encoded record is a
+    /// different key with the same meaning, so deduplication is best-effort here,
+    /// not guaranteed.
+    ///
+    /// This is a *storage* property, not a security one: nothing downstream trusts
+    /// these bytes. The signed message is recomputed from the decoded values, so a
+    /// re-encoding verifies exactly as the original does and forges nothing.
+    ///
+    /// Closing it fully costs a re-encode-and-compare on every decode, as
+    /// [`crate::committee::Committee::from_bytes`] does — affordable for an anchor
+    /// read once at startup, less obviously so on the verify path, where the
+    /// aggregate is the bulk of the record.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let (value, rest) = postcard::take_from_bytes::<Self>(bytes)
             .map_err(|e| format!("status list not deserializable: {e}"))?;

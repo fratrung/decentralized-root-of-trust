@@ -19,31 +19,33 @@ verifier accepts either:
 
 The verifier embeds one fixed anchor — the committee (`N` public keys, threshold
 `t`, genesis slot) — and needs no live data fetch.
-`docs/committee-status-list.md` holds the design rationale; `README.md` holds the
-measured numbers and the architecture diagram.
+`README.md` holds the design rationale, the measured numbers and the architecture
+diagram; the per-module reasoning lives in the doc comments themselves.
 
 ## Commands
 
 ```sh
 cargo run --release --bin decentralized-root-of-trust  # combined SNARK demo: setup, N updates, 3 security tests
 cargo run --release --bin raw_agg                      # the same protocol with no SNARK, through SignerNode/VerifierNode
-cargo run --release --bin my_test_2                    # smallest raw walkthrough: VC -> JCS -> entry -> quorum -> verify
 cargo run --release --bin prover   -- [outdir]         # split: sign + aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --example footprint -- prover      # RAM of setup alone; also: verifier | none
-cargo test --lib                                       # 18 unit tests, seconds, no SNARK setup
+cargo test                                             # 38 unit + 6 integration tests, ~10 s (incl. a real SNARK)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
+tools/mutate.py                                        # mutation testing: 21 checks, each must be caught by a test
 ```
 
 **Always `--release`** for anything touching the prover; it is unusable in a debug
 build. The first build compiles the whole leanVM tree and takes several minutes.
-`cargo test --lib` is fine in debug — nothing there calls `setup_prover()`.
+`cargo test` is fine in debug: `Cargo.toml` optimizes dependencies in the dev
+profile, which is what makes `tests/snark_path.rs` affordable there (~10 s) even
+though it drives a real prover.
 
-The unit tests cover the slot counter and the raw quorum path, which are cheap to
-exercise. The SNARK path has no unit tests and is asserted by running the
-binaries: the combined demo must print `security OK: true`, `raw_agg` and
-`verifier` must exit 0. `benchmark.sh` refuses to print timings if any run reports
-a failure.
+The tests cover the slot counter, the raw quorum path and — since
+`tests/snark_path.rs` — each of the five checks in `verify_proof`. The binaries
+remain the end-to-end assertion: the combined demo must print `security OK: true`,
+`raw_agg` and `verifier` must exit 0. `benchmark.sh` refuses to print timings if
+any run reports a failure.
 
 `.cargo/config.toml` sets `RUST_MIN_STACK=512MiB` (the prover recurses very
 deeply) and `target-cpu=native`. Both are required — don't run the binary in a
@@ -79,6 +81,9 @@ Library:
   derived), `sign_and_prove`/`make_proof`, both `verify_proof` and
   `verify_quorum`, and `select_freshest` (the DHT-layer freshness selection:
   newest declared version first, verify, fall back on failure).
+  `select_freshest_above` is the same with a floor — the caller's high-water mark
+  — applied before any proof is verified. That is a work saver, not a check: the
+  floor can only drop records the caller was already going to refuse as stale.
 - `src/atomic_slot_counter.rs` — the durable monotonic slot allocator. Burns the
   slot on disk **before** handing it out (write tmp → fsync → rename → fsync the
   parent dir), guarded by a lock on a separate file so two processes cannot share
@@ -99,6 +104,12 @@ Library:
   `verify_proof`, which stays pure.
 - `src/mem.rs`, `src/stats.rs` — RSS probes and descriptive statistics shared by
   every binary.
+- `src/snark_prover_node.rs`, `src/snark_verifier_node.rs` — thin wrappers pairing
+  `setup_prover()` / `setup_verifier()` with the proving and verifying calls. They
+  own **no** policy: both derive the slot through `Committee::slot_for` and the
+  verifier delegates to `committee::verify_proof`, so neither can drift from the
+  checks. Keep it that way — an earlier copy of the verifier wrapper had drifted
+  and silently lost the slot check.
 
 Binaries:
 - `src/main.rs` — the combined single-process demo; still the reference for the
@@ -110,8 +121,41 @@ Binaries:
   real node types end to end. Its `sign` figure therefore includes one `fsync`
   pair per signature that `prover.rs` never pays: compare *verify* and *size*
   across the two paths freely, compare *sign* knowing that.
-- `src/bin/my_test_2.rs` — the smallest complete raw path, one member and two
-  updates, for reading rather than measuring.
+Local scratch binaries (`src/bin/my_test*.rs`) are gitignored: hand-run
+walkthroughs, not part of the published surface and not covered by the tests.
+
+Tests (`cargo test`, ~10 s warm, 44 in total):
+- `src/*.rs` unit tests cover each module against its own contract. `stats.rs`'s
+  are worth a note: they are the only guard on the numbers that reach the paper,
+  and they pin the two choices a "simplification" would silently undo — the
+  median over a lone mean, and the Bessel-corrected (`n-1`) standard deviation
+  `benchmark.sh` builds its confidence interval on.
+- `tests/raw_path_round.rs` covers the seam: rotating quorums over durable
+  counters, the published record verifying against the anchor, and the stale
+  record that still verifies but is refused by the freshness gate. It stays on the
+  raw path deliberately, so it costs milliseconds.
+- `tests/snark_path.rs` covers `verify_proof` with **real** proofs on a small
+  committee (`N=5, t=3`). One case per check, each breaking only that check and
+  asserting the other four still hold; deleting any of the five makes exactly one
+  assertion fail (verified by mutation). Check 5's case splices an honest
+  aggregate's `info` onto another proof body — checks 1-4 then pass by
+  construction, so only the SNARK itself can reject it.
+  - It is one `#[test]`, not several: leanVM's arena has a single region per
+    process and `setup_prover` forbids concurrent proving, which libtest's threads
+    would otherwise do.
+  - `Cargo.toml` sets `[profile.dev.package."*"] opt-level = 3` for this. leanVM's
+    prover is unusable at `opt-level = 0`; optimizing only the dependencies keeps
+    `cargo test` at seconds while this crate keeps its debug assertions and
+    overflow checks. The release profile — what `benchmark.sh` measures — is
+    untouched.
+- `tests/lock_two_processes.rs` checks the cross-process lock with two **real**
+  processes: it re-execs the test binary (`child_probe`, `#[ignore]`d, driven with
+  `--ignored --exact`) and reads a marker line back. The unit tests only ever
+  probed the lock from a second thread, which cannot tell a `flock` from a
+  process-local mutex. Removing `try_lock` makes both tests fail with
+  `PROBE=acquired:<slot>` naming the slot both holders would issue.
+  It also asserts the negative control — after the holder exits, the next process
+  gets the lock *and* resumes from the slot the first durably burned.
 
 ### The split deployment (and why it exists)
 
@@ -129,7 +173,9 @@ Two consequences that drive design decisions here:
 1. **The application's own data structures are noise.** Optimizing `StatusList`,
    `Committee` or the proof bytes for memory is pointless at demo scale; those
    changes matter only for list sizes orders of magnitude larger.
-2. **A verify-only process is ~33% smaller** (~696 MB peak vs ~1042 MB) and, more
+2. **A verify-only process is much smaller** — ~696 MB peak vs ~1042 MB at
+   `N=10, t=7` (~33%), and ~692 MB vs ~2053 MB at the current `N=200, t=128`
+   defaults (~66%), because only the prover's side scales with the committee. More
    importantly, its RSS is **flat** in the number of verifications. A prover
    process's is monotonically increasing, because `zk_alloc::enable_arena()` sets
    `M_TRIM_THRESHOLD=-1` and `M_MMAP_MAX=0` — freed memory is never returned to
@@ -194,18 +240,26 @@ quorum check.
   folds sequentially, so `root([a,b]) != root([b,a])`: one logical revocation set
   has `n!` valid roots. Sorting inside the fold would fix it and is a
   wire-format-breaking change.
-- `SnarkStatusList::proof()` decodes the *inner leanVM aggregate* with
-  `postcard::from_bytes`, which accepts trailing bytes. (The *outer* wire format,
-  `from_bytes` on either record / `Committee::from_bytes`, is canonical — it
-  rejects them.) leanVM offers `SingleMessageAggregateSignature::from_bytes` for
-  the inner one.
+- **The published records are not canonically encoded.** Every decoder rejects
+  trailing bytes, which closes the unbounded family of alternative encodings, but
+  that is not canonicity: postcard's varint decoder errors only on overflow of the
+  last permitted byte, so `87 00` and `07` both decode to `7`. The `version`
+  field, each `Vec` length prefix and the `Algorithms` discriminant all admit that
+  padding, so one logical update still has several valid byte forms and DHT
+  deduplication is best-effort. Not a soundness issue — the signed message is
+  recomputed from the decoded values, so a re-encoding verifies as the original
+  and forges nothing. `Committee::from_bytes` *does* close it fully (re-encode and
+  compare), because the anchor is read once at startup and the freshness gate
+  fingerprints it; the same treatment on the verify path would cost a re-encode of
+  the whole aggregate per record.
 - **Committee rotation is not implemented.** Because the slot is derived, every
   key now runs out at the *same* round (`genesis + KEY_SLOTS`), which turns
   rotation from an asynchronous per-node event into a deadline everybody can
   compute from the anchor — but the hand-off protocol (the old committee signing
   the new one) is still missing.
-- The raw path's checks all have tests (`raw_agg` forgeries + `cargo test`). On
-  the SNARK path, a **sub-threshold quorum** is still untested.
+- Both paths' checks now have tests: `raw_agg` forgeries plus `cargo test` for the
+  raw path, `tests/snark_path.rs` for all five SNARK checks including the
+  sub-threshold quorum.
 
 ## leanVM constraints that shape this code
 

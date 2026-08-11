@@ -307,7 +307,11 @@ fn main() {
         verify.stddev(),
         verify.sum(),
         peak_rss_mb(),
-        all_rejected,
+        // Must be an integer: benchmark.sh's failure gate tests this field against
+        // "1", and a Rust bool would print "true" and score every run as a
+        // security-expectation failure. The name is historical — this is the AND
+        // of all four forgery checks, not just the tampered-list one.
+        all_rejected as u8,
     );
 
     // Counters die with the keys they belong to; see the note at the top.

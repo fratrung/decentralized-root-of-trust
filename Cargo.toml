@@ -22,3 +22,12 @@ postcard = { version = "1.1.3", features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_jcs  = "0.2"
+
+# `tests/snark_path.rs` runs a real leanVM prover, which is not usable at
+# `opt-level = 0` — plain `cargo test` would otherwise take hours instead of
+# seconds. Optimizing the *dependencies* only leaves this crate itself
+# unoptimized, so `cargo test` keeps its debug info, its assertions and its
+# integer-overflow checks. The release profile, which the benchmark measures, is
+# untouched.
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,11 +1,13 @@
 //! Status list controlled by a t-of-N committee (leanVM).
-//!  - one-time prover setup (measured: bytecode vs. extra)
-//!  - N_UPDATES sequential updates, rotating the `t` signers over the `N`
-//!    members at each update (each update = a new XMSS slot; the aggregated
-//!    proof IS the signature of the update)
-//!  - two final security tests that MUST be rejected:
-//!      A) a tampered list carrying a valid proof of a DIFFERENT list
-//!      B) a proof from signers OUTSIDE the committee
+//!
+//! - one-time prover setup (measured: bytecode vs. extra)
+//! - `N_UPDATES` sequential updates, rotating the `t` signers over the `N`
+//!   members at each update (each update = a new XMSS slot; the aggregated
+//!   proof IS the signature of the update)
+//! - three final security tests, each of which MUST be rejected:
+//!   - A) a tampered list carrying a valid proof of a DIFFERENT list
+//!   - B) a proof from signers OUTSIDE the committee
+//!   - C) a valid proof re-labelled with a spoofed version
 
 use std::time::{Duration, Instant};
 
@@ -27,7 +29,16 @@ fn ms(d: Duration) -> f64 {
 }
 
 /// (min, median, max) in ms of a series of durations.
+/// `(min, median, max)` in ms. Panics on an empty slice, deliberately and with a
+/// message: an empty series here means the update loop never ran, and reporting
+/// `0.0` for that — as `Series` does — makes a run that measured nothing
+/// indistinguishable from an infinitely fast one.
 fn dur_stats(v: &[Duration]) -> (f64, f64, f64) {
+    assert!(
+        !v.is_empty(),
+        "no timings to summarise: the update loop produced no samples \
+         (N_UPDATES = 0?). Refusing to report 0.0 as a measurement."
+    );
     let mut xs: Vec<f64> = v.iter().map(|d| ms(*d)).collect();
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = xs.len();
@@ -147,8 +158,12 @@ fn main() {
         // the application counter bound into the signed message. They are
         // independent — the version keeps climbing across a future committee
         // re-key, when the slot window would reset.
-        let slot = SLOT + i as u32;
+        //
+        // The slot is derived through the anchor, never spelled out: `slot_for` is
+        // the only place `genesis + version` is computed, and a second copy of that
+        // expression is a second place to drift from the verifier.
         let version = i as u32;
+        let slot = committee.slot_for(version).expect("slot overflow");
         let (sl, s, p, v) = run_flow(
             &keypairs,
             &signers,
@@ -160,15 +175,17 @@ fn main() {
         );
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
-        let who: String = signers
-            .iter()
-            .map(|&j| char::from(b'A' + j as u8))
-            .collect();
+        // The signer window as a range rather than one character per member: at
+        // N=200 the old `b'A' + index` mapping ran off the printable range into
+        // Latin-1 and C1 control codes, and past N_UPDATES = 64 it would have
+        // overflowed the u8 outright — a panic in debug, a silent wrap in release.
         println!(
-            "  update {:2}/{}  signers {}  v{}  slot {}  prove={:>8.1?}  verify={:>8.1?}  RAM={} MB  OK",
+            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  prove={:>8.1?}  verify={:>8.1?}  RAM={} MB  OK",
             i + 1,
             N_UPDATES,
-            who,
+            signers[0],
+            signers[signers.len() - 1],
+            signers.len(),
             version,
             slot,
             p,
@@ -183,8 +200,8 @@ fn main() {
     let updates_total = t_updates.elapsed();
 
     // ---- SECURITY TESTS (all must be REJECTED) ----
-    let honest_slot = SLOT + N_UPDATES as u32;
     let honest_version = N_UPDATES as u32;
+    let honest_slot = committee.slot_for(honest_version).expect("slot overflow");
     let quorum: Vec<usize> = (0..T).collect();
 
     // A) tampered list carrying a valid proof of a DIFFERENT list.
@@ -216,8 +233,21 @@ fn main() {
     // C) version spoof: a VALID proof of (list, version) re-labelled with a
     //    different version. Defeated only by the version binding of check 2 —
     //    before Option B, when `version` was cleartext-only, this was ACCEPTED.
-    let spoof_slot = SLOT + N_UPDATES as u32 + 1;
-    let signed_version = 5u32;
+    //
+    //    Built **slot-consistent** on purpose, mirroring `prover.rs`: signed at
+    //    the slot the *inflated* version derives to, so check 3 (slot) passes and
+    //    check 2 is the only thing standing between this record and acceptance.
+    //    The previous version of this test signed at an unrelated slot, so check 2
+    //    and check 3 both rejected it — the test still passed, but it no longer
+    //    proved that check 2 was load-bearing, which is the single thing it exists
+    //    to prove.
+    //
+    //    Note how far the inflation can reach: `slot = genesis + version` means the
+    //    attacker needs a key covering that slot, so KEY_SLOTS is the largest lie
+    //    available.
+    let spoof_version = KEY_SLOTS;
+    let spoof_slot = committee.slot_for(spoof_version).expect("slot overflow");
+    let signed_version = (N_UPDATES - 1) as u32; // the true latest
     let versioned_proof = make_signed_proof(
         &keypairs,
         &quorum,
@@ -229,7 +259,7 @@ fn main() {
     let sl_spoofed = SnarkStatusList::new(
         Algorithms::WotsXmss,
         list.clone(),
-        signed_version + 1000,
+        spoof_version,
         versioned_proof,
     );
     let version_rejected = !verify_proof(&committee, &sl_spoofed);
@@ -269,15 +299,26 @@ fn main() {
 
     // BENCH: ONE line, space-separated key=value fields, read by benchmark.sh.
     // Units: *_ms in ms, *_bytes in bytes, *_mb in MB, sec_ok in {0,1}.
+    //
+    // `updates_total_ms` is the wall clock of the whole loop — sign, prove, verify,
+    // the RSS reads and the printing. It is NOT comparable with the prover's
+    // `prove_total_ms`, so the per-phase totals are emitted alongside it and those
+    // are what the harness aggregates. Reporting the loop time under the same
+    // heading as a phase sum makes this process look ~2.5x slower than it is.
+    let sum_ms = |v: &[Duration]| -> f64 { v.iter().map(|d| ms(*d)).sum() };
     let bench = [
         format!("setup_verifier_ms={:.3}", ms(setup_verifier_time)),
         format!("setup_prover_extra_ms={:.3}", ms(setup_prover_extra)),
         format!("setup_total_ms={:.3}", ms(setup_prover_total)),
+        format!("n_updates={}", prove_ts.len()),
         format!("upd_sign_med_ms={sg_med:.3}"),
+        format!("upd_sign_total_ms={:.3}", sum_ms(&sign_ts)),
         format!("upd_prove_med_ms={pv_med:.3}"),
         format!("upd_prove_min_ms={pv_min:.3}"),
         format!("upd_prove_max_ms={pv_max:.3}"),
+        format!("upd_prove_total_ms={:.3}", sum_ms(&prove_ts)),
         format!("upd_verify_med_ms={vf_med:.3}"),
+        format!("upd_verify_total_ms={:.3}", sum_ms(&verify_ts)),
         format!("updates_total_ms={:.3}", ms(updates_total)),
         format!("proof_med_bytes={proof_med}"),
         format!("rss_setup_mb={rss_after_setup}"),

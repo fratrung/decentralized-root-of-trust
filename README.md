@@ -1,19 +1,101 @@
 # decentralized-root-of-trust
 
-A **committee-controlled status list** (e.g. a revocation list) secured with
-**post-quantum, hash-based signatures** (XMSS) that are **aggregated into a
-single SNARK proof** by the [leanVM](https://github.com/leanEthereum/leanVM)
-zkVM.
+**Removing the single key at the root of a trust hierarchy, without giving up
+offline verification — and without assuming an adversary that cannot run a
+quantum computer.**
 
-It replaces a *single-key* root of trust with a **`t`-of-`N` committee**, while
-keeping the property that **anyone** can verify the list knowing a single fixed
-trust anchor (the committee), without fetching anything in real time.
+---
 
+## The problem
+
+Systems that issue credentials — PKI, verifiable credentials, firmware update
+channels, device attestation — publish a **status list**: the set of identifiers
+that have been revoked. That list is the security-critical object. If an attacker
+can rewrite it, they can un-revoke a stolen key; if they can freeze it, they can
+keep a compromised device trusted indefinitely.
+
+Almost universally, that list is authorized by **one signing key**. This
+concentrates two separate failures into a single point:
+
+- **Compromise.** Whoever holds the key controls revocation for the entire
+  system. There is no quorum to overrule them and no partial failure mode.
+- **Cryptographic obsolescence.** The signature is typically ECDSA or Ed25519,
+  both broken by a sufficiently large quantum computer. Records that are archived
+  and verified years later are exposed to *store-now-decrypt-later* on the
+  signature layer.
+
+The obvious fix — have `N` parties sign instead of one — reintroduces a cost that
+is usually what stopped people: `t` signatures are `t` times the bytes and `t`
+times the verification work, on every published update, forever. For a
+constrained verifier (an embedded controller, a light client, an offline device)
+that is not a marginal cost.
+
+## What this builds
+
+A status list controlled by a **`t`-of-`N` committee**, where the published
+evidence of quorum is **one constant-size object** rather than `t` signatures.
+
+- Members sign with **XMSS** — hash-based, stateful, post-quantum, and *not*
+  reliant on any number-theoretic assumption.
+- The `t` signatures are aggregated by the [leanVM](https://github.com/leanEthereum/leanVM)
+  zkVM into a **single SNARK proof** that attests "a quorum of this committee
+  signed this list at this version".
+- A verifier holds **one fixed trust anchor** — the committee's `N` public keys,
+  the threshold `t`, and a genesis slot — and needs **no live data fetch**,
+  no directory lookup, and no revocation service to check an update.
+
+Both the aggregated form and the raw `t`-signature form are implemented and
+measured, so the trade-off is a number in this repository rather than an
+assertion.
+
+## What it demonstrates
+
+The repository is built to make four claims falsifiable, each with the artifact
+that tests it:
+
+| Claim | Where it is checked |
+|---|---|
+| A quorum of the committee — and nothing else — can authorize an update | five checks in `verify_proof`, exercised by the forgery corpus |
+| Evidence cannot be lifted from one list, version or slot onto another | `attack-tampered`, `attack-outsider`, `attack-version` must all be rejected |
+| A stale but validly signed record cannot be replayed | the persistent anti-rollback gate in [`src/freshness.rs`](src/freshness.rs) |
+| Aggregation is worth its cost above some `t`, and is not below it | [Benchmark](#benchmark), which measures both forms on the same host |
+
+Two properties are treated as safety-critical rather than best-effort, because
+their failure modes are silent and unrecoverable:
+
+- **XMSS is stateful.** A `(key, slot)` pair that signs twice leaks enough of the
+  WOTS hash chains to forge for that slot. Slot allocation therefore goes through
+  a durable, crash-safe counter that burns a slot *before* the key touches it
+  ([`src/atomic_slot_counter.rs`](src/atomic_slot_counter.rs)).
+- **Verification is stateless.** An old record verifies forever, so the
+  cryptography alone cannot refuse a rollback. That is a separate, explicitly
+  stateful gate.
+
+## What it is not
+
+A research prototype measured on one machine, not a deployment. Committee
+rotation is not implemented, the transport is a directory of files standing in
+for a DHT, and every number in [Benchmark](#benchmark) is host-specific — the
+binaries are built with `target-cpu=native`. The open gaps are listed in
+[`AGENT.md`](AGENT.md) rather than left for the reader to discover.
+
+---
 
 ![The committee signs one status-list root at a slot derived from the anchor; the quorum is then published either as raw signatures with a signer bitmap, or as one aggregated SNARK proof. Both are checked against the same anchor.](docs/architecture.png)
 
 Editable source: [`docs/architecture.svg`](docs/architecture.svg). The README
 points at the PNG because SVG rendering in the GitHub mobile app is unreliable.
+
+### How to read the rest
+
+[Trust model](#trust-model) and [Signature scheme](#signature-scheme) state what
+is assumed and what is proved. [Two published forms](#two-published-forms),
+[Slot derivation](#slot-derivation) and
+[Versioning and freshness](#versioning-and-freshness) are the design core — the
+three places where a plausible-looking shortcut would break the scheme, and why.
+[Build & run](#build--run) and [Split deployment](#split-deployment) are
+operational. [Benchmark](#benchmark) is the measurement methodology and the
+numbers.
 
 ---
 
@@ -194,9 +276,17 @@ closest peers — different versions, some stale, perhaps one from a hostile pee
 The declared version only decides the *order*; it is trusted only after step 2
 verifies the record. A peer that stamps a garbage record with version `4294967295`
 to jump the queue therefore costs one failed verification before it is skipped —
-it can never be selected. The `verifier` binary runs this over the ten updates
-plus a planted forgery (`attack-version.bin`, declared version `999999`) and
-selects the real newest, `version 9`, every time.
+it can never be selected. The `verifier` binary runs this over the `N_UPDATES`
+updates plus a planted forgery (`attack-version.bin`) and selects the real
+newest — at the current defaults, 20 updates and `version 19` — every time.
+
+The forgery's declared version is `KEY_SLOTS` (64), not an arbitrarily large
+number, and the reason is worth stating: `slot = genesis + version`, so lying
+about the version means signing at the slot that version derives to, and the
+attacker needs a key covering it. The end of the key window is therefore the
+largest lie available. The forgery is built slot-consistent on purpose, so that
+check 3 passes and check 2 — the message binding the version — is the one that
+rejects it.
 
 ### Anti-rollback across time
 
@@ -215,9 +305,22 @@ it survives a restart. It is keyed to a fingerprint of the anchor, so a committe
 rotation legitimately resets the counter instead of rejecting the new generation.
 This is local verifier state and must never be published.
 
+The mark also feeds *back into* selection. `select_freshest_above` takes it as a
+floor and drops every candidate not strictly above it before verifying anything —
+`select_freshest` is that function with no floor. This removes work, not attacks:
+a record at or below the mark would verify and then be refused as stale anyway,
+so the only difference is whether a SNARK verification was paid for first. It is
+worth having because selection is the one place an unauthenticated peer chooses
+how much work you do, and because the stale case is the *common* one — a node
+polling a list that has not changed hits it every round. Filtering on the declared
+version is sound for the same reason ordering by it is: understating your own
+version only forfeits a record that was going to be refused, and cannot suppress
+what a different peer served.
+
 The `verifier` binary demonstrates both halves: it advances the mark to the newest
 update, then replays an old but valid record and shows it refused. Run it twice
-and the second run loads the mark from disk.
+and the second run loads the mark from disk, reports how many candidates the floor
+removed, and verifies none of them.
 
 ### What this does and does not guarantee
 
@@ -256,11 +359,14 @@ src/
   bin/prover.rs         split deployment: signs and aggregates, writes artifacts, never verifies
   bin/verifier.rs       split deployment: verify-only, calls setup_verifier() alone
   bin/raw_agg.rs        the same protocol without a SNARK, through SignerNode / VerifierNode
-  bin/my_test_2.rs      smallest end-to-end walkthrough of the raw path: VC -> JCS -> entry -> quorum -> verify
+  snark_prover_node.rs  / snark_verifier_node.rs   thin module wrappers over the two paths
+tests/
+  raw_path_round.rs     end-to-end: rotating quorums over durable counters, then the rollback refusal
+  snark_path.rs         the five checks of verify_proof, each broken in isolation against a real proof
+  lock_two_processes.rs the cross-process slot lock, checked by re-executing the test binary
 examples/
   footprint.rs          RAM cost of setup_prover vs setup_verifier
 docs/
-  committee-status-list.md   design rationale
   architecture.svg / .png    the diagram at the top of this file
 benchmark.sh            reproducible multi-run benchmark (env capture, tidy CSV, CI95)
 ```
@@ -293,7 +399,6 @@ stack) and `target-cpu=native`.
 ```sh
 cargo run --release --bin decentralized-root-of-trust   # the SNARK demo, one process
 cargo run --release --bin raw_agg                       # the same protocol, no SNARK
-cargo run --release --bin my_test_2                     # smallest raw walkthrough, VC to verdict
 ```
 
 Example output (shape):
@@ -368,15 +473,22 @@ It skips the arena and the DFT twiddles, and — more importantly — it never r
 `zk_alloc::enable_arena()`, which sets `M_TRIM_THRESHOLD = -1` so that a *prover*
 process never returns freed memory to the OS. The measured effect:
 
+At the **small** committee (`N=10, t=7`), median of 30 runs:
+
 | | prover | verifier | combined demo |
 |---|---|---|---|
 | resident after setup | 786 MB | **676 MB** | 754 MB |
-| peak RSS (median of 30 runs) | 1082 MB | **694 MB** | 1049 MB |
+| peak RSS | 1082 MB | **694 MB** | 1049 MB |
 
-**34% less peak RAM** (355 MB) for a node that only verifies. The more useful
-property is the *slope*: the verifier's RSS is flat in the number of verifications
-(676 → 678 MB over 10), while the prover's climbs monotonically and never comes
-back down.
+**36% less peak RAM** for a node that only verifies. The saving grows with the
+committee, because only the prover's side scales: at the current defaults
+(`N=200, t=128`, see [Reference numbers](#reference-numbers)) the same three
+figures are 2053 / 692 / 2014 MB — a **66%** reduction. The verifier's peak is
+essentially constant in `t`; the prover's is not.
+
+The more useful property is the *slope*: the verifier's RSS is flat in the number
+of verifications (676 → 678 MB over 10), while the prover's climbs monotonically
+and never comes back down.
 
 Since the verifier's only input is the anchor plus the published structure, the
 artifact directory can simply be copied to the target device:
@@ -396,6 +508,8 @@ different runs are not interchangeable — start from a clean directory.
 ./benchmark.sh                                    # defaults: RUNS=20, WARMUP=2
 RUNS=30 WARMUP=3 ./benchmark.sh
 TARGETS="prover verifier" RUNS=50 ./benchmark.sh
+STRICT_ENV=1 PIN_CPUS=0-7 RUNS=30 ./benchmark.sh  # settings for numbers you publish
+INTERLEAVE=0 ./benchmark.sh                       # old block order, for back-comparison
 PROJECT_CM4=1 ./benchmark.sh                      # adds an explicitly-labelled ESTIMATE
 ```
 
@@ -413,20 +527,42 @@ writes to `bench-<timestamp>/`:
 
 Design points that matter if you quote these numbers:
 
+- Targets run **round-robin**, not in contiguous blocks. In block order any
+  drift over the sweep — a thermal ramp, a stray background job — is perfectly
+  confounded with target identity: the target that happened to run during the
+  disturbance simply looks slower. Interleaving spreads the disturbance across
+  all targets, so it inflates variance instead of biasing one mean.
+- `runs.csv` records **`t_start`** (epoch seconds) per run, so that assumption
+  can be checked rather than trusted. Plot the metric against it before
+  reporting; drift shows up there and nowhere else.
 - The verifier is measured against a **fixed artifact corpus**, generated once.
   Regenerating it per run would fold the prover's variance into the verifier's.
 - The unit of analysis for per-update metrics is the **per-run median**
   (n = RUNS). Updates inside one process share allocator and cache state and are
   not independent; `samples.csv` keeps every raw observation if you prefer to
   report the pooled distribution.
+- Every target reports **both** of its phases: `work_*` is the primary one
+  (prove, or verify for the verify-only targets) and `work2_*` the secondary
+  (sign; verify for the combined process). `work_total_ms` is always the sum of
+  the *primary phase*, so it is comparable across targets — it is not the wall
+  clock of the update loop, which for `combined` also contains signing,
+  verification and printing.
+- **`n_items`** records how many updates or verifications each run actually
+  measured. A run that measured zero would otherwise report `0.000 ms` medians,
+  which is indistinguishable from a very fast result; the script aborts on a zero
+  count and on any change in the count across runs of one target.
 - Quantiles use linear interpolation (type 7); CI95 uses Student's *t* with
-  df = n−1.
+  df = n−1. It is a **precision** interval for repeated runs on one host in one
+  session — not an interval that generalizes to other hardware or other days.
 - Peak RSS is cross-checked against `/usr/bin/time -v`, independently of the
   process's own `/proc/self/status` reading.
+- leanVM sizes its worker pool from `available_parallelism()` at startup and
+  offers no override, so **every timing is an *n*-thread figure**. `env.txt`
+  records the affinity mask and thread count; `PIN_CPUS` fixes them.
 - The script **refuses to print any timing** if a run reports a violated security
-  expectation.
-- It warns when the CPU governor is not `performance`, when `Cargo.lock` is
-  missing, and when GNU `time` is unavailable.
+  expectation. `STRICT_ENV=1` additionally refuses to run at all unless the
+  governor is `performance`, GNU `time` is present and `Cargo.lock` exists —
+  otherwise those are warnings.
 
 The CM4 projection is opt-in and is a **linear extrapolation, not a
 measurement**. For real numbers, run `benchmark.sh` natively on the board (an
@@ -653,5 +789,28 @@ supplying the whole quorum by itself, signatures re-attributed to other indices,
 padding bits set past member `N-1`, and the wire encoding being independent of the
 order the signers were collected in.
 
-Still untested: a sub-threshold quorum on the **SNARK** path (check 4). The raw
-path covers it; the aggregated one does not.
+Two of them are worth calling out because they guard things the binaries cannot
+reach:
+
+- `tests/lock_two_processes.rs` re-executes the test binary so the **operating
+  system**, not a thread, arbitrates the slot-counter lock. A same-process test
+  cannot tell a real `flock` from a process-local mutex, and the failure it guards
+  against is ordinary — one state directory, two nodes started from it — while its
+  cost is a destroyed key. Removing the lock makes it fail with
+  `PROBE=acquired:102`, naming the slot both holders would have issued.
+- `src/stats.rs`'s tests are the only guard on the numbers in
+  [Benchmark](#benchmark). They pin the median against the mean on skewed samples,
+  and the standard deviation as the Bessel-corrected (`n-1`) one that the
+  confidence interval is built from.
+
+It also carries the SNARK path's own negative suite (`tests/snark_path.rs`), on a
+small committee (`N=5, t=3`, ~10 s) so it can afford real proofs. Each of the five
+checks in `verify_proof` gets a case that breaks **only** that check, and the case
+asserts the other four still hold — so a rejection can only have come from the
+check under test. Deleting any one of the five makes exactly one assertion fail.
+
+The interesting one is check 5. Checks 1 to 4 all read the aggregate's `info`
+(message, slot, public keys); nothing relates that header to the computation
+underneath it. The test splices an honest record's `info` onto another
+aggregate's proof body: checks 1-4 pass by construction, and only verifying the
+SNARK tells the two apart.
