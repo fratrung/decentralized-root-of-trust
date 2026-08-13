@@ -30,9 +30,9 @@ cargo run --release --bin raw_agg                      # the same protocol with 
 cargo run --release --bin prover   -- [outdir]         # split: sign + aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --example footprint -- prover      # RAM of setup alone; also: verifier | none
-cargo test                                             # 38 unit + 6 integration tests, ~10 s (incl. a real SNARK)
+cargo test                                             # 44 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
-tools/mutate.py                                        # mutation testing: 21 checks, each must be caught by a test
+tools/mutate.py                                        # mutation testing: 25 checks, each must be caught by a test
 ```
 
 **Always `--release`** for anything touching the prover; it is unusable in a debug
@@ -42,7 +42,7 @@ profile, which is what makes `tests/snark_path.rs` affordable there (~10 s) even
 though it drives a real prover.
 
 The tests cover the slot counter, the raw quorum path and — since
-`tests/snark_path.rs` — each of the five checks in `verify_proof`. The binaries
+`tests/snark_path.rs` — each of the five checks in `PQSNARKVerifierModule::verify`. The binaries
 remain the end-to-end assertion: the combined demo must print `security OK: true`,
 `raw_agg` and `verifier` must exit 0. `benchmark.sh` refuses to print timings if
 any run reports a failure.
@@ -77,13 +77,11 @@ Library:
   out-of-order and repeated-signer variants are unconstructible rather than
   defended against. `from_bytes` additionally rejects a bitmap whose population
   disagrees with the signature count.
-- `src/committee.rs` — the anchor, `slot_for` (the **only** place the slot is
-  derived), `sign_and_prove`/`make_proof`, both `verify_proof` and
-  `verify_quorum`, and `select_freshest` (the DHT-layer freshness selection:
-  newest declared version first, verify, fall back on failure).
-  `select_freshest_above` is the same with a floor — the caller's high-water mark
-  — applied before any proof is verified. That is a work saver, not a check: the
-  floor can only drop records the caller was already going to refuse as stale.
+- `src/committee.rs` — the anchor and **nothing else**: members, `t`,
+  `genesis_slot`, the wire encoding, and `slot_for` (the **only** place the slot
+  is derived). The protocol predicates used to live here as free functions taking
+  `&Committee`; they are now methods on the node type that owns the anchor, so a
+  participant is one value with the operations its role can perform.
 - `src/atomic_slot_counter.rs` — the durable monotonic slot allocator. Burns the
   slot on disk **before** handing it out (write tmp → fsync → rename → fsync the
   parent dir), guarded by a lock on a separate file so two processes cannot share
@@ -91,25 +89,34 @@ Library:
   protocol-chosen one, jumping forward over missed rounds and refusing the past.
 - `src/signer_node.rs` — one member: keypair + counter. `sign` for the local-slot
   path, `sign_at` for the derived-slot one.
-- `src/verifier_node.rs` — one relying party: holds the anchor, verifies a single
-  member signature or either whole record form. It delegates to `committee.rs`
-  rather than reimplementing the checks; two copies would drift, and the copy
-  that drifts is the one no benchmark exercises.
+- `src/verifier_node.rs` — one relying party on the **raw** path: `verify` for a
+  single member signature, `verify_quorum` for the whole record (the six checks
+  that decide whether an update is authorized). Needs no `setup_verifier()` and no
+  circuit, which is what makes it the honest comparison against the SNARK path.
 - `src/params.rs` — demo parameters (`SLOT` = the genesis slot, `N_MEMBERS`, `T`,
   `N_UPDATES`, `KEY_SLOTS`, `LOG_INV_RATE`), shared by `main.rs`, `prover` and
   `raw_agg`. The `verifier` deliberately imports none of them.
 - `src/freshness.rs` — `HighWaterMark`, the persistent anti-rollback gate. Strict
   monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
   committee rotation resets it, persisted with a write-then-rename. Lives *outside*
-  `verify_proof`, which stays pure.
+  the verification predicate, which stays pure.
 - `src/mem.rs`, `src/stats.rs` — RSS probes and descriptive statistics shared by
   every binary.
-- `src/snark_prover_node.rs`, `src/snark_verifier_node.rs` — thin wrappers pairing
-  `setup_prover()` / `setup_verifier()` with the proving and verifying calls. They
-  own **no** policy: both derive the slot through `Committee::slot_for` and the
-  verifier delegates to `committee::verify_proof`, so neither can drift from the
-  checks. Keep it that way — an earlier copy of the verifier wrapper had drifted
-  and silently lost the slot check.
+- `src/snark_prover_node.rs` — the prover. Holding the value *is* the proof that
+  `setup_prover()` ran. `make_proof` derives the slot through `Committee::slot_for`
+  and takes a `version`, never a slot; `aggregate` takes an explicit slot and
+  exists for the adversarial tests, which have to build what the honest path
+  cannot express. `sign_and_prove` refuses a repeated signer **before** signing —
+  leanVM dedups the aggregate, so nothing downstream could catch it and the key
+  would already be damaged.
+- `src/snark_verifier_node.rs` — the SNARK relying party, paired with
+  `setup_verifier()`. Owns the five checks, `is_newer`, and `select_freshest` (the
+  DHT-layer selection: newest declared version first, verify, fall back on
+  failure). `select_freshest_above` is the same with a floor — the caller's
+  high-water mark — applied before any proof is verified. That is a work saver,
+  not a check: the floor can only drop records the caller was already going to
+  refuse as stale. There is exactly **one** copy of each predicate and it lives
+  here; an earlier second copy had drifted and silently lost the slot check.
 
 Binaries:
 - `src/main.rs` — the combined single-process demo; still the reference for the
@@ -117,14 +124,20 @@ Binaries:
 - `src/bin/prover.rs` — holds the secret keys, writes artifacts, **never verifies**.
 - `src/bin/verifier.rs` — calls **only** `setup_verifier()`; loads `anchor.bin`
   and hardcodes nothing else.
-- `src/bin/raw_agg.rs` — the no-SNARK baseline, and the only binary that runs the
-  real node types end to end. Its `sign` figure therefore includes one `fsync`
-  pair per signature that `prover.rs` never pays: compare *verify* and *size*
-  across the two paths freely, compare *sign* knowing that.
+- `src/bin/raw_agg.rs` — the no-SNARK baseline, and the only binary that spends
+  slots through `SignerNode`/`AtomicSlotCounter`. Its `sign` figure therefore
+  includes one `fsync` pair per signature that `prover.rs` never pays: compare
+  *verify* and *size* across the two paths freely, compare *sign* knowing that.
+
+Every binary goes through the node types, because there is nothing else to call:
+`prover`/`main` through `PQSNARKProverModule`, `verifier`/`main` through
+`PQSNARKVerifierModule`, `raw_agg` through `SignerNode`/`VerifierNode`. The
+predicates are not reachable any other way, which is the point — a free function
+duplicated next to a wrapper is how the verifier module once lost its slot check.
 Local scratch binaries (`src/bin/my_test*.rs`) are gitignored: hand-run
 walkthroughs, not part of the published surface and not covered by the tests.
 
-Tests (`cargo test`, ~10 s warm, 44 in total):
+Tests (`cargo test`, ~15 s warm, 52 in total):
 - `src/*.rs` unit tests cover each module against its own contract. `stats.rs`'s
   are worth a note: they are the only guard on the numbers that reach the paper,
   and they pin the two choices a "simplification" would silently undo — the
@@ -134,7 +147,7 @@ Tests (`cargo test`, ~10 s warm, 44 in total):
   counters, the published record verifying against the anchor, and the stale
   record that still verifies but is refused by the freshness gate. It stays on the
   raw path deliberately, so it costs milliseconds.
-- `tests/snark_path.rs` covers `verify_proof` with **real** proofs on a small
+- `tests/snark_path.rs` covers `PQSNARKVerifierModule::verify` with **real** proofs on a small
   committee (`N=5, t=3`). One case per check, each breaking only that check and
   asserting the other four still hold; deleting any of the five makes exactly one
   assertion fail (verified by mutation). Check 5's case splices an honest
@@ -190,7 +203,7 @@ via a leanVM fork does not work. Treat the floor as a fixed constraint.
 
 `verify_single_message_aggregate` attests **only** "these listed public keys
 signed this message at this slot". Every link to trust is a cleartext check
-outside the circuit, in `verify_proof` (`src/committee.rs`):
+outside the circuit, in `PQSNARKVerifierModule::verify` (`src/snark_verifier_node.rs`):
 
 1. every signer ∈ committee — membership against the fixed anchor;
 2. `agg.info.message == status_list_root_fe(list, version)` — **the critical
@@ -213,7 +226,7 @@ and the Merkle path directions, so a wrong one simply fails check 5. It pins
 It also caps version inflation, since a slot-consistent forgery needs a key
 covering `genesis + version`.
 
-`verify_quorum` is the same five checks for the raw form, with two differences
+`VerifierNode::verify_quorum` is the same five checks for the raw form, with two differences
 worth knowing: membership is structural (an index *is* a member, so check 1
 disappears), and the bitmap needs two extra well-formedness checks — exact width
 `ceil(N/8)`, and padding bits past member `N-1` clear, without which one signer
@@ -226,7 +239,7 @@ quorum check.
 ### Known gaps in the model (deliberate, not bugs to fix silently)
 
 - Verification is **stateless**: an old but legitimate (list, proof) pair verifies
-  forever. Rollback is stopped one layer up, not by `verify_proof`:
+  forever. Rollback is stopped one layer up, not by the predicate:
   `select_freshest` picks the newest valid record, then `HighWaterMark`
   (`freshness.rs`) refuses anything not strictly newer than the last accepted
   version, persisted across restarts. The mark is per-object; the demo carries a

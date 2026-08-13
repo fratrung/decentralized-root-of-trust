@@ -35,10 +35,11 @@
 //! reliably and novel bugs only by luck. Raising `ITERATIONS` locally is the way
 //! to go looking for the latter.
 
-use decentralized_root_of_trust::committee::{Committee, verify_quorum};
+use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::status_list::{
     Algorithms, SnarkStatusList, StatusList, hash_any, status_list_root_fe,
 };
+use decentralized_root_of_trust::verifier_node::VerifierNode;
 use lean_multisig::{xmss_key_gen, xmss_sign};
 use rand::{RngExt, SeedableRng};
 
@@ -71,6 +72,8 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
         .map(|i| xmss_key_gen(seed(i as u8), GENESIS, GENESIS + 8, false).expect("keygen"))
         .collect();
     let committee = Committee::new(keys.iter().map(|(_, pk)| pk.clone()).collect(), T, GENESIS);
+    let verifier = VerifierNode::new(committee);
+    let committee = verifier.get_committee();
 
     let list = entries();
     let message = status_list_root_fe(&list, VERSION);
@@ -88,7 +91,7 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
     let honest = StatusList::new(Algorithms::WotsXmss, list.clone(), VERSION, N, signatures)
         .expect("well-formed");
     assert!(
-        verify_quorum(&committee, &honest),
+        verifier.verify_quorum(&honest),
         "the seed record must verify, or every negative below is vacuous"
     );
 
@@ -155,7 +158,7 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
 
         if let Ok(sl) = StatusList::from_bytes(&bytes) {
             decoded += 1;
-            if verify_quorum(&committee, &sl) {
+            if verifier.verify_quorum(&sl) {
                 verified += 1;
                 // The one that would be a break. A mutant may legitimately verify
                 // — the mutation can be a no-op, and postcard admits non-minimal

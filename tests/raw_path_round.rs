@@ -10,12 +10,13 @@
 //! this test is not about.
 
 use decentralized_root_of_trust::atomic_slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
-use decentralized_root_of_trust::committee::{Committee, verify_quorum};
+use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::signer_node::{SignerNode, SignerNodeError};
 use decentralized_root_of_trust::status_list::{
     Algorithms, StatusList, hash_any, status_list_root_fe,
 };
+use decentralized_root_of_trust::verifier_node::VerifierNode;
 use lean_multisig::xmss_key_gen;
 
 const N: usize = 5;
@@ -51,7 +52,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 /// The committee, plus one signer node per member with its own durable counter —
 /// the deployment the protocol actually describes, where no member can reach
 /// another's state.
-fn bring_up(dir: &std::path::Path, ns: u8) -> (Committee, Vec<SignerNode>) {
+fn bring_up(dir: &std::path::Path, ns: u8) -> (VerifierNode, Vec<SignerNode>) {
     let mut nodes = Vec::with_capacity(N);
     let mut members = Vec::with_capacity(N);
 
@@ -69,7 +70,10 @@ fn bring_up(dir: &std::path::Path, ns: u8) -> (Committee, Vec<SignerNode>) {
         nodes.push(SignerNode::new(pk, sk, counter));
     }
 
-    (Committee::new(members, T, GENESIS), nodes)
+    (
+        VerifierNode::new(Committee::new(members, T, GENESIS)),
+        nodes,
+    )
 }
 
 /// One round: `signers` sign `(list, version)` at the slot the *anchor* derives,
@@ -102,22 +106,22 @@ fn publish(
 #[test]
 fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     let dir = scratch("round");
-    let (committee, mut nodes) = bring_up(&dir, 1);
-    let mut hwm = HighWaterMark::load(dir.join("freshness"), &committee.to_bytes());
+    let (verifier, mut nodes) = bring_up(&dir, 1);
+    let mut hwm = HighWaterMark::load(dir.join("freshness"), &verifier.get_committee().to_bytes());
 
     // --- round 0: members 0,1,2 ---
     let mut list = vec![hash_any(b"revoke-alice")];
-    let v0 = publish(&committee, &mut nodes, &list, 0, &[0, 1, 2]);
+    let v0 = publish(verifier.get_committee(), &mut nodes, &list, 0, &[0, 1, 2]);
 
-    assert!(verify_quorum(&committee, &v0), "honest round 0 must verify");
+    assert!(verifier.verify_quorum(&v0), "honest round 0 must verify");
     assert!(matches!(hwm.try_advance(v0.version()), Decision::Accepted));
 
     // --- round 1: members 2,3,4. Only member 2 overlaps, which is the case
     // per-member counters cannot handle and `slot_for` exists to fix.
     list.push(hash_any(b"revoke-bob"));
-    let v1 = publish(&committee, &mut nodes, &list, 1, &[2, 3, 4]);
+    let v1 = publish(verifier.get_committee(), &mut nodes, &list, 1, &[2, 3, 4]);
 
-    assert!(verify_quorum(&committee, &v1), "honest round 1 must verify");
+    assert!(verifier.verify_quorum(&v1), "honest round 1 must verify");
     assert!(matches!(hwm.try_advance(v1.version()), Decision::Accepted));
     assert_eq!(hwm.current(), Some(1));
 
@@ -130,7 +134,7 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     // cryptography is stateless and cannot tell "old" from "current". Only the
     // gate can, which is the entire reason it exists.
     assert!(
-        verify_quorum(&committee, &v0),
+        verifier.verify_quorum(&v0),
         "the stale record is still cryptographically valid"
     );
     assert!(matches!(hwm.try_advance(v0.version()), Decision::Stale(1)));
@@ -144,11 +148,11 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
 #[test]
 fn a_member_cannot_be_made_to_sign_one_round_twice() {
     let dir = scratch("replay");
-    let (committee, mut nodes) = bring_up(&dir, 2);
+    let (verifier, mut nodes) = bring_up(&dir, 2);
 
     let list = vec![hash_any(b"revoke-alice")];
     let round0 = status_list_root_fe(&list, 0);
-    let slot0 = committee.slot_for(0).expect("slot");
+    let slot0 = verifier.get_committee().slot_for(0).expect("slot");
     let mut rng = rand::rng();
 
     assert!(nodes[0].sign_at(&mut rng, &round0, slot0).is_ok());
@@ -167,8 +171,8 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
 
     // The other four are untouched by member 0's refusal, so the round still
     // reaches quorum without it.
-    let published = publish(&committee, &mut nodes, &list, 0, &[1, 2, 3]);
-    assert!(verify_quorum(&committee, &published));
+    let published = publish(verifier.get_committee(), &mut nodes, &list, 0, &[1, 2, 3]);
+    assert!(verifier.verify_quorum(&published));
 }
 
 /// A crash is indistinguishable from a clean exit here: the counter is reopened
@@ -176,10 +180,10 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
 #[test]
 fn a_restart_does_not_replay_spent_slots() {
     let dir = scratch("restart");
-    let (committee, mut nodes) = bring_up(&dir, 3);
+    let (verifier, mut nodes) = bring_up(&dir, 3);
 
     let list = vec![hash_any(b"revoke-alice")];
-    let _ = publish(&committee, &mut nodes, &list, 0, &[0, 1, 2]);
+    let _ = publish(verifier.get_committee(), &mut nodes, &list, 0, &[0, 1, 2]);
     drop(nodes); // releases every lock, as a process exit would
 
     let (_, pk) = xmss_key_gen(seed(3, 0), GENESIS, GENESIS + WINDOW, false).expect("keygen");

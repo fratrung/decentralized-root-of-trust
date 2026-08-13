@@ -55,7 +55,7 @@ that tests it:
 
 | Claim | Where it is checked |
 |---|---|
-| A quorum of the committee — and nothing else — can authorize an update | five checks in `verify_proof`, exercised by the forgery corpus |
+| A quorum of the committee — and nothing else — can authorize an update | five checks in `PQSNARKVerifierModule::verify`, exercised by the forgery corpus |
 | Evidence cannot be lifted from one list, version or slot onto another | `attack-tampered`, `attack-outsider`, `attack-version` must all be rejected |
 | A stale but validly signed record cannot be replayed | the persistent anti-rollback gate in [`src/freshness.rs`](src/freshness.rs) |
 | Aggregation is worth its cost above some `t`, and is not below it | [Benchmark](#benchmark), which measures both forms on the same host |
@@ -167,7 +167,7 @@ the quorum is evidenced, and a verifier accepts either.
 | verifier setup | none | ~5 s · 651 MB resident |
 | verify | `t` × `xmss_verify`, linear in `t` | one check, flat in `t` |
 | payload at `t=128` | ≈ 189 KB | ≈ 234 KB |
-| entry point | `committee::verify_quorum` | `committee::verify_proof` |
+| entry point | `VerifierNode::verify_quorum` | `PQSNARKVerifierModule::verify` |
 
 A signer is named by its **index into the committee's member list**. The anchor
 already fixes and authenticates that order, so the index is a stable identifier
@@ -184,7 +184,7 @@ the bitmap buys three things:
   index *is* a member, so a non-member is unnameable rather than merely rejected.
 
 Two encodings of one signer set would still be possible if the bits past member
-`N-1` were free, so `verify_quorum` requires them clear, and `from_bytes` rejects
+`N-1` were free, so `VerifierNode::verify_quorum` requires them clear, and `from_bytes` rejects
 a bitmap whose population disagrees with the number of signatures.
 
 What the bitmap does **not** hide is the participation pattern: anyone holding the
@@ -257,7 +257,7 @@ a future committee re-key, when the slot window would reset.
 
 ### Does the verifier trust the version, or keep its own?
 
-For a single record, neither — it **checks** it. `verify_proof` recomputes the
+For a single record, neither — it **checks** it. `PQSNARKVerifierModule::verify` recomputes the
 signed message from the version found *in the record* and compares it against what
 the committee signed. The value is accepted only because it survived that check,
 so once verification passes the version is as trustworthy as the list itself.
@@ -267,7 +267,7 @@ self-authenticating.
 Picking *the newest* version is a different job, and it belongs one layer up,
 where records are fetched. A Kademlia lookup returns several records from the
 closest peers — different versions, some stale, perhaps one from a hostile peer.
-`select_freshest` (in `committee.rs`) is that policy:
+`PQSNARKVerifierModule::select_freshest` is that policy:
 
 1. order the candidates by their declared version, newest first;
 2. verify them in that order and return the first that passes;
@@ -299,7 +299,7 @@ access to a node that has since been revoked.
 The fix is memory. `HighWaterMark` (in `freshness.rs`) records the highest version
 this verifier has accepted and refuses anything not **strictly newer**. The rule
 is strict on purpose: a tolerance window would reopen exactly the rollback it is
-meant to close. The mark lives *outside* `verify_proof`, which stays pure — crypto
+meant to close. The mark lives *outside* the verification predicate, which stays pure — crypto
 first (`select_freshest`), freshness second (the mark) — and it is persisted, so
 it survives a restart. It is keyed to a fingerprint of the anchor, so a committee
 rotation legitimately resets the counter instead of rejecting the new generation.
@@ -347,10 +347,10 @@ removed, and verifies none of them.
 ```
 src/
   status_list.rs        StatusList (raw + bitmap) and SnarkStatusList, versioned Poseidon2 root, wire format
-  committee.rs          Committee anchor, slot_for, sign_and_prove, verify_proof / verify_quorum, select_freshest
+  committee.rs          Committee anchor: members, threshold, genesis_slot, slot_for, wire encoding
   atomic_slot_counter.rs durable monotonic slot allocator: reserve, reserve_at, fsync + cross-process lock
   signer_node.rs        one member: XMSS keypair + its counter; sign (local slot) and sign_at (protocol slot)
-  verifier_node.rs      one relying party: holds the anchor, verifies either record form
+  verifier_node.rs      raw-path relying party: verify (one signature) and verify_quorum (the whole record)
   freshness.rs          HighWaterMark: persistent, anchor-scoped anti-rollback gate
   params.rs             demo parameters (SLOT, N_MEMBERS, T, N_UPDATES, KEY_SLOTS, LOG_INV_RATE)
   mem.rs                VmRSS / VmHWM probes
@@ -359,10 +359,11 @@ src/
   bin/prover.rs         split deployment: signs and aggregates, writes artifacts, never verifies
   bin/verifier.rs       split deployment: verify-only, calls setup_verifier() alone
   bin/raw_agg.rs        the same protocol without a SNARK, through SignerNode / VerifierNode
-  snark_prover_node.rs  / snark_verifier_node.rs   thin module wrappers over the two paths
+  snark_prover_node.rs  the prover: make_proof (slot derived from the anchor), aggregate, sign_and_prove
+  snark_verifier_node.rs the SNARK relying party: the five checks, is_newer, select_freshest(_above)
 tests/
   raw_path_round.rs     end-to-end: rotating quorums over durable counters, then the rollback refusal
-  snark_path.rs         the five checks of verify_proof, each broken in isolation against a real proof
+  snark_path.rs         the five checks of PQSNARKVerifierModule::verify, each broken in isolation
   lock_two_processes.rs the cross-process slot lock, checked by re-executing the test binary
 examples/
   footprint.rs          RAM cost of setup_prover vs setup_verifier
@@ -775,7 +776,7 @@ adds it to the candidate set with an inflated version, and `select_freshest` ski
 it and returns the real newest.
 
 A **rollback** — replaying an old but validly signed version — is refused by the
-high-water mark, not by `verify_proof`: `verifier` accepts the newest update, then
+high-water mark, not by the predicate: `verifier` accepts the newest update, then
 replays an old one and shows it refused
 (see [Versioning and freshness](#versioning-and-freshness)).
 
@@ -805,7 +806,7 @@ reach:
 
 It also carries the SNARK path's own negative suite (`tests/snark_path.rs`), on a
 small committee (`N=5, t=3`, ~10 s) so it can afford real proofs. Each of the five
-checks in `verify_proof` gets a case that breaks **only** that check, and the case
+checks in `PQSNARKVerifierModule::verify` gets a case that breaks **only** that check, and the case
 asserts the other four still hold — so a rejection can only have come from the
 check under test. Deleting any one of the five makes exactly one assertion fail.
 
@@ -814,3 +815,17 @@ The interesting one is check 5. Checks 1 to 4 all read the aggregate's `info`
 underneath it. The test splices an honest record's `info` onto another
 aggregate's proof body: checks 1-4 pass by construction, and only verifying the
 SNARK tells the two apart.
+
+`tests/snark_modules.rs` covers the two node wrappers the binaries go through.
+The assertion that earns its keep is the first one: the slot recorded *inside* the
+finished proof must equal the slot the anchor derives for that version. Nothing in
+the call hands `PQSNARKProverModule` a slot, and this is what would notice if it
+ever started accepting one — which is the same drift that once removed the slot
+check from the verifier wrapper.
+
+Every check named in this section is verified to be load-bearing by
+`tools/mutate.py`, which deletes one and reports which test complains. 25 mutants,
+all caught. Its findings so far: three checks that no test reached at all
+(`verify_quorum`'s padding bits, the bitmap width, and `t == 0`), plus a padding
+test that had been locating the bitmap by searching a signature blob for a byte
+value.

@@ -42,15 +42,15 @@
 //! per-slot budget is written out next to the constants below, and cases skip
 //! rounds rather than reuse a slot.
 
-use decentralized_root_of_trust::committee::{
-    Committee, make_proof, select_freshest, select_freshest_above, verify_proof,
-};
+use decentralized_root_of_trust::committee::Committee;
+use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
+use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
 use decentralized_root_of_trust::status_list::{
     Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
 };
 use lean_multisig::{
-    SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover,
-    xmss_key_gen, xmss_sign,
+    SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen,
+    xmss_sign,
 };
 
 const N: usize = 5;
@@ -125,9 +125,10 @@ fn info_of(sl: &SnarkStatusList) -> SingleMessageAggregateSignature {
 
 #[test]
 fn each_of_the_five_checks_rejects_on_its_own() {
-    setup_prover();
+    let prover = PQSNARKProverModule::init_prover();
 
     let (keys, c) = committee();
+    let verifier = PQSNARKVerifierModule::new(c.clone(), 0);
     let list = vec![hash_any(b"vc-1"), hash_any(b"vc-2")];
 
     // ---------------------------------------------------------------- valid --
@@ -135,7 +136,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let slot = c.slot_for(ROUND).expect("slot");
     assert_eq!(slot, GENESIS + ROUND);
     let message = status_list_root_fe(&list, ROUND);
-    let proof = make_proof(
+    let proof = prover.aggregate(
         sign_at(&[&keys[0], &keys[1], &keys[2]], message, slot),
         message,
         slot,
@@ -143,13 +144,13 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     );
     let valid = record(list.clone(), ROUND, proof.clone());
     assert!(
-        verify_proof(&c, &valid),
+        verifier.verify(&valid),
         "an honest quorum must verify, or every rejection below is vacuous"
     );
 
     // ...and it survives the wire encoding the DHT would store it under.
     let back = SnarkStatusList::from_bytes(&valid.to_bytes()).expect("record decodes");
-    assert!(verify_proof(&c, &back));
+    assert!(verifier.verify(&back));
 
     // ------------------------------------------------- check 2: the message --
     // A revocation nobody authorized, appended to a list carrying a real quorum.
@@ -173,7 +174,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         );
     }
     assert!(
-        !verify_proof(&c, &tampered),
+        !verifier.verify(&tampered),
         "check 2 must bind the proof to THIS list"
     );
 
@@ -181,7 +182,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // signed message *and* fixes the slot, so this breaks checks 2 and 3 at once —
     // which is the point: there is no way to move a record between rounds.
     assert!(
-        !verify_proof(&c, &record(list.clone(), ROUND - 1, proof.clone())),
+        !verifier.verify(&record(list.clone(), ROUND - 1, proof.clone())),
         "check 2/3 must bind the proof to THIS version"
     );
 
@@ -196,7 +197,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let wrong_slot = record(
         list.clone(),
         1,
-        make_proof(
+        prover.aggregate(
             sign_at(&[&keys[0], &keys[1], &keys[2]], message_1, chosen_slot),
             message_1,
             chosen_slot,
@@ -212,7 +213,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         assert_eq!(agg.info.slot, chosen_slot);
     }
     assert!(
-        !verify_proof(&c, &wrong_slot),
+        !verifier.verify(&wrong_slot),
         "check 3 must pin the slot to the one the anchor derives"
     );
 
@@ -223,7 +224,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let thin = record(
         list.clone(),
         3,
-        make_proof(
+        prover.aggregate(
             sign_at(&[&keys[0], &keys[1]], message_3, slot_3),
             message_3,
             slot_3,
@@ -238,7 +239,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         assert_eq!(agg.info.pubkeys.len(), T - 1, "one short, and only that");
     }
     assert!(
-        !verify_proof(&c, &thin),
+        !verifier.verify(&thin),
         "check 4 must enforce the threshold"
     );
 
@@ -256,7 +257,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let intruded = record(
         list.clone(),
         4,
-        make_proof(
+        prover.aggregate(
             sign_at(&[&outsider, &keys[0], &keys[1]], message_4, slot_4),
             message_4,
             slot_4,
@@ -279,7 +280,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         );
     }
     assert!(
-        !verify_proof(&c, &intruded),
+        !verifier.verify(&intruded),
         "check 1 must reject a signer the anchor does not name"
     );
 
@@ -306,7 +307,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         assert!(agg.info.pubkeys.len() >= T);
     }
     assert!(
-        !verify_proof(&c, &forged),
+        !verifier.verify(&forged),
         "checks 1-4 pass on this record: only check 5 stands between it and acceptance"
     );
 
@@ -317,11 +318,11 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let mut padded = proof.clone();
     padded.push(0);
     assert!(
-        !verify_proof(&c, &record(list.clone(), ROUND, padded)),
+        !verifier.verify(&record(list.clone(), ROUND, padded)),
         "trailing bytes after the aggregate must not verify"
     );
     assert!(
-        !verify_proof(&c, &record(list.clone(), ROUND, Vec::new())),
+        !verifier.verify(&record(list.clone(), ROUND, Vec::new())),
         "an empty proof must not verify"
     );
 
@@ -332,17 +333,23 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let liar = record(list.clone(), 999, proof).to_bytes();
     let honest = valid.to_bytes();
 
-    let picked = select_freshest(&c, &[honest.clone(), liar.clone()])
+    let picked = verifier
+        .select_freshest(&[honest.clone(), liar.clone()])
         .expect("the honest record is still there behind the liar");
     assert_eq!(picked.version(), ROUND);
     // Order of arrival must not matter.
-    let picked =
-        select_freshest(&c, &[liar.clone(), honest.clone()]).expect("same set, reversed order");
+    let picked = verifier
+        .select_freshest(&[liar.clone(), honest.clone()])
+        .expect("same set, reversed order");
     assert_eq!(picked.version(), ROUND);
     // With nothing valid in hand it selects nothing, rather than falling back to
     // the best-looking candidate.
-    assert!(select_freshest(&c, std::slice::from_ref(&liar)).is_none());
-    assert!(select_freshest(&c, &[]).is_none());
+    assert!(
+        verifier
+            .select_freshest(std::slice::from_ref(&liar))
+            .is_none()
+    );
+    assert!(verifier.select_freshest(&[]).is_none());
 
     // The floor prunes on the declared version *before* verifying anything. It is
     // not a security check — it can only discard records the caller was already
@@ -352,17 +359,21 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // above the record is not a third case — it is indistinguishable from `at`.
     let both = vec![honest, liar];
     assert_eq!(
-        select_freshest_above(&c, &both, None).map(|sl| sl.version()),
+        verifier
+            .select_freshest_above(&both, None)
+            .map(|sl| sl.version()),
         Some(ROUND),
         "no floor must behave exactly as select_freshest"
     );
     assert_eq!(
-        select_freshest_above(&c, &both, Some(ROUND - 1)).map(|sl| sl.version()),
+        verifier
+            .select_freshest_above(&both, Some(ROUND - 1))
+            .map(|sl| sl.version()),
         Some(ROUND),
         "a floor below the record must not prune it"
     );
     assert!(
-        select_freshest_above(&c, &both, Some(ROUND)).is_none(),
+        verifier.select_freshest_above(&both, Some(ROUND)).is_none(),
         "the floor is strict: a record AT the mark is not newer, and the liar \
          above it does not verify"
     );

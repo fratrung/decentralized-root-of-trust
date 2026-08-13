@@ -11,9 +11,11 @@
 
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::{Committee, make_proof, sign_and_prove, verify_proof};
+use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
+use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
+use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
 use decentralized_root_of_trust::status_list::{
     Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
 };
@@ -56,20 +58,28 @@ fn usize_median(v: &[usize]) -> usize {
     xs[xs.len() / 2]
 }
 
-/// One round: the `signers` sign the root of `list` at `slot`, the signatures
-/// are aggregated into ONE proof, the SnarkStatusList is built and verified against
-/// the `committee`. Returns (status_list, sign_time, prove_time, verify_time).
+/// One round: the `signers` sign the root of `list` at the slot the anchor assigns
+/// to `version`, the signatures are aggregated into ONE proof, the SnarkStatusList
+/// is built and verified. Returns (status_list, sign_time, prove_time, verify_time).
+///
+/// Both sides go through their module: `PQSNARKProverModule` derives the slot from
+/// the anchor, `PQSNARKVerifierModule` performs all five checks. This is a
+/// single-process demo, so there is one anchor and the prover borrows it from the
+/// verifier module — in the split deployment (`prover` / `verifier`) each process
+/// holds its own copy, which is the arrangement that actually matters.
 fn run_flow(
+    prover: &PQSNARKProverModule,
+    verifier: &PQSNARKVerifierModule,
     keypairs: &[(XmssSecretKey, XmssPublicKey)],
     signers: &[usize],
     list: Vec<[u8; 32]>,
-    slot: u32,
     version: u32,
-    committee: &Committee,
     rng: &mut ThreadRng,
 ) -> (SnarkStatusList, Duration, Duration, Duration) {
+    let committee = verifier.committee_as_ref();
     // The signed message binds both the list and its version (Option B).
     let message = status_list_root_fe(&list, version);
+    let slot = committee.slot_for(version).expect("slot overflow");
 
     let t_sign = Instant::now();
     let mut raws: Vec<(XmssPublicKey, XmssSignature)> = Vec::new();
@@ -81,13 +91,13 @@ fn run_flow(
     let sign_time = t_sign.elapsed();
 
     let t_prove = Instant::now();
-    let zk_proof = make_proof(raws, message, slot, LOG_INV_RATE);
+    let zk_proof = prover.make_proof(committee, raws, &list, version, LOG_INV_RATE);
     let prove_time = t_prove.elapsed();
 
     let status_list = SnarkStatusList::new(Algorithms::WotsXmss, list, version, zk_proof);
 
     let t_verify = Instant::now();
-    let ok = verify_proof(committee, &status_list);
+    let ok = verifier.verify(&status_list);
     let verify_time = t_verify.elapsed();
     assert!(ok, "a legitimate update failed to verify");
 
@@ -98,6 +108,7 @@ fn run_flow(
 /// bytes. `version` is bound into the message, so a proof made here is only valid
 /// for that exact version.
 fn make_signed_proof(
+    prover: &PQSNARKProverModule,
     keypairs: &[(XmssSecretKey, XmssPublicKey)],
     signers: &[usize],
     list: &[[u8; 32]],
@@ -105,7 +116,7 @@ fn make_signed_proof(
     version: u32,
     rng: &mut ThreadRng,
 ) -> Vec<u8> {
-    sign_and_prove(
+    prover.sign_and_prove(
         keypairs,
         signers,
         status_list_root_fe(list, version),
@@ -118,6 +129,18 @@ fn make_signed_proof(
 fn main() {
     let rss_baseline = rss_now_mb();
 
+    // Setup is called directly here, not through the modules, because measuring the
+    // two phases *apart* is the reason this binary exists: `setup_verifier` is the
+    // bytecode alone, `setup_prover` adds the arena and the DFT twiddles. A module
+    // constructor bundles setup with the object it builds, and the verifier module
+    // cannot be built before the committee exists — which is after keygen, by which
+    // point the RSS sample below would also be counting 200 keypairs.
+    //
+    // The modules are therefore constructed after keygen, and their setup calls land
+    // as no-ops: `init_aggregation_bytecode` is a `OnceLock::get_or_init`,
+    // `parallel::init` a `Once`, `enable_arena` two idempotent `mallopt`s, and
+    // `precompute_dft_twiddles` returns early once the table is large enough
+    // (`whir/src/dft.rs`: `if fft_len > curr_max_fft_len`).
     println!("setup...");
     let t_v = Instant::now();
     setup_verifier();
@@ -139,6 +162,15 @@ fn main() {
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
     // The fixed trust anchor, built once and shared by every verification below.
     let committee = Committee::new(members, T, SLOT);
+
+    // Both sides of the protocol, as the modules that own them. The second argument
+    // feeds `PQSNARKVerifierModule::is_newer`, a stateless convenience this demo does
+    // not use: freshness and anti-rollback live in `freshness::HighWaterMark`, which
+    // the `verifier` binary exercises. Nothing here depends on the 0.
+    let prover = PQSNARKProverModule::init_prover();
+    let verifier = PQSNARKVerifierModule::new(committee, 0);
+    let committee = verifier.committee_as_ref();
+
     println!("committee N={N_MEMBERS} t={T}; {N_UPDATES} updates rotating the signers\n");
 
     // ---- N_UPDATES updates, rotating the `t` signers over the `N` members ----
@@ -165,12 +197,12 @@ fn main() {
         let version = i as u32;
         let slot = committee.slot_for(version).expect("slot overflow");
         let (sl, s, p, v) = run_flow(
+            &prover,
+            &verifier,
             &keypairs,
             &signers,
             list.clone(),
-            slot,
             version,
-            &committee,
             &mut rng,
         );
         let rss = rss_now_mb();
@@ -206,6 +238,7 @@ fn main() {
 
     // A) tampered list carrying a valid proof of a DIFFERENT list.
     let good_proof = make_signed_proof(
+        &prover,
         &keypairs,
         &quorum,
         &list,
@@ -217,7 +250,7 @@ fn main() {
     tampered.push(hash_any(b"FAKE-REVOCATION")); // row not authorized by the committee
     let sl_tampered =
         SnarkStatusList::new(Algorithms::WotsXmss, tampered, honest_version, good_proof);
-    let tamper_rejected = !verify_proof(&committee, &sl_tampered);
+    let tamper_rejected = !verifier.verify(&sl_tampered);
 
     // B) proof from signers OUTSIDE the committee (keys not in it).
     let mut outsiders: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
@@ -226,9 +259,9 @@ fn main() {
         outsiders.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("outsider keygen"));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
-    let out_proof = make_signed_proof(&outsiders, &quorum, &out_list, SLOT, 0, &mut rng);
+    let out_proof = make_signed_proof(&prover, &outsiders, &quorum, &out_list, SLOT, 0, &mut rng);
     let sl_outsider = SnarkStatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof);
-    let outsider_rejected = !verify_proof(&committee, &sl_outsider);
+    let outsider_rejected = !verifier.verify(&sl_outsider);
 
     // C) version spoof: a VALID proof of (list, version) re-labelled with a
     //    different version. Defeated only by the version binding of check 2 —
@@ -249,6 +282,7 @@ fn main() {
     let spoof_slot = committee.slot_for(spoof_version).expect("slot overflow");
     let signed_version = (N_UPDATES - 1) as u32; // the true latest
     let versioned_proof = make_signed_proof(
+        &prover,
         &keypairs,
         &quorum,
         &list,
@@ -262,7 +296,7 @@ fn main() {
         spoof_version,
         versioned_proof,
     );
-    let version_rejected = !verify_proof(&committee, &sl_spoofed);
+    let version_rejected = !verifier.verify(&sl_spoofed);
 
     let sec_ok = tamper_rejected && outsider_rejected && version_rejected;
 

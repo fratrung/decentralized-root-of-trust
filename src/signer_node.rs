@@ -128,6 +128,24 @@ mod tests {
     const START: u32 = 100;
     const END: u32 = 110;
 
+    /// Same seed discipline as `verifier_node::tests`, where it is documented in
+    /// full: `[FILE, namespace, member, 0…]`, one namespace per test.
+    ///
+    /// All three tests below used to share `[3u8; 32]`, so one key signed slot 100
+    /// in every one of them — three different messages under the same `(key, slot)`
+    /// pair, which is the exact XMSS failure this crate is built to prevent.
+    /// `xmss_sign` re-randomises each signature, so those three reveal different
+    /// WOTS chain positions. Nothing is at risk (the keys authorize nothing), but
+    /// the invariant should not be one the tests are the first to break.
+    const FILE: u8 = 6;
+
+    fn seed(ns: u8) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[0] = FILE;
+        s[1] = ns;
+        s
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("signer-{name}-{}", std::process::id()));
         for ext in ["", "lock", "tmp"] {
@@ -140,8 +158,8 @@ mod tests {
         p
     }
 
-    fn node(path: &PathBuf, counter_end: u32) -> SignerNode {
-        let (sk, pk) = xmss_key_gen([3u8; 32], START, END, false).expect("keygen");
+    fn node(path: &PathBuf, counter_end: u32, ns: u8) -> SignerNode {
+        let (sk, pk) = xmss_key_gen(seed(ns), START, END, false).expect("keygen");
         let counter = AtomicSlotCounter::create(path, &pk, START, counter_end).expect("counter");
         SignerNode::new(pk, sk, counter)
     }
@@ -149,7 +167,7 @@ mod tests {
     #[test]
     fn signs_consecutive_slots_and_the_signatures_verify() {
         let path = scratch("ok");
-        let mut signer = node(&path, END);
+        let mut signer = node(&path, END, 1);
         let mut rng = rand::rng();
         let list = vec![hash_any(b"vc-1")];
 
@@ -168,7 +186,7 @@ mod tests {
     #[test]
     fn a_failed_signature_still_consumes_its_slot() {
         let path = scratch("burn");
-        let mut signer = node(&path, END + 5); // counter outlives the key window
+        let mut signer = node(&path, END + 5, 2); // counter outlives the key window
         let mut rng = rand::rng();
         let message = status_list_root_fe(&[hash_any(b"vc")], 0);
 
@@ -194,7 +212,7 @@ mod tests {
     #[test]
     fn exhaustion_is_reported_not_wrapped_around() {
         let path = scratch("exhaust");
-        let mut signer = node(&path, START + 1);
+        let mut signer = node(&path, START + 1, 3);
         let mut rng = rand::rng();
         let message = status_list_root_fe(&[hash_any(b"vc")], 0);
 

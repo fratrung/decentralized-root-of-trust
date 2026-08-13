@@ -15,16 +15,15 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::{Committee, make_proof, sign_and_prove};
+use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
+use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
 use decentralized_root_of_trust::stats::Series;
 use decentralized_root_of_trust::status_list::{
     Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
 };
-use lean_multisig::{
-    XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover, xmss_key_gen, xmss_sign,
-};
+use lean_multisig::{XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -67,7 +66,9 @@ fn main() {
     let rss_baseline = rss_now_mb();
     println!("prover: setup...");
     let t_setup = Instant::now();
-    setup_prover();
+    // `init_prover()` *is* the `setup_prover()` call — the module owns the pairing
+    // of setup with proving, which is why the bare call is not made here as well.
+    let prover = PQSNARKProverModule::init_prover();
     let setup_time = t_setup.elapsed();
     let rss_after_setup = rss_now_mb();
 
@@ -124,8 +125,12 @@ fn main() {
         }
         let sign_time = t_sign.elapsed();
 
+        // The module takes `version`, not `slot`: it derives the slot from the
+        // anchor itself and computes the signed message the same way the verifier
+        // does. Passing a slot here would be a second place for `genesis + version`
+        // to live, which is exactly the drift check 3 exists to catch.
         let t_prove = Instant::now();
-        let proof = make_proof(raws, message, slot, LOG_INV_RATE);
+        let proof = prover.make_proof(&committee, raws, &list, version, LOG_INV_RATE);
         let prove_time = t_prove.elapsed();
 
         let sl = SnarkStatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
@@ -170,13 +175,20 @@ fn main() {
 
     // ---- Forgeries the verifier must reject. Built here only because this is
     // the process that owns signing keys; conceptually these are the attacker's.
+    //
+    // These deliberately do NOT go through `PQSNARKProverModule::make_proof`, and
+    // that is the method working as intended rather than a gap in it. Forgery C
+    // signs one version's content at a *different* version's slot — `make_proof`
+    // derives the slot from the anchor, so it structurally cannot express that. An
+    // attacker is under no such constraint, so the attacker's code path is
+    // `sign_and_prove`, which still takes an explicit slot.
     let attack_version = N_UPDATES as u32;
     let attack_slot = committee.slot_for(attack_version).expect("slot overflow");
     let quorum: Vec<usize> = (0..T).collect();
 
     // A) a valid proof of the honest list, attached to a list with an extra row.
     //    Defeated by check 2 (message binds the list).
-    let good_proof = sign_and_prove(
+    let good_proof = prover.sign_and_prove(
         &keypairs,
         &quorum,
         status_list_root_fe(&list, attack_version),
@@ -201,7 +213,7 @@ fn main() {
         outsiders.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("outsider keygen"));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
-    let out_proof = sign_and_prove(
+    let out_proof = prover.sign_and_prove(
         &outsiders,
         &quorum,
         status_list_root_fe(&out_list, 0),
@@ -231,7 +243,7 @@ fn main() {
     let spoof_version = KEY_SLOTS;
     let spoof_slot = committee.slot_for(spoof_version).expect("slot overflow");
     let signed_version = (N_UPDATES - 1) as u32; // the true latest
-    let versioned_proof = sign_and_prove(
+    let versioned_proof = prover.sign_and_prove(
         &keypairs,
         &quorum,
         status_list_root_fe(&list, signed_version),

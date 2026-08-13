@@ -18,6 +18,12 @@ be deleted with the whole suite still green).
 A mutant is EXPECTED TO FAIL. One that SURVIVES is the finding: either the check
 is dead code, or nothing tests it.
 
+Output: each mutant is named *before* it is applied and the verdict completes the
+line, so the last line of the log always identifies the mutant currently live in
+the working tree. This matters because a full run takes ~40 minutes with tracked
+source modified throughout, and the obvious reaction to finding a mutated file is
+to assume something has gone wrong.
+
 Safety: every target file is backed up before the first edit and restored after
 each mutant, with the restore verified by comparison. `finally` plus a signal
 handler means Ctrl-C and a crashing `cargo` both still restore. If a restore ever
@@ -36,8 +42,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Python block-buffers stdout when it is not a terminal, so a redirected run
+# stayed mute for its full 40 minutes and only flushed at the end — exactly when
+# the progress was no longer of any use. Line buffering costs nothing here.
+sys.stdout.reconfigure(line_buffering=True)
 
 GREEN, RED, YELLOW, DIM, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 if not sys.stdout.isatty():
@@ -55,63 +67,98 @@ if not sys.stdout.isatty():
 # documenting is a check worth a mutant.
 
 MUTANTS = {
-    # --- verify_proof: the five checks of the SNARK path -------------------
-    "snark-1-membership": ("src/committee.rs", """    if !agg
-        .info
-        .pubkeys
-        .iter()
-        .all(|pk| committee.members.contains(pk))
-    {
-        return false;
-    }""", "    if false { return false; }"),
-    "snark-2-message": ("src/committee.rs", """    if agg.info.message != status_list_root_fe(status_list.list(), status_list.version()) {
-        return false;
-    }""", "    if false { return false; }"),
-    "snark-3-slot": ("src/committee.rs", """    if committee.slot_for(status_list.version()) != Some(agg.info.slot) {
-        return false;
-    }""", "    if false { return false; }"),
-    "snark-4-quorum": ("src/committee.rs", """    if agg.info.pubkeys.len() < committee.t {
-        return false;
-    }""", "    if false { return false; }"),
-    "snark-5-proof": ("src/committee.rs", """    if verify_single_message_aggregate(&agg).is_err() {
-        return false;
-    }""", "    if false { return false; }"),
+    # --- PQSNARKVerifierModule::verify: the five checks of the SNARK path --
+    "snark-1-membership": ("src/snark_verifier_node.rs", """        if !agg
+            .info
+            .pubkeys
+            .iter()
+            .all(|pk| self.committee.members().contains(pk))
+        {
+            return false;
+        }""", "        if false { return false; }"),
+    "snark-2-message": ("src/snark_verifier_node.rs", """        if agg.info.message != status_list_root_fe(status_list.list(), status_list.version()) {
+            return false;
+        }""", "        if false { return false; }"),
+    "snark-3-slot": ("src/snark_verifier_node.rs", """        if self.committee.slot_for(status_list.version()) != Some(agg.info.slot) {
+            return false;
+        }""", "        if false { return false; }"),
+    "snark-4-quorum": ("src/snark_verifier_node.rs", """        if agg.info.pubkeys.len() < self.committee.threshold() {
+            return false;
+        }""", "        if false { return false; }"),
+    "snark-5-proof": ("src/snark_verifier_node.rs", """        if verify_single_message_aggregate(&agg).is_err() {
+            return false;
+        }""", "        if false { return false; }"),
 
-    # --- verify_quorum: the raw path --------------------------------------
-    "raw-t-zero": ("src/committee.rs", """    if committee.t == 0 {
-        return false;
-    }""", "    if false { return false; }"),
-    "raw-bitmap-width": ("src/committee.rs", """    if bitmap.len() != n.div_ceil(8) {
-        return false;
-    }""", "    if false { return false; }"),
+    # --- VerifierNode::verify_quorum: the raw path ------------------------
+    "raw-t-zero": ("src/verifier_node.rs", """        if self.committee.threshold() == 0 {
+            return false;
+        }""", "        if false { return false; }"),
+    "raw-bitmap-width": ("src/verifier_node.rs", """        if bitmap.len() != n.div_ceil(8) {
+            return false;
+        }""", "        if false { return false; }"),
     # Not merely canonicity: this is what keeps `members[i]` in range. Removing
     # it turns a two-bit edit of a genuine record into a remote panic.
-    "raw-padding-bits": ("src/committee.rs", """    if !n.is_multiple_of(8)
-        && let Some(last) = bitmap.last()
-        && (last >> (n % 8)) != 0
-    {
-        return false;
-    }
+    "raw-padding-bits": ("src/verifier_node.rs", """        if !n.is_multiple_of(8)
+            && let Some(last) = bitmap.last()
+            && (last >> (n % 8)) != 0
+        {
+            return false;
+        }
 """, ""),
-    "raw-quorum": ("src/committee.rs", """    if count < committee.t || count != status_list.signatures().len() {
-        return false;
-    }""", "    if false { return false; }"),
+    "raw-quorum": ("src/verifier_node.rs", """        if count < self.committee.threshold() || count != status_list.signatures().len() {
+            return false;
+        }""", "        if false { return false; }"),
     "raw-signatures": (
-        "src/committee.rs",
-        "        .all(|(i, sig)| xmss_verify(&committee.members[i], &message, sig, slot).is_ok())",
-        "        .all(|(i, sig)| { let _ = (i, sig); true })",
+        "src/verifier_node.rs",
+        "            .all(|(i, sig)| xmss_verify(&members[i], &message, sig, slot).is_ok())",
+        "            .all(|(i, sig)| { let _ = (i, sig); true })",
+    ),
+
+    # --- the derivations the node types own -------------------------------
+    #
+    # The five checks above are the predicate; these are the two places a node
+    # decides *what* to check against. Both are on the critical path of every
+    # binary, and `snark_verifier_node` is where a check has actually been lost
+    # before — it once held a second copy of the predicate with the slot check
+    # missing.
+    #
+    # The prover mutant stands in for "the slot comes from the caller instead of the
+    # anchor". That cannot be written as a text swap — the parameter does not exist —
+    # so the derivation is made wrong instead, which fails in the same way.
+    "snark-module-slot": (
+        "src/snark_prover_node.rs",
+        "            .slot_for(version)",
+        "            .slot_for(version + 1)",
+    ),
+    "snark-module-is-newer": (
+        "src/snark_verifier_node.rs",
+        "        status_list.version() > self.status_list_last_version",
+        "        status_list.version() >= self.status_list_last_version",
+    ),
+    "node-membership": (
+        "src/verifier_node.rs",
+        "        if !self.committee.members().contains(pub_key) {",
+        "        if false {",
     ),
 
     # --- freshness --------------------------------------------------------
     "freshness-floor-strict": (
-        "src/committee.rs",
-        "        .filter(|sl| floor.is_none_or(|f| sl.version() > f))",
-        "        .filter(|sl| floor.is_none_or(|f| sl.version() >= f))",
+        "src/snark_verifier_node.rs",
+        "            .filter(|sl| floor.is_none_or(|f| sl.version() > f))",
+        "            .filter(|sl| floor.is_none_or(|f| sl.version() >= f))",
     ),
     "freshness-floor-off": (
-        "src/committee.rs",
-        "        .filter(|sl| floor.is_none_or(|f| sl.version() > f))\n",
+        "src/snark_verifier_node.rs",
+        "            .filter(|sl| floor.is_none_or(|f| sl.version() > f))\n",
         "",
+    ),
+    # The selection is the DHT layer choosing which record to trust. Returning the
+    # newest *declared* version without verifying it hands the choice to whichever
+    # peer lies hardest.
+    "freshness-select-unverified": (
+        "src/snark_verifier_node.rs",
+        "        decoded.into_iter().find(|sl| self.verify(sl))",
+        "        decoded.into_iter().next()",
     ),
     "hwm-strict": (
         "src/freshness.rs",
@@ -130,7 +177,7 @@ MUTANTS = {
         "        if path.exists() {",
         "        if false {",
     ),
-    "dup-signer-guard": ("src/committee.rs", "        duplicated.is_none(),", "        true,"),
+    "dup-signer-guard": ("src/snark_prover_node.rs", "        duplicated.is_none(),", "        true,"),
 
     # --- wire format ------------------------------------------------------
     "anchor-canonical": ("src/committee.rs", """        if value.to_bytes() != bytes {
@@ -221,6 +268,18 @@ def cargo_test(extra):
     return p.returncode, p.stdout + p.stderr
 
 
+def uncommitted(files):
+    """Which of `files` differ from the index/HEAD. Empty if git is unavailable."""
+    try:
+        p = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", *files],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    return [line for line in p.stdout.split() if line]
+
+
 def who_failed(output):
     names = [
         line.split()[1]
@@ -231,25 +290,36 @@ def who_failed(output):
     return ", ".join(seen[:3]) + (f" (+{len(seen) - 3} more)" if len(seen) > 3 else "")
 
 
-def run_one(ws, name, extra):
-    """0 = caught (good), 1 = survived (finding), 2 = pattern stale."""
+def run_one(ws, name, extra, position=""):
+    """0 = caught (good), 1 = survived (finding), 2 = pattern stale.
+
+    The name is printed *before* the mutant is applied, not after the verdict.
+    A `cargo test` here takes a minute or more, during which the working tree is
+    modified; without this the log is silent and the tree looks inexplicably
+    dirty. The last line of the output now always names the mutant currently
+    live, which is the first thing anyone asks when they open a mutated file.
+    """
     rel, old, new = MUTANTS[name]
+    print(f"  {position}{name:<24} ", end="", flush=True)
+
     matches = ws.apply(rel, old, new)
     if matches != 1:
-        print(f"  {name:<24} {YELLOW}PATTERN STALE{OFF} — {matches} matches in {rel}")
+        print(f"{YELLOW}PATTERN STALE{OFF} — {matches} matches in {rel}")
         ws.restore()
         return 2
 
+    started = time.monotonic()
     rc, out = cargo_test(extra)
+    elapsed = time.monotonic() - started
     bad = ws.restore()
     if bad:
-        print(f"  !! RESTORE FAILED for {', '.join(bad)} — check `git diff` now", file=sys.stderr)
+        print(f"\n  !! RESTORE FAILED for {', '.join(bad)} — check `git diff` now", file=sys.stderr)
         sys.exit(3)
 
     if rc != 0:
-        print(f"  {name:<24} {GREEN}caught{OFF} by {who_failed(out) or '(build failure)'}")
+        print(f"{GREEN}caught{OFF} ({elapsed:.0f}s) by {who_failed(out) or '(build failure)'}")
         return 0
-    print(f"  {name:<24} {RED}SURVIVED — no test covers this check{OFF}")
+    print(f"{RED}SURVIVED ({elapsed:.0f}s) — no test covers this check{OFF}")
     return 1
 
 
@@ -265,7 +335,21 @@ def main():
 
     ws = Workspace({rel for rel, _, _ in MUTANTS.values()})
     # A Ctrl-C during `cargo test` must not leave a mutated tree behind.
-    signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+    #
+    # SIGTERM matters just as much and used to be missing: Python's default for it
+    # exits without unwinding, so `finally` never runs and the tree keeps whatever
+    # mutant was applied. That is exactly what a plain `kill` or `pkill` sends, and
+    # it happened — a killed run left `.slot_for(version + 1)` in
+    # `snark_prover_node.rs` and a `>=` in `snark_verifier_node.rs`, staged, ready
+    # to be committed as if they were real code.
+    interrupt = lambda *_: (_ for _ in ()).throw(KeyboardInterrupt)
+    signal.signal(signal.SIGINT, interrupt)
+    signal.signal(signal.SIGTERM, interrupt)
+    # The backups live in /tmp. A SIGKILL takes them with it, so uncommitted work
+    # in a target file is at risk in a way committed work is not — say so first.
+    if dirty := uncommitted(ws.files):
+        print(f"{YELLOW}warning:{OFF} uncommitted changes in {', '.join(dirty)}. "
+              f"The only copy is in {ws.dir}; commit or stash first.\n")
     try:
         if cmd == "check":
             print("verifying every pattern matches exactly once:")
@@ -288,17 +372,24 @@ def main():
                 return 1
             return run_one(ws, argv[1], argv[2:])
 
-        print("mutation testing — every line should say 'caught'\n")
+        total = len(MUTANTS)
+        print(f"mutation testing — {total} mutants, every line should say 'caught'")
+        print(f"{DIM}the tree is modified while this runs: {', '.join(ws.files)}")
+        print(f"do not commit until it finishes; `git show HEAD:<file>` for the real source{OFF}\n")
+
+        started = time.monotonic()
         survived, stale = [], []
-        for name in MUTANTS:
-            r = run_one(ws, name, [])
+        for i, name in enumerate(MUTANTS, 1):
+            r = run_one(ws, name, [], position=f"[{i:>2}/{total}] ")
             if r == 1:
                 survived.append(name)
             elif r == 2:
                 stale.append(name)
 
-        caught = len(MUTANTS) - len(survived) - len(stale)
-        print(f"\n{len(MUTANTS)} mutants: {caught} caught, {len(survived)} survived, {len(stale)} stale")
+        caught = total - len(survived) - len(stale)
+        mins = (time.monotonic() - started) / 60
+        print(f"\n{total} mutants in {mins:.0f} min: "
+              f"{caught} caught, {len(survived)} survived, {len(stale)} stale")
         if survived:
             print(f"{RED}survived (nothing tests these):{OFF} {', '.join(survived)}")
         if stale:
@@ -309,6 +400,10 @@ def main():
         ws.close()
         if bad:
             print(f"!! RESTORE FAILED for {', '.join(bad)}", file=sys.stderr)
+        else:
+            # Said out loud on purpose. A tool that rewrites tracked source owes
+            # the reader an explicit "your tree is back", not silence.
+            print(f"{DIM}tree restored: {len(ws.files)} files match their pre-run contents{OFF}")
 
 
 if __name__ == "__main__":

@@ -23,14 +23,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::{
-    Committee, select_freshest, select_freshest_above, verify_proof,
-};
+use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
 use decentralized_root_of_trust::stats::Series;
 use decentralized_root_of_trust::status_list::SnarkStatusList;
-use lean_multisig::setup_verifier;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -60,18 +58,39 @@ fn main() -> ExitCode {
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
 
     let rss_baseline = rss_now_mb();
-    println!("verifier: setup...");
-    let t_setup = Instant::now();
-    setup_verifier();
-    let setup_time = t_setup.elapsed();
-    let rss_after_setup = rss_now_mb();
 
-    // The fixed trust anchor. A production verifier embeds this at compile time;
-    // loading it from a file changes nothing about the trust model, as long as
-    // the anchor itself is authentic.
+    // The anchor is read *before* setup because the verifier module is built around
+    // it: `PQSNARKVerifierModule::new` owns both the anchor and the `setup_verifier()`
+    // the aggregation bytecode needs. Reading ~6 kB from disk costs nothing that the
+    // RSS sample below can see, and the trust model is unchanged — a production
+    // verifier embeds this at compile time, and either way what matters is only that
+    // the anchor is authentic.
     let anchor =
         std::fs::read(dir.join("anchor.bin")).unwrap_or_else(|e| panic!("cannot read anchor: {e}"));
     let committee = Committee::from_bytes(&anchor).expect("malformed anchor");
+
+    // The durable mark is loaded here rather than at the freshness section further
+    // down, so the module can be built with the version this verifier has actually
+    // accepted instead of a placeholder. Nothing advances it in between.
+    let state_path = std::env::var_os("VERIFIER_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("verifier-highwater.state"));
+    let mut hwm = HighWaterMark::load(&state_path, &anchor);
+
+    println!("verifier: setup...");
+    let t_setup = Instant::now();
+    // `new` performs the one-time `setup_verifier()`, so this is the same
+    // measurement as before plus one clone of a 200-key anchor.
+    //
+    // The second argument feeds `PQSNARKVerifierModule::is_newer`, a *stateless*
+    // convenience this binary does not use: freshness here is the durable
+    // `HighWaterMark` below, which survives restarts and is what actually stops a
+    // rollback. `unwrap_or(0)` on a fresh state is therefore not load-bearing.
+    let verifier = PQSNARKVerifierModule::new(committee, hwm.current().unwrap_or(0));
+    let setup_time = t_setup.elapsed();
+    let rss_after_setup = rss_now_mb();
+
+    let committee = verifier.committee_as_ref();
     println!(
         "anchor: N={} t={} ({} B)\n",
         committee.members().len(),
@@ -92,7 +111,7 @@ fn main() -> ExitCode {
         // recomputes the bytecode claim while deserializing.
         let t = Instant::now();
         let ok = match SnarkStatusList::from_bytes(&bytes) {
-            Ok(sl) => verify_proof(&committee, &sl),
+            Ok(sl) => verifier.verify(&sl),
             Err(e) => {
                 println!("  {name:<22} DECODE FAILED: {e}");
                 failures += 1;
@@ -128,7 +147,7 @@ fn main() -> ExitCode {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let bytes = std::fs::read(&path).expect("cannot read attack artifact");
         let accepted = SnarkStatusList::from_bytes(&bytes)
-            .map(|sl| verify_proof(&committee, &sl))
+            .map(|sl| verifier.verify(&sl))
             .unwrap_or(false);
         if accepted {
             failures += 1;
@@ -153,10 +172,6 @@ fn main() -> ExitCode {
     // stateless), so without the mark a peer could serve it and re-grant access a
     // node had lost. The mark is local verifier state, keyed to this anchor.
     println!("\nDHT freshness + anti-rollback");
-    let state_path = std::env::var_os("VERIFIER_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dir.join("verifier-highwater.state"));
-    let mut hwm = HighWaterMark::load(&state_path, &anchor);
     match hwm.current() {
         Some(v) => println!("  high-water mark (persisted): version {v}"),
         None => println!("  high-water mark: none yet for this committee"),
@@ -186,7 +201,7 @@ fn main() -> ExitCode {
             .count(),
         None => 0,
     };
-    match select_freshest_above(&committee, &candidates, floor) {
+    match verifier.select_freshest_above(&candidates, floor) {
         Some(sl) => match hwm.try_advance(sl.version()) {
             Decision::Accepted => {
                 println!(
@@ -245,7 +260,7 @@ fn main() -> ExitCode {
         .into_iter()
         .next()
         .and_then(|p| std::fs::read(&p).ok())
-        .and_then(|bytes| select_freshest(&committee, std::slice::from_ref(&bytes)));
+        .and_then(|bytes| verifier.select_freshest(std::slice::from_ref(&bytes)));
 
     match (hwm.current(), replayed) {
         (Some(_), Some(sl)) => match hwm.try_advance(sl.version()) {
