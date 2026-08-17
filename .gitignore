@@ -1,6 +1,5 @@
 /target
 /bench_*.csv
-Cargo.lock
 .claude/
 artifacts/
 bench-*/
@@ -9,3 +8,5 @@ bench-*/
 # the published surface and not covered by the test suite.
 src/bin/my_test.rs
 src/bin/my_test_2.rs
+src/bin/my_test_3.rs
+

@@ -74,10 +74,9 @@ their failure modes are silent and unrecoverable:
 ## What it is not
 
 A research prototype measured on one machine, not a deployment. Committee
-rotation is not implemented, the transport is a directory of files standing in
-for a DHT, and every number in [Benchmark](#benchmark) is host-specific — the
-binaries are built with `target-cpu=native`. The open gaps are listed in
-[`AGENT.md`](AGENT.md) rather than left for the reader to discover.
+rotation is not implemented, and every number in [Benchmark](#benchmark) is
+host-specific — the binaries are built with `target-cpu=native`. The open gaps
+are listed in [`AGENTS.md`](AGENTS.md) rather than left for the reader to discover.
 
 ---
 
@@ -159,6 +158,21 @@ its own successor.
 Both carry the same payload and the same signed message. They differ only in how
 the quorum is evidenced, and a verifier accepts either.
 
+### Wire format and canonicality
+
+Published `StatusList` and `SnarkStatusList` records use **SSZ
+(SimpleSerialize)**, with a fixed schema and field order. SSZ gives each decoded
+record one valid byte representation: malformed offsets, trailing bytes and
+alternative length encodings are rejected. This makes a content-addressed record
+stable — equal records have equal bytes and therefore the same object identifier.
+
+leanVM's XMSS signatures and aggregate proof retain leanVM's native postcard
+encoding inside SSZ byte fields. At the boundary they are decoded and re-encoded;
+the bytes must match exactly. Canonicality therefore includes the embedded
+cryptographic objects, not only the outer container. This is a wire-format
+commitment: artifacts created with the former postcard record format are not
+compatible and must be regenerated.
+
 | | `StatusList` | `SnarkStatusList` |
 |---|---|---|
 | evidence | the `t` raw signatures + a signer bitmap | one aggregated SNARK proof |
@@ -167,7 +181,7 @@ the quorum is evidenced, and a verifier accepts either.
 | verifier setup | none | ~5 s · 651 MB resident |
 | verify | `t` × `xmss_verify`, linear in `t` | one check, flat in `t` |
 | payload at `t=128` | ≈ 189 KB | ≈ 234 KB |
-| entry point | `VerifierNode::verify_quorum` | `PQSNARKVerifierModule::verify` |
+| entry point | `VerifierNode::verify_status_list` | `PQSNARKVerifierModule::verify` |
 
 A signer is named by its **index into the committee's member list**. The anchor
 already fixes and authenticates that order, so the index is a stable identifier
@@ -184,8 +198,9 @@ the bitmap buys three things:
   index *is* a member, so a non-member is unnameable rather than merely rejected.
 
 Two encodings of one signer set would still be possible if the bits past member
-`N-1` were free, so `VerifierNode::verify_quorum` requires them clear, and `from_bytes` rejects
-a bitmap whose population disagrees with the number of signatures.
+`N-1` were free, so `VerifierNode::verify_status_list` requires them clear, and
+`from_bytes` rejects a bitmap whose population disagrees with the number of
+signatures.
 
 What the bitmap does **not** hide is the participation pattern: anyone holding the
 anchor learns who signed, and correlating records over time reveals which members
@@ -350,7 +365,7 @@ src/
   committee.rs          Committee anchor: members, threshold, genesis_slot, slot_for, wire encoding
   atomic_slot_counter.rs durable monotonic slot allocator: reserve, reserve_at, fsync + cross-process lock
   signer_node.rs        one member: XMSS keypair + its counter; sign (local slot) and sign_at (protocol slot)
-  verifier_node.rs      raw-path relying party: verify (one signature) and verify_quorum (the whole record)
+  verifier_node.rs      raw-path relying party: verify (one signature) and verify_status_list (the whole record)
   freshness.rs          HighWaterMark: persistent, anchor-scoped anti-rollback gate
   params.rs             demo parameters (SLOT, N_MEMBERS, T, N_UPDATES, KEY_SLOTS, LOG_INV_RATE)
   mem.rs                VmRSS / VmHWM probes
@@ -379,16 +394,19 @@ uses none of them: everything it needs comes from the committee anchor it loads.
 
 ## Dependencies
 
-All dependencies are **git-pinned** (no vendored clones):
+The leanVM dependencies are **git-pinned** (no vendored clones):
 
 - `lean-multisig`, `backend` — from `leanEthereum/leanVM` at a fixed revision.
   leanVM ships its own field/hash backend and **does not depend on Plonky3**, so
   the whole tree resolves reproducibly.
-- `rand`, `sha3`, `postcard`, `serde` — from crates.io.
+- `ethereum_ssz` / `ethereum_ssz_derive` — SSZ encoding compatible with the
+  Ethereum consensus specification.
+- `rand`, `sha3`, `postcard`, `serde` — from crates.io. `postcard` is retained
+  only for leanVM-native cryptographic objects, not published record containers.
 
-`Cargo.lock` is currently listed in `.gitignore`. Since the leanVM dependencies
-are pinned by revision but their transitive tree is not, committing the lockfile
-is what makes a build reproducible — `benchmark.sh` warns when it is missing.
+`Cargo.lock` is committed. The direct leanVM revision alone does not lock its
+transitive tree; the lockfile is part of the reproducible build contract and
+`benchmark.sh` warns when it is missing.
 
 `.cargo/config.toml` sets a large `RUST_MIN_STACK` (the prover uses a very deep
 stack) and `target-cpu=native`.
@@ -826,6 +844,6 @@ check from the verifier wrapper.
 Every check named in this section is verified to be load-bearing by
 `tools/mutate.py`, which deletes one and reports which test complains. 25 mutants,
 all caught. Its findings so far: three checks that no test reached at all
-(`verify_quorum`'s padding bits, the bitmap width, and `t == 0`), plus a padding
-test that had been locating the bitmap by searching a signature blob for a byte
-value.
+(`verify_status_list`'s padding bits, the bitmap width, and `t == 0`), plus a
+padding test that had been locating the bitmap by searching a signature blob for
+a byte value.

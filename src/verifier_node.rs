@@ -1,9 +1,10 @@
 //! A relying party on the **raw** path: it holds the anchor and answers the two
 //! questions a verifier can ask without a circuit.
 //!
-//! `verify` asks "is this one signature from some member". `verify_quorum` asks
-//! the question that actually authorizes an update — "did at least `t` distinct
-//! members sign *this* list at *this* version" — and the threshold is part of it.
+//! `verify` asks "is this one signature from some member". `verify_status_list`
+//! asks the question that actually authorizes an update — "did at least `t`
+//! distinct members sign *this* list at *this* version" — and the threshold is
+//! part of it.
 //!
 //! Neither needs `setup_verifier()`, neither needs the aggregation bytecode, and
 //! neither costs a gigabyte of resident state. This is the counterpart of
@@ -55,15 +56,21 @@ impl VerifierNode {
             .map_err(|_| VerifierError::SignatureVerificationError)
     }
 
-    /// Verifies the raw quorum carried by a [`StatusList`]: the `t` XMSS
-    /// signatures themselves, plus the bitmap naming who produced them.
+    /// Verifies a [`StatusList`] against this node's anchor: the `t` XMSS
+    /// signatures it carries, plus the bitmap naming who produced them.
     ///
     /// Unlike [`VerifierNode::verify`], which answers "is this one signature from
     /// some member", this answers "is this update authorized" — the threshold is
     /// part of the question.
     ///
+    /// It is a method on the node, and never a free function, because *every*
+    /// answer it gives is relative to the committee this node holds: the bitmap
+    /// width, which key each bit names, the slot the version derives to, and `t`
+    /// itself all come from the anchor. The same bytes verify under one committee
+    /// and not under another, so there is no anchor-free way to ask the question.
+    ///
     /// All six checks are load-bearing; dropping any one of them is exploitable.
-    pub fn verify_quorum(&self, status_list: &StatusList) -> bool {
+    pub fn verify_status_list(&self, status_list: &StatusList) -> bool {
         let members = self.committee.members();
         let n = members.len();
         let bitmap = status_list.signers_bitmap();
@@ -265,7 +272,7 @@ mod tests {
         assert_eq!(c.slot_for(7), Some(GENESIS + 7));
     }
 
-    // --- `verify_quorum`: the predicate that authorizes an update -------------
+    // --- `verify_status_list`: the predicate that authorizes an update -------
 
     #[test]
     fn a_legitimate_quorum_verifies() {
@@ -276,12 +283,12 @@ mod tests {
 
         assert_eq!(sl.signer_count(), 3);
         assert_eq!(sl.signer_indices().collect::<Vec<_>>(), vec![0, 2, 4]);
-        assert!(node.verify_quorum(&sl));
+        assert!(node.verify_status_list(&sl));
 
         // ...and it survives a round trip through the wire encoding.
         let bytes = sl.to_bytes();
         let back = StatusList::from_bytes(&bytes).expect("decodes");
-        assert!(node.verify_quorum(&back));
+        assert!(node.verify_status_list(&back));
     }
 
     /// The signers are named out of order and get sorted into canonical form, so
@@ -297,7 +304,7 @@ mod tests {
         let a = record(list.clone(), 0, sigs);
         let b = record(list.clone(), 0, shuffled);
         assert_eq!(a.to_bytes(), b.to_bytes());
-        assert!(node.verify_quorum(&b));
+        assert!(node.verify_status_list(&b));
     }
 
     #[test]
@@ -317,7 +324,7 @@ mod tests {
         let (keys, node) = committee_in(8);
         let list = vec![hash_any(b"vc-1")];
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[1, 3]);
-        assert!(!node.verify_quorum(&record(list, 0, sigs)));
+        assert!(!node.verify_status_list(&record(list, 0, sigs)));
     }
 
     /// A valid quorum re-labelled with another version. The version is folded into
@@ -327,7 +334,7 @@ mod tests {
         let (keys, node) = committee_in(9);
         let list = vec![hash_any(b"vc-1")];
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[0, 1, 2]);
-        assert!(!node.verify_quorum(&record(list, 1, sigs)));
+        assert!(!node.verify_status_list(&record(list, 1, sigs)));
     }
 
     /// A row nobody authorized, appended to a list carrying a real quorum.
@@ -338,7 +345,7 @@ mod tests {
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[0, 1, 2]);
         let mut tampered = list.clone();
         tampered.push(hash_any(b"FAKE-REVOCATION"));
-        assert!(!node.verify_quorum(&record(tampered, 0, sigs)));
+        assert!(!node.verify_status_list(&record(tampered, 0, sigs)));
     }
 
     /// Signatures re-attributed to members who never produced them. Nothing about
@@ -352,32 +359,33 @@ mod tests {
             .into_iter()
             .map(|(i, s)| (i + 2, s)) // 0,1,2 -> 2,3,4
             .collect();
-        assert!(!node.verify_quorum(&record(list, 0, moved)));
+        assert!(!node.verify_status_list(&record(list, 0, moved)));
     }
 
-    /// Where the signer bitmap sits inside `StatusList::to_bytes`, derived from
-    /// the postcard layout rather than searched for:
+    /// Locates the signer bitmap through the SSZ container's offset table.
     ///
-    /// ```text
-    /// alg | list len | 32 * n_entries | version | bitmap len | BITMAP | sigs len | ...
-    ///  1        1                          1          1
-    /// ```
-    ///
-    /// Valid only while `n_entries`, the version and the bitmap length each fit in
-    /// one varint byte, which the callers below ensure. `bitmap_byte` asserts the
-    /// arithmetic landed on the value it expected, so a layout change fails here
-    /// rather than silently patching a byte in the middle of a signature.
-    ///
-    /// Searching was the original approach and it was wrong: the bitmap for
-    /// signers `{0,1,2}` is `0b0000_0111`, and `0x07` occurs *all over* a 4.4 kB
-    /// blob of signatures. `rposition` found one at offset 4434 instead of 36, so
-    /// the test was corrupting a signature and then congratulating itself when the
-    /// record failed to verify — for entirely the wrong reason.
-    fn bitmap_byte(bytes: &[u8], n_entries: usize, expected: u8) -> usize {
-        let at = 1 + 1 + 32 * n_entries + 1 + 1;
+    /// The fixed section is `alg: u8`, `list: offset`, `version: u32`,
+    /// `signers: offset`, `signatures: offset`; the signer bytes occupy the
+    /// interval between the last two offsets. Reading the schema is deliberate:
+    /// searching a signature blob for a byte value can mutate a signature instead
+    /// of the bitmap and turn a security test into a false positive.
+    fn read_offset(bytes: &[u8], at: usize) -> usize {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("SSZ offset")) as usize
+    }
+
+    fn write_offset(bytes: &mut [u8], at: usize, value: usize) {
+        bytes[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
+    }
+
+    fn bitmap_byte(bytes: &[u8], expected: u8) -> usize {
+        const SIGNERS_OFFSET: usize = 1 + 4 + 4;
+        const SIGNATURES_OFFSET: usize = SIGNERS_OFFSET + 4;
+        let at = read_offset(bytes, SIGNERS_OFFSET);
+        let end = read_offset(bytes, SIGNATURES_OFFSET);
+        assert_eq!(end, at + 1, "test records carry a one-byte bitmap");
         assert_eq!(
             bytes[at], expected,
-            "postcard layout moved: offset {at} is {:#010b}, expected {expected:#010b}",
+            "SSZ bitmap offset {at} is {:#010b}, expected {expected:#010b}",
             bytes[at]
         );
         at
@@ -407,7 +415,7 @@ mod tests {
         assert_eq!(empty.signatures().len(), 0);
 
         assert!(
-            !node.verify_quorum(&empty),
+            !node.verify_status_list(&empty),
             "a threshold of zero must never authorize anything"
         );
 
@@ -431,16 +439,17 @@ mod tests {
         let list = vec![hash_any(b"vc-1")];
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[1, 2, 3]);
         let sl = record(list.clone(), 0, sigs);
-        assert!(node.verify_quorum(&sl), "the record starts out honest");
+        assert!(node.verify_status_list(&sl), "the record starts out honest");
 
         let mut bytes = sl.to_bytes();
-        let at = bitmap_byte(&bytes, list.len(), 0b0000_1110);
+        let at = bitmap_byte(&bytes, 0b0000_1110);
         // Widen `signers` from one byte to two: members 1 and 2 stay, member 3's
         // bit moves into a second byte that the committee has no room for.
-        assert_eq!(bytes[at - 1], 1, "the byte before the bitmap is its length");
-        bytes[at - 1] = 2;
+        const SIGNATURES_OFFSET: usize = 1 + 4 + 4 + 4;
+        let signatures_at = read_offset(&bytes, SIGNATURES_OFFSET);
         bytes[at] = 0b0000_0110;
-        bytes.insert(at + 1, 0b0000_0001);
+        bytes.insert(signatures_at, 0b0000_0001);
+        write_offset(&mut bytes, SIGNATURES_OFFSET, signatures_at + 1);
 
         let forged = StatusList::from_bytes(&bytes)
             .expect("three bits against three signatures still decodes");
@@ -460,7 +469,7 @@ mod tests {
         );
 
         assert!(
-            !node.verify_quorum(&forged),
+            !node.verify_status_list(&forged),
             "a bitmap wider than the committee must be refused"
         );
     }
@@ -474,12 +483,12 @@ mod tests {
         let list = vec![hash_any(b"vc-1")];
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[0, 1, 2]);
         let sl = record(list.clone(), 0, sigs);
-        assert!(node.verify_quorum(&sl));
+        assert!(node.verify_status_list(&sl));
 
         // Set a bit above member 4 directly in the encoding: `StatusList::new`
         // would never produce it, so a forgery has to come off the wire.
         let mut bytes = sl.to_bytes();
-        let at = bitmap_byte(&bytes, list.len(), 0b0000_0111);
+        let at = bitmap_byte(&bytes, 0b0000_0111);
         bytes[at] |= 0b1000_0000;
         assert!(
             StatusList::from_bytes(&bytes).is_err(),
@@ -487,8 +496,9 @@ mod tests {
         );
     }
 
-    /// The padding case that actually reaches [`VerifierNode::verify_quorum`], and
-    /// the reason the check there is not redundant with the decoder's.
+    /// The padding case that actually reaches
+    /// [`VerifierNode::verify_status_list`], and the reason the check there is
+    /// not redundant with the decoder's.
     ///
     /// Adding a bit changes the population, so the decoder catches it. *Moving*
     /// one does not: clear member 0's bit and set the padding bit 7, and the
@@ -520,10 +530,10 @@ mod tests {
         // the two genuine pairs ahead of it keep `.all()` going.
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[1, 2, 3]);
         let sl = record(list.clone(), 0, sigs);
-        assert!(node.verify_quorum(&sl), "the record starts out honest");
+        assert!(node.verify_status_list(&sl), "the record starts out honest");
 
         let mut bytes = sl.to_bytes();
-        let at = bitmap_byte(&bytes, list.len(), 0b0000_1110);
+        let at = bitmap_byte(&bytes, 0b0000_1110);
         // 0b0000_1110 -> 0b1000_0110: member 3's bit moves to the padding bit 7.
         // Still three bits against three signatures, so the decoder sees nothing
         // wrong; the record now claims members 1, 2 and 7 of a committee of 5.
@@ -542,7 +552,7 @@ mod tests {
         );
 
         assert!(
-            !node.verify_quorum(&forged),
+            !node.verify_status_list(&forged),
             "a bitmap naming a member the committee does not have must be refused"
         );
     }
@@ -565,7 +575,7 @@ mod tests {
         // The outsider takes member 2's seat — the only way in, and it fails
         // because seat 2 is checked against member 2's key.
         sigs.push((2, outsider.clone()));
-        assert!(!node.verify_quorum(&record(list.clone(), 0, sigs)));
+        assert!(!node.verify_status_list(&record(list.clone(), 0, sigs)));
 
         // Claiming a seat the committee does not have is refused at construction,
         // so an outsider cannot be appended alongside a full honest quorum either.

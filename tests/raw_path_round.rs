@@ -113,7 +113,7 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     let mut list = vec![hash_any(b"revoke-alice")];
     let v0 = publish(verifier.get_committee(), &mut nodes, &list, 0, &[0, 1, 2]);
 
-    assert!(verifier.verify_quorum(&v0), "honest round 0 must verify");
+    assert!(verifier.verify_status_list(&v0), "honest round 0 must verify");
     assert!(matches!(hwm.try_advance(v0.version()), Decision::Accepted));
 
     // --- round 1: members 2,3,4. Only member 2 overlaps, which is the case
@@ -121,7 +121,7 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     list.push(hash_any(b"revoke-bob"));
     let v1 = publish(verifier.get_committee(), &mut nodes, &list, 1, &[2, 3, 4]);
 
-    assert!(verifier.verify_quorum(&v1), "honest round 1 must verify");
+    assert!(verifier.verify_status_list(&v1), "honest round 1 must verify");
     assert!(matches!(hwm.try_advance(v1.version()), Decision::Accepted));
     assert_eq!(hwm.current(), Some(1));
 
@@ -134,7 +134,7 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     // cryptography is stateless and cannot tell "old" from "current". Only the
     // gate can, which is the entire reason it exists.
     assert!(
-        verifier.verify_quorum(&v0),
+        verifier.verify_status_list(&v0),
         "the stale record is still cryptographically valid"
     );
     assert!(matches!(hwm.try_advance(v0.version()), Decision::Stale(1)));
@@ -172,7 +172,7 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
     // The other four are untouched by member 0's refusal, so the round still
     // reaches quorum without it.
     let published = publish(verifier.get_committee(), &mut nodes, &list, 0, &[1, 2, 3]);
-    assert!(verifier.verify_quorum(&published));
+    assert!(verifier.verify_status_list(&published));
 }
 
 /// A crash is indistinguishable from a clean exit here: the counter is reopened

@@ -11,23 +11,21 @@
 //! 1. **No panic.** `from_bytes` returns `Result`, so any panic — an index out of
 //!    range, an `unwrap`, a capacity overflow — is a bug regardless of what the
 //!    bytes were.
-//! 2. **No allocation bomb.** postcard prefixes every `Vec` with a varint length.
-//!    A decoder that believed a declared length of `u32::MAX` and preallocated
-//!    would be a one-packet OOM. (postcard's `SeqAccess::size_hint` returns `None`
-//!    when the declared length exceeds the remaining input, so serde never sees a
-//!    hint it could act on — this checks that rather than trusting it.)
+//! 2. **No allocation bomb.** SSZ offsets and lengths must describe regions that
+//!    actually exist in the input; a malformed offset must be rejected rather
+//!    than being trusted as an allocation request.
 //! 3. **No forgery.** The one that would be a real break: a mutated record that
-//!    `verify_quorum` accepts while *meaning* something different from the record
-//!    it was derived from. Anything that verifies must carry exactly the original
-//!    list, version and signer set.
+//!    `verify_status_list` accepts while *meaning* something different from the
+//!    record it was derived from. Anything that verifies must carry exactly the
+//!    original list, version and signer set.
 //!
 //! ## Scope, honestly stated
 //!
 //! This is the **raw** path. `SnarkStatusList` is decoded here but not verified:
 //! `verify_proof` costs ~30 ms and `setup_verifier` a further several seconds, so
 //! a run large enough to be interesting would take hours. Property 3 therefore
-//! covers `verify_quorum` only; the SNARK predicate is covered case-by-case in
-//! `tests/snark_path.rs`, which is the better tool for it anyway — a fuzzer is
+//! covers `verify_status_list` only; the SNARK predicate is covered case-by-case
+//! in `tests/snark_path.rs`, which is the better tool for it anyway — a fuzzer is
 //! very unlikely to stumble onto a valid aggregate.
 //!
 //! The seed is fixed, so a failure is reproducible and the suite does not become
@@ -91,7 +89,7 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
     let honest = StatusList::new(Algorithms::WotsXmss, list.clone(), VERSION, N, signatures)
         .expect("well-formed");
     assert!(
-        verifier.verify_quorum(&honest),
+        verifier.verify_status_list(&honest),
         "the seed record must verify, or every negative below is vacuous"
     );
 
@@ -100,11 +98,29 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
         .to_bytes();
     let anchor = committee.to_bytes();
 
-    // --- property 2: a declared length no input could satisfy ---
-    // `FF FF FF FF 0F` is postcard's varint for `u32::MAX`. Splicing it in at every
-    // offset lands it on real length prefixes, on the middle of other varints, and
-    // on payload bytes — the last two matter too, since a decoder that misreads
-    // where a length *is* is exactly how this goes wrong.
+    // The wire codec is canonical: decoding then encoding an accepted record
+    // yields exactly the original bytes. A trailing byte is not an alternative
+    // spelling of the same record under SSZ.
+    assert_eq!(
+        StatusList::from_bytes(&raw)
+            .expect("honest raw record decodes")
+            .to_bytes(),
+        raw
+    );
+    assert_eq!(
+        SnarkStatusList::from_bytes(&snark)
+            .expect("well-formed SSZ container decodes")
+            .to_bytes(),
+        snark
+    );
+    let mut padded_raw = raw.clone();
+    padded_raw.push(0);
+    assert!(StatusList::from_bytes(&padded_raw).is_err());
+
+    // --- property 2: hostile offset/length-shaped data ---
+    // The pattern is spliced at every early offset. Under SSZ it may land in a
+    // fixed field, an offset table, or payload; in each case decoding must stay
+    // bounded and return an error when the resulting layout is invalid.
     for corpus in [&raw, &snark, &anchor] {
         for cut in 0..corpus.len().min(64) {
             let mut bytes = corpus[..cut].to_vec();
@@ -158,12 +174,10 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
 
         if let Ok(sl) = StatusList::from_bytes(&bytes) {
             decoded += 1;
-            if verifier.verify_quorum(&sl) {
+            if verifier.verify_status_list(&sl) {
                 verified += 1;
                 // The one that would be a break. A mutant may legitimately verify
-                // — the mutation can be a no-op, and postcard admits non-minimal
-                // varints so a re-encoding of the same values is a different byte
-                // string with the same meaning. What it may never do is verify
+                // — the mutation can be a no-op. What it may never do is verify
                 // while meaning something else.
                 assert_eq!(sl.version(), VERSION, "forged version");
                 assert_eq!(sl.list(), entries().as_slice(), "forged list");
@@ -188,6 +202,6 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
     );
     assert!(
         verified > 0,
-        "no mutant reached verify_quorum at all: property 3 was never tested"
+        "no mutant reached verify_status_list at all: property 3 was never tested"
     );
 }

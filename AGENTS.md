@@ -1,4 +1,4 @@
-# AGENT.md
+# AGENTS.md
 
 This file provides guidance to a generic Code Agent (Claude, GPT, Cursor etc..) when working with code in this repository.
 
@@ -72,7 +72,10 @@ Library:
   entry(e))` from `[0;8]`. Cost is O(n) sequential and there are no per-entry
   inclusion proofs. It allocates nothing on the heap, so a large list could be
   streamed rather than held in RAM.
-  `StatusList::new` sorts the `(index, signature)` pairs and rejects duplicates
+  Published records use SSZ containers, so their outer wire encoding is canonical.
+  Raw XMSS signatures and leanVM aggregates remain postcard blobs because those
+  types belong to leanVM; decoding re-encodes and byte-compares them before use,
+  so the embedded representation is canonical too. `StatusList::new` sorts the `(index, signature)` pairs and rejects duplicates
   and out-of-range indices, so a value that exists is already canonical — the
   out-of-order and repeated-signer variants are unconstructible rather than
   defended against. `from_bytes` additionally rejects a bitmap whose population
@@ -90,9 +93,12 @@ Library:
 - `src/signer_node.rs` — one member: keypair + counter. `sign` for the local-slot
   path, `sign_at` for the derived-slot one.
 - `src/verifier_node.rs` — one relying party on the **raw** path: `verify` for a
-  single member signature, `verify_quorum` for the whole record (the six checks
-  that decide whether an update is authorized). Needs no `setup_verifier()` and no
-  circuit, which is what makes it the honest comparison against the SNARK path.
+  single member signature, `verify_status_list` for the whole record (the six
+  checks that decide whether an update is authorized). It is a method on the node
+  and not a free function because every answer depends on the anchor it holds:
+  the same bytes verify under one committee and not under another. Needs no
+  `setup_verifier()` and no circuit, which is what makes it the honest comparison
+  against the SNARK path.
 - `src/params.rs` — demo parameters (`SLOT` = the genesis slot, `N_MEMBERS`, `T`,
   `N_UPDATES`, `KEY_SLOTS`, `LOG_INV_RATE`), shared by `main.rs`, `prover` and
   `raw_agg`. The `verifier` deliberately imports none of them.
@@ -137,7 +143,7 @@ duplicated next to a wrapper is how the verifier module once lost its slot check
 Local scratch binaries (`src/bin/my_test*.rs`) are gitignored: hand-run
 walkthroughs, not part of the published surface and not covered by the tests.
 
-Tests (`cargo test`, ~15 s warm, 52 in total):
+Tests (`cargo test`, ~15 s warm, 58 in total):
 - `src/*.rs` unit tests cover each module against its own contract. `stats.rs`'s
   are worth a note: they are the only guard on the numbers that reach the paper,
   and they pin the two choices a "simplification" would silently undo — the
@@ -226,9 +232,10 @@ and the Merkle path directions, so a wrong one simply fails check 5. It pins
 It also caps version inflation, since a slot-consistent forgery needs a key
 covering `genesis + version`.
 
-`VerifierNode::verify_quorum` is the same five checks for the raw form, with two differences
-worth knowing: membership is structural (an index *is* a member, so check 1
-disappears), and the bitmap needs two extra well-formedness checks — exact width
+`VerifierNode::verify_status_list` is the same five checks for the raw form, with
+two differences worth knowing: membership is structural (an index *is* a member,
+so check 1 disappears), and the bitmap needs two extra well-formedness checks —
+exact width
 `ceil(N/8)`, and padding bits past member `N-1` clear, without which one signer
 set has several valid encodings.
 
@@ -253,18 +260,11 @@ quorum check.
   folds sequentially, so `root([a,b]) != root([b,a])`: one logical revocation set
   has `n!` valid roots. Sorting inside the fold would fix it and is a
   wire-format-breaking change.
-- **The published records are not canonically encoded.** Every decoder rejects
-  trailing bytes, which closes the unbounded family of alternative encodings, but
-  that is not canonicity: postcard's varint decoder errors only on overflow of the
-  last permitted byte, so `87 00` and `07` both decode to `7`. The `version`
-  field, each `Vec` length prefix and the `Algorithms` discriminant all admit that
-  padding, so one logical update still has several valid byte forms and DHT
-  deduplication is best-effort. Not a soundness issue — the signed message is
-  recomputed from the decoded values, so a re-encoding verifies as the original
-  and forges nothing. `Committee::from_bytes` *does* close it fully (re-encode and
-  compare), because the anchor is read once at startup and the freshness gate
-  fingerprints it; the same treatment on the verify path would cost a re-encode of
-  the whole aggregate per record.
+- **Published records are canonically encoded.** `StatusList` and
+  `SnarkStatusList` use SSZ containers. XMSS signatures and leanVM aggregates
+  remain native postcard blobs, but they are accepted only when decode followed
+  by re-encode returns byte-for-byte identical data. The old postcard container
+  format is intentionally incompatible; regenerate artifacts after upgrading.
 - **Committee rotation is not implemented.** Because the slot is derived, every
   key now runs out at the *same* round (`genesis + KEY_SLOTS`), which turns
   rotation from an asynchronous per-node event into a deadline everybody can

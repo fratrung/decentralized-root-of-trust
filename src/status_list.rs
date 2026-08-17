@@ -21,10 +21,67 @@ use backend::*;
 use lean_multisig::XmssSignature;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
+use ssz::{Decode as _, Encode as _};
+use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum Algorithms {
     WotsXmss,
+}
+
+/// SSZ wire schema for the raw form.  LeanVM's signature type is external to
+/// this crate, so its canonical postcard representation is carried as an opaque
+/// SSZ byte-list and checked while decoding.
+#[derive(SszEncode, SszDecode)]
+#[ssz(struct_behaviour = "container")]
+struct RawStatusListWire {
+    alg: u8,
+    status_list: Vec<[u8; 32]>,
+    version: u32,
+    signers: Vec<u8>,
+    signatures: Vec<Vec<u8>>,
+}
+
+/// SSZ wire schema for the SNARK form.  `zk_proof` remains an opaque byte-list
+/// here because leanVM requires verifier setup before its aggregate can be
+/// deserialized; [`SnarkStatusList::proof`] checks its inner encoding before
+/// verification.
+#[derive(SszEncode, SszDecode)]
+#[ssz(struct_behaviour = "container")]
+struct SnarkStatusListWire {
+    alg: u8,
+    status_list: Vec<[u8; 32]>,
+    version: u32,
+    zk_proof: Vec<u8>,
+}
+
+fn algorithm_tag(alg: Algorithms) -> u8 {
+    match alg {
+        Algorithms::WotsXmss => 0,
+    }
+}
+
+fn algorithm_from_tag(tag: u8) -> Result<Algorithms, String> {
+    match tag {
+        0 => Ok(Algorithms::WotsXmss),
+        _ => Err(format!("unknown status-list algorithm tag {tag}")),
+    }
+}
+
+fn canonical_signature_bytes(signature: &XmssSignature) -> Vec<u8> {
+    postcard::to_allocvec(signature).expect("XMSS signature serialization failed")
+}
+
+fn decode_canonical_signature(bytes: &[u8]) -> Result<XmssSignature, String> {
+    let (signature, rest) = postcard::take_from_bytes::<XmssSignature>(bytes)
+        .map_err(|e| format!("signature not deserializable: {e}"))?;
+    if !rest.is_empty() {
+        return Err(format!("{} trailing byte(s) after signature", rest.len()));
+    }
+    if canonical_signature_bytes(&signature) != bytes {
+        return Err("signature is not canonically encoded".into());
+    }
+    Ok(signature)
 }
 
 /// SHA3-256 of arbitrary bytes, used to build status-list entries.
@@ -115,13 +172,10 @@ impl SnarkStatusList {
     /// Requires the aggregation bytecode to be initialized: `setup_prover()`
     /// or `setup_verifier()` MUST be called first.
     ///
-    /// Rejects trailing bytes, like every other decoder here. It used to accept
-    /// them (`postcard::from_bytes` never calls `finalize`), and `zk_proof` is a
-    /// length-prefixed `Vec<u8>`, so padding it produced a byte-different record
-    /// that still verified — one logical update with unboundedly many encodings,
-    /// each a distinct key in a content-addressed DHT. That unbounded family is
-    /// closed; see [`SnarkStatusList::from_bytes`] for the narrower one that
-    /// remains.
+    /// The aggregate remains postcard-encoded because that is leanVM's native
+    /// representation. It is canonicalized here: after decoding, its unique
+    /// postcard encoding must byte-match the stored blob. This closes the only
+    /// non-SSZ field before the verifier trusts the record.
     pub fn proof(&self) -> Result<lean_multisig::SingleMessageAggregateSignature, String> {
         let (value, rest) = postcard::take_from_bytes::<
             lean_multisig::SingleMessageAggregateSignature,
@@ -130,42 +184,37 @@ impl SnarkStatusList {
         if !rest.is_empty() {
             return Err(format!("{} trailing byte(s) after proof", rest.len()));
         }
+        if postcard::to_allocvec(&value).expect("proof serialization failed") != self.zk_proof {
+            return Err("proof is not canonically encoded".to_string());
+        }
         Ok(value)
     }
 
-    /// Wire encoding of the published object — this is what would go into the DHT.
+    /// Canonical SSZ wire encoding of the published object.
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("status list serialization failed")
+        SnarkStatusListWire {
+            alg: algorithm_tag(self.alg),
+            status_list: self.status_list.clone(),
+            version: self.version,
+            zk_proof: self.zk_proof.clone(),
+        }
+        .as_ssz_bytes()
     }
 
     /// Inverse of [`SnarkStatusList::to_bytes`].
     ///
-    /// Rejects trailing bytes, which closes the *unbounded* source of alternative
-    /// encodings — padding a length-prefixed field is free and repeatable.
-    ///
-    /// It does **not** make the encoding canonical, and the difference matters for
-    /// a content-addressed DHT. postcard's varint decoder errors only when the last
-    /// permitted byte would overflow the type, so a non-minimal `87 00` decodes to
-    /// the same `7` as `07`; the `version` field, every `Vec` length prefix and the
-    /// `Algorithms` discriminant all admit that padding. A re-encoded record is a
-    /// different key with the same meaning, so deduplication is best-effort here,
-    /// not guaranteed.
-    ///
-    /// This is a *storage* property, not a security one: nothing downstream trusts
-    /// these bytes. The signed message is recomputed from the decoded values, so a
-    /// re-encoding verifies exactly as the original does and forges nothing.
-    ///
-    /// Closing it fully costs a re-encode-and-compare on every decode, as
-    /// [`crate::committee::Committee::from_bytes`] does — affordable for an anchor
-    /// read once at startup, less obviously so on the verify path, where the
-    /// aggregate is the bulk of the record.
+    /// SSZ rejects invalid offsets, non-minimal container layouts and trailing
+    /// bytes. The aggregate itself is checked by [`SnarkStatusList::proof`],
+    /// since leanVM requires verifier setup before it can be deserialized.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let (value, rest) = postcard::take_from_bytes::<Self>(bytes)
-            .map_err(|e| format!("status list not deserializable: {e}"))?;
-        if !rest.is_empty() {
-            return Err(format!("{} trailing byte(s) after status list", rest.len()));
-        }
-        Ok(value)
+        let value = SnarkStatusListWire::from_ssz_bytes(bytes)
+            .map_err(|e| format!("SNARK status list is not valid SSZ: {e:?}"))?;
+        Ok(Self {
+            alg: algorithm_from_tag(value.alg)?,
+            status_list: value.status_list,
+            version: value.version,
+            zk_proof: value.zk_proof,
+        })
     }
 }
 
@@ -194,9 +243,10 @@ pub struct StatusList {
     version: u32,
     /// One bit per committee member, LSB-first within each byte: member `i` is
     /// bit `i % 8` of byte `i / 8`. Its length is `ceil(N / 8)`, which only the
-    /// anchor knows — see [`crate::committee::verify_quorum`], which also rejects
-    /// the padding bits past `N` being set, since two encodings of one signer set
-    /// would otherwise both be valid.
+    /// anchor knows — see
+    /// [`crate::verifier_node::VerifierNode::verify_status_list`], which also
+    /// rejects the padding bits past `N` being set, since two encodings of one
+    /// signer set would otherwise both be valid.
     signers: Vec<u8>,
     /// One signature per set bit, in ascending index order.
     signatures: Vec<XmssSignature>,
@@ -279,24 +329,43 @@ impl StatusList {
         &self.signatures
     }
 
-    /// Wire encoding of the published object.
+    /// Canonical SSZ wire encoding of the published object.
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("status list serialization failed")
+        RawStatusListWire {
+            alg: algorithm_tag(self.alg),
+            status_list: self.status_list.clone(),
+            version: self.version,
+            signers: self.signers.clone(),
+            signatures: self
+                .signatures
+                .iter()
+                .map(canonical_signature_bytes)
+                .collect(),
+        }
+        .as_ssz_bytes()
     }
 
     /// Inverse of [`StatusList::to_bytes`].
     ///
-    /// Rejects trailing bytes, and rejects a bitmap whose population does not
-    /// match the number of signatures. That second check needs no anchor and
-    /// costs nothing, so it belongs here: a record whose bits and signatures
-    /// disagree can only misalign the two when zipped, and catching it at the
-    /// boundary means no later code has to consider the possibility.
+    /// Decodes the SSZ schema and rejects a bitmap whose population does not
+    /// match the number of signatures. Each embedded leanVM signature must also
+    /// be its unique postcard representation, so no non-canonical encoding is
+    /// smuggled inside an otherwise canonical SSZ container.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let (value, rest) = postcard::take_from_bytes::<Self>(bytes)
-            .map_err(|e| format!("status list not deserializable: {e}"))?;
-        if !rest.is_empty() {
-            return Err(format!("{} trailing byte(s) after status list", rest.len()));
-        }
+        let value = RawStatusListWire::from_ssz_bytes(bytes)
+            .map_err(|e| format!("raw status list is not valid SSZ: {e:?}"))?;
+        let signatures: Vec<XmssSignature> = value
+            .signatures
+            .iter()
+            .map(|bytes| decode_canonical_signature(bytes))
+            .collect::<Result<_, _>>()?;
+        let value = Self {
+            alg: algorithm_from_tag(value.alg)?,
+            status_list: value.status_list,
+            version: value.version,
+            signers: value.signers,
+            signatures,
+        };
         if value.signer_count() != value.signatures.len() {
             return Err(format!(
                 "bitmap names {} signers but {} signatures are present",

@@ -1,8 +1,9 @@
 //! The trust anchor, and nothing else.
 //!
-//! This module used to carry the protocol predicates too — `verify_quorum`,
-//! `verify_proof`, `make_proof`, the freshness selection. They are now methods on
-//! the node types that own the anchor ([`crate::verifier_node::VerifierNode`],
+//! This module used to carry the protocol predicates too —
+//! `verify_status_list`, `verify_proof`, `make_proof`, the freshness selection.
+//! They are now methods on the node types that own the anchor
+//! ([`crate::verifier_node::VerifierNode`],
 //! [`crate::snark_prover_node::PQSNARKProverModule`],
 //! [`crate::snark_verifier_node::PQSNARKVerifierModule`]), so a participant is one
 //! value with the operations its role can perform, rather than a bag of free
@@ -35,8 +36,8 @@ impl Committee {
     ///
     /// If `t` is not in `1..=members.len()`. Both bounds are load-bearing: `t = 0`
     /// makes a record with *no* signatures reach quorum (see the guard in
-    /// [`crate::verifier_node::VerifierNode::verify_quorum`]), and `t > N` is an
-    /// anchor no quorum can ever satisfy.
+    /// [`crate::verifier_node::VerifierNode::verify_status_list`]), and `t > N`
+    /// is an anchor no quorum can ever satisfy.
     /// Neither is a runtime condition — an anchor is built once, by its owner —
     /// so this is an assertion, not a `Result`.
     pub fn new(members: Vec<XmssPublicKey>, t: usize, genesis_slot: u32) -> Self {
@@ -53,9 +54,10 @@ impl Committee {
     }
 
     /// [`Committee::new`] without the `t` invariant, so the guard that backstops
-    /// it in [`crate::verifier_node::VerifierNode::verify_quorum`] can be reached
-    /// at all. Test-only and crate-visible: the fields are private, and the guard
-    /// exists precisely for a construction path that does not go through `new`.
+    /// it in [`crate::verifier_node::VerifierNode::verify_status_list`] can be
+    /// reached at all. Test-only and crate-visible: the fields are private, and
+    /// the guard exists precisely for a construction path that does not go
+    /// through `new`.
     #[cfg(test)]
     pub(crate) fn new_unchecked(members: Vec<XmssPublicKey>, t: usize, genesis_slot: u32) -> Self {
         Committee {

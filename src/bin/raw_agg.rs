@@ -133,7 +133,7 @@ fn main() {
         // untrusted transport it is part of the cost an attacker can force.
         let t_verify = Instant::now();
         let ok = match StatusList::from_bytes(&wire) {
-            Ok(sl) => verifier.verify_quorum(&sl),
+            Ok(sl) => verifier.verify_status_list(&sl),
             Err(_) => false,
         };
         let verify_time = t_verify.elapsed();
@@ -186,7 +186,7 @@ fn main() {
     // A) a row nobody authorized, appended to a list carrying a real quorum.
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION"));
-    let tamper_rejected = !verifier.verify_quorum(
+    let tamper_rejected = !verifier.verify_status_list(
         &StatusList::new(
             Algorithms::WotsXmss,
             tampered,
@@ -200,7 +200,7 @@ fn main() {
     // B) the same quorum re-labelled with a later version, as a hostile peer would
     //    do to look freshest. The version is folded into the message AND fixes the
     //    slot, so both bindings break at once.
-    let relabel_rejected = !verifier.verify_quorum(
+    let relabel_rejected = !verifier.verify_status_list(
         &StatusList::new(
             Algorithms::WotsXmss,
             list.clone(),
@@ -213,7 +213,7 @@ fn main() {
 
     // C) below threshold: t - 1 signatures, every one of them valid.
     let short: Vec<(usize, XmssSignature)> = honest.iter().take(T - 1).cloned().collect();
-    let short_rejected = !verifier.verify_quorum(
+    let short_rejected = !verifier.verify_status_list(
         &StatusList::new(
             Algorithms::WotsXmss,
             list.clone(),
@@ -240,7 +240,7 @@ fn main() {
             .sign_at(&mut rng, &message, slot)
             .expect("signing failed"),
     );
-    let outsider_rejected = !verifier.verify_quorum(
+    let outsider_rejected = !verifier.verify_status_list(
         &StatusList::new(
             Algorithms::WotsXmss,
             list.clone(),

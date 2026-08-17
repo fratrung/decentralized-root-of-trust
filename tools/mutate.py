@@ -7,8 +7,8 @@ to break the check and see who complains. This repository has been caught twice
 by exactly that: `snark_verifier_node` had silently lost the slot check, and
 `padding_bits_past_the_committee_are_refused` turned out never to reach the check
 it was named after (it patched a byte in the middle of a signature, so the record
-failed to verify for the wrong reason, and `verify_quorum`'s padding check could
-be deleted with the whole suite still green).
+failed to verify for the wrong reason, and `verify_status_list`'s padding check
+could be deleted with the whole suite still green).
 
     tools/mutate.py                     # every mutant, against the whole suite
     tools/mutate.py list                # names and targets
@@ -63,7 +63,7 @@ if not sys.stdout.isatty():
 # reformats a check fails loudly here instead of producing a mutant that patches
 # nothing and "passes". Replacing with "" deletes the check outright.
 #
-# Keep this in step with what README/AGENT.md call load-bearing. A check worth
+# Keep this in step with what README/AGENTS.md call load-bearing. A check worth
 # documenting is a check worth a mutant.
 
 MUTANTS = {
@@ -89,7 +89,7 @@ MUTANTS = {
             return false;
         }""", "        if false { return false; }"),
 
-    # --- VerifierNode::verify_quorum: the raw path ------------------------
+    # --- VerifierNode::verify_status_list: the raw path -------------------
     "raw-t-zero": ("src/verifier_node.rs", """        if self.committee.threshold() == 0 {
             return false;
         }""", "        if false { return false; }"),
