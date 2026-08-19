@@ -20,8 +20,34 @@ use std::fmt;
 use backend::*;
 use lean_multisig::{SingleMessageAggregateSignature, XmssSignature};
 use sha3::{Digest, Sha3_256};
-use ssz::{Decode as _, Encode as _};
+use ssz::{BitList, Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
+
+/// Ceiling on committee size, and the only thing about `N` that is fixed at
+/// compile time. The actual committee size always comes from the anchor.
+///
+/// SSZ needs it because a `BitList` carries its maximum as a type-level integer.
+/// The cost is that a committee larger than this is unrepresentable, so the value
+/// is chosen deliberately rather than inherited: 2048 is what Ethereum allows per
+/// attestation committee, and it is two orders of magnitude above the `N = 200`
+/// this demo runs at.
+pub const MAX_COMMITTEE_SIZE: usize = 2048;
+type MaxCommittee = typenum::U2048;
+const _: () = assert!(MAX_COMMITTEE_SIZE == <MaxCommittee as typenum::Unsigned>::USIZE);
+
+/// The signer bitmap: one bit per committee member, LSB-first.
+///
+/// An SSZ `BitList` rather than a byte array, and that is a security property
+/// rather than a typing preference. A byte array fixes how many *bytes* there
+/// are, never how many *bits* mean something, so the bits above member `N - 1`
+/// are free: one signer set gets several encodings, and — worse — an index past
+/// the end of the committee becomes representable. A `BitList` appends a
+/// sentinel bit after the last real bit, so its length in bits is recovered
+/// exactly on decode, bits above it are rejected as excess, and trailing zero
+/// bytes are rejected too. What used to be two hand-written checks in
+/// [`crate::verifier_node::VerifierNode::verify_status_list`] is now one
+/// comparison against the anchor.
+type SignerBits = BitList<MaxCommittee>;
 
 #[derive(Clone, Copy)]
 pub enum Algorithms {
@@ -42,7 +68,7 @@ struct RawStatusListWire {
     alg: u8,
     status_list: Vec<[u8; 32]>,
     version: u32,
-    signers: Vec<u8>,
+    signers: SignerBits,
     signatures: Vec<XmssSignature>,
 }
 
@@ -257,13 +283,10 @@ pub struct StatusList {
     pub alg: Algorithms,
     status_list: Vec<[u8; 32]>,
     version: u32,
-    /// One bit per committee member, LSB-first within each byte: member `i` is
-    /// bit `i % 8` of byte `i / 8`. Its length is `ceil(N / 8)`, which only the
-    /// anchor knows — see
-    /// [`crate::verifier_node::VerifierNode::verify_status_list`], which also
-    /// rejects the padding bits past `N` being set, since two encodings of one
-    /// signer set would otherwise both be valid.
-    signers: Vec<u8>,
+    /// One bit per committee member. Its length is `N`, which only the anchor
+    /// knows — see [`crate::verifier_node::VerifierNode::verify_status_list`],
+    /// which compares the two.
+    signers: SignerBits,
     /// One signature per set bit, in ascending index order.
     signatures: Vec<XmssSignature>,
 }
@@ -297,9 +320,13 @@ impl StatusList {
             ));
         }
 
-        let mut signers = vec![0u8; n_members.div_ceil(8)];
+        let mut signers = SignerBits::with_capacity(n_members).map_err(|_| {
+            format!("committee of {n_members} exceeds the ceiling of {MAX_COMMITTEE_SIZE}")
+        })?;
         for (i, _) in &signatures {
-            signers[i / 8] |= 1 << (i % 8);
+            signers
+                .set(*i, true)
+                .expect("index bounded by n_members above");
         }
         Ok(StatusList {
             alg,
@@ -322,23 +349,26 @@ impl StatusList {
         self.status_list.clone()
     }
 
-    /// The raw signer bitmap. Interpreting it requires the anchor.
-    pub fn signers_bitmap(&self) -> &[u8] {
-        &self.signers
+    /// How many members the bitmap is sized for — the committee this record
+    /// claims to target. Meaningful only against an anchor, which is where it is
+    /// checked.
+    pub fn signer_slots(&self) -> usize {
+        self.signers.len()
     }
 
-    /// How many members signed. Cheap: one popcount per byte.
+    /// How many members signed.
     pub fn signer_count(&self) -> usize {
-        self.signers.iter().map(|b| b.count_ones() as usize).sum()
+        self.signers.num_set_bits()
     }
 
     /// The signing members' indices, ascending — the same order as
-    /// [`StatusList::signatures`], so the two zip.
+    /// [`StatusList::signatures`], so the two zip. Every index is `<
+    /// signer_slots()` by construction.
     pub fn signer_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.signers.iter().enumerate().flat_map(|(byte, bits)| {
-            let bits = *bits;
-            (0..8).filter_map(move |b| ((bits >> b) & 1 == 1).then_some(byte * 8 + b))
-        })
+        self.signers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, set)| set.then_some(i))
     }
 
     pub fn signatures(&self) -> &[XmssSignature] {
@@ -360,7 +390,8 @@ impl StatusList {
     /// Inverse of [`StatusList::to_bytes`].
     ///
     /// Decodes the SSZ schema and rejects a bitmap whose population does not
-    /// match the number of signatures. The signatures are decoded by leanVM's own
+    /// match the number of signatures — the one relation between two fields that
+    /// no schema can express. The signatures are decoded by leanVM's own
     /// SSZ implementation, which fixes their length at 1208 bytes and refuses a
     /// field element outside the modulus, so a non-canonical encoding cannot be
     /// smuggled inside an otherwise canonical container.
@@ -439,9 +470,9 @@ impl fmt::Display for StatusList {
         writeln!(f, "StatusList {{")?;
         write_common(f, &self.alg, self.version, &self.status_list)?;
         write!(f, "  signers    : {} of ", self.signer_count())?;
-        // The bitmap's width is the only hint the record carries about N, and it
-        // is a rounded-up one: a committee of 200 and one of 197 look identical.
-        writeln!(f, "<= {} members [", self.signers.len() * 8)?;
+        // Exact, not a hint: a BitList knows its own length in bits, so a
+        // committee of 200 and one of 197 are told apart here.
+        writeln!(f, "{} members [", self.signers.len())?;
         write!(f, "      ")?;
         for (n, i) in self.signer_indices().enumerate() {
             if n > 0 {

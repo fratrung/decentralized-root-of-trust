@@ -68,11 +68,10 @@ impl VerifierNode {
     /// itself all come from the anchor. The same bytes verify under one committee
     /// and not under another, so there is no anchor-free way to ask the question.
     ///
-    /// All six checks are load-bearing; dropping any one of them is exploitable.
+    /// All five checks are load-bearing; dropping any one of them is exploitable.
     pub fn verify_status_list(&self, status_list: &StatusList) -> bool {
         let members = self.committee.members();
         let n = members.len();
-        let bitmap = status_list.signers_bitmap();
 
         // 0) a degenerate anchor. `Committee::new` and `from_bytes` both reject
         //    `t = 0`, so this is unreachable through them — but this is the
@@ -84,20 +83,20 @@ impl VerifierNode {
             return false;
         }
 
-        // 1) the bitmap must be exactly as wide as the committee...
-        if bitmap.len() != n.div_ceil(8) {
-            return false;
-        }
-        // ...and every bit past member `n - 1` must be clear. Otherwise one signer
-        // set has several valid encodings: records that differ byte for byte while
-        // meaning the same thing, which defeats deduplication wherever they are
-        // content-addressed. Together these two checks also guarantee that every
-        // index `signer_indices` yields is `< n`, which is what makes indexing
-        // `members` below infallible.
-        if !n.is_multiple_of(8)
-            && let Some(last) = bitmap.last()
-            && (last >> (n % 8)) != 0
-        {
+        // 1) the bitmap must name exactly this committee. It is an SSZ `BitList`,
+        //    so its length is a count of *bits* recovered from the sentinel bit on
+        //    decode, not a byte width rounded up — a record built for a committee
+        //    of 197 does not pass here as one for 200.
+        //
+        //    This is also what makes indexing `members` below infallible: every
+        //    index `signer_indices` yields is `< signer_slots()`, and this line
+        //    ties that to `n`. It used to take two checks — a byte width and a
+        //    sweep for set padding bits — because a byte array leaves the bits
+        //    above member `n - 1` free, so one signer set had several encodings
+        //    and an index past the end of the committee was representable. A
+        //    `BitList` cannot express either, so the encoding enforces what the
+        //    second check used to.
+        if status_list.signer_slots() != n {
             return false;
         }
 
@@ -372,10 +371,6 @@ mod tests {
         u32::from_le_bytes(bytes[at..at + 4].try_into().expect("SSZ offset")) as usize
     }
 
-    fn write_offset(bytes: &mut [u8], at: usize, value: usize) {
-        bytes[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
-    }
-
     fn bitmap_byte(bytes: &[u8], expected: u8) -> usize {
         const SIGNERS_OFFSET: usize = 1 + 4 + 4;
         const SIGNATURES_OFFSET: usize = SIGNERS_OFFSET + 4;
@@ -422,137 +417,121 @@ mod tests {
         assert!(Committee::from_bytes(&encoded).is_err());
     }
 
-    /// The bitmap must be exactly `ceil(N / 8)` bytes. A *wider* one is the case
-    /// the padding check cannot catch: that check only inspects `bitmap.last()`,
-    /// so a second byte carrying only low bits reads as clean padding — `1 >> 5`
-    /// is `0` — while `signer_indices` happily yields index 8 for a committee of
-    /// five.
-    ///
-    /// As with the moved padding bit, the two checks together are what keep
-    /// `members[i]` in range, and the reachable outcome of dropping this one is a
-    /// panic rather than a false accept. The bit is placed on the *last* signer so
-    /// the genuine pairs ahead of it keep `.all()` going long enough to reach it.
+    /// The bitmap must name *this* committee, and since it is an SSZ `BitList`
+    /// its length is a number of bits rather than a byte width rounded up. A
+    /// record built for a committee of 8 therefore no longer passes as one built
+    /// for a committee of 5: under the old byte array both were one byte wide and
+    /// only a sweep for set padding bits could tell them apart.
     #[test]
-    fn a_bitmap_wider_than_the_committee_is_refused() {
+    fn a_record_built_for_another_committee_size_is_refused() {
         let (keys, node) = committee_in(15);
         let list = vec![hash_any(b"vc-1")];
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[1, 2, 3]);
-        let sl = record(list.clone(), 0, sigs);
-        assert!(node.verify_status_list(&sl), "the record starts out honest");
 
-        let mut bytes = sl.to_bytes();
-        let at = bitmap_byte(&bytes, 0b0000_1110);
-        // Widen `signers` from one byte to two: members 1 and 2 stay, member 3's
-        // bit moves into a second byte that the committee has no room for.
-        const SIGNATURES_OFFSET: usize = 1 + 4 + 4 + 4;
-        let signatures_at = read_offset(&bytes, SIGNATURES_OFFSET);
-        bytes[at] = 0b0000_0110;
-        bytes.insert(signatures_at, 0b0000_0001);
-        write_offset(&mut bytes, SIGNATURES_OFFSET, signatures_at + 1);
+        // Same signatures, same list, same version — only the committee size the
+        // record was sized for differs.
+        let honest = record(list.clone(), 0, sigs.clone());
+        assert!(node.verify_status_list(&honest));
+        assert_eq!(honest.signer_slots(), N);
 
-        let forged = StatusList::from_bytes(&bytes)
-            .expect("three bits against three signatures still decodes");
-        assert_eq!(forged.signers_bitmap().len(), 2, "wider than ceil(5 / 8)");
+        let mis_sized = StatusList::new(Algorithms::WotsXmss, list, 0, 8, sigs)
+            .expect("well-formed, just built for the wrong committee");
+        assert_eq!(mis_sized.signer_slots(), 8);
         assert_eq!(
-            forged.signer_indices().collect::<Vec<_>>(),
-            vec![1, 2, 8],
-            "index 8 is past member {}",
-            N - 1
+            mis_sized.signer_indices().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the signer set is the honest one; only the width differs"
         );
-        // The padding check alone would let this through, which is why the width
-        // check is not redundant with it.
-        assert_eq!(
-            forged.signers_bitmap().last().copied().unwrap() >> (N % 8),
-            0,
-            "the last byte looks like clean padding"
-        );
-
         assert!(
-            !node.verify_status_list(&forged),
-            "a bitmap wider than the committee must be refused"
+            !node.verify_status_list(&mis_sized),
+            "a bitmap sized for another committee must be refused"
         );
     }
 
-    /// Padding bits past member `N - 1` must be clear. Setting one *in addition*
-    /// to the honest bits is caught at the decoding boundary, because the bitmap's
-    /// population no longer matches the signature count.
+    /// A bit set in addition to the honest ones is caught at the decoding
+    /// boundary, because the bitmap then names more signers than there are
+    /// signatures. That relation is between two different fields, so no schema
+    /// can express it and the check stays hand-written.
     #[test]
-    fn an_extra_padding_bit_is_caught_at_the_decoding_boundary() {
+    fn an_extra_bit_is_caught_at_the_decoding_boundary() {
         let (keys, node) = committee_in(12);
         let list = vec![hash_any(b"vc-1")];
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[0, 1, 2]);
         let sl = record(list.clone(), 0, sigs);
         assert!(node.verify_status_list(&sl));
 
-        // Set a bit above member 4 directly in the encoding: `StatusList::new`
-        // would never produce it, so a forgery has to come off the wire.
+        // Members 0, 1, 2 are bits 0..2; bit 5 is the BitList sentinel that makes
+        // the length 5. Member 3 joins without a signature to go with it.
         let mut bytes = sl.to_bytes();
-        let at = bitmap_byte(&bytes, 0b0000_0111);
-        bytes[at] |= 0b1000_0000;
+        let at = bitmap_byte(&bytes, 0b0010_0111);
+        bytes[at] |= 1 << 3;
         assert!(
             StatusList::from_bytes(&bytes).is_err(),
             "4 bits against 3 signatures must not decode"
         );
     }
 
-    /// The padding case that actually reaches
-    /// [`VerifierNode::verify_status_list`], and the reason the check there is
-    /// not redundant with the decoder's.
+    /// The invariant that makes `members[i]` infallible, asserted exhaustively
+    /// rather than argued.
     ///
-    /// Adding a bit changes the population, so the decoder catches it. *Moving*
-    /// one does not: clear member 0's bit and set the padding bit 7, and the
-    /// record still carries three bits and three signatures. It decodes cleanly
-    /// and arrives at the quorum check naming member 7 of a committee of 5.
+    /// The predecessor of this test flipped one specific pair of bits, because
+    /// under a byte array a moved padding bit produced a record that decoded
+    /// cleanly and arrived at the quorum check naming member 7 of a committee of
+    /// 5 — a remote panic any peer could trigger with two bit flips and no key of
+    /// its own. A `BitList` cannot represent that: the highest set bit *is* the
+    /// length, so moving a bit upward moves the sentinel and changes the declared
+    /// length rather than smuggling an index past the end.
     ///
-    /// So the check is not only about canonicity. It is what makes `members[i]`
-    /// infallible: without it this record indexes past the end of the member list
-    /// and the verifier **panics** — a remote crash any peer can trigger with 25
-    /// bytes, on a record it never had to sign.
-    ///
-    /// The previous version of this test could not see that. It only ever set an
-    /// extra bit, so it always exited through the decoder and never reached the
-    /// quorum check with a padding bit at all — the whole check could be deleted
-    /// and the entire suite still passed.
-    ///
-    /// Reaching the panic takes one more step than it looks. The zip runs under
-    /// `.all()`, which short-circuits, so the out-of-range index is only touched
-    /// if every index *before* it verified. Moving the **last** signer's bit is
-    /// what does it: the earlier pairs are genuine and pass, and the iterator then
-    /// reaches `members[7]`. That is not a contrived input — a peer holding one
-    /// honestly published record can produce it by flipping two bits, with no key
-    /// and no signature of its own.
+    /// With `N = 5` the bitmap is a single byte, so the case worth pinning is not
+    /// one mutation but **all 256 of them**. Each must either fail to decode or
+    /// name only members the record declares room for, and only the honest byte
+    /// may verify.
     #[test]
-    fn a_moved_padding_bit_reaches_the_quorum_check_and_is_refused_there() {
+    fn no_bitmap_byte_can_name_a_member_the_committee_does_not_have() {
         let (keys, node) = committee_in(14);
         let list = vec![hash_any(b"vc-1")];
-        // Signers 1, 2, 3 — the *highest* one is the bit that will be moved, so
-        // the two genuine pairs ahead of it keep `.all()` going.
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[1, 2, 3]);
         let sl = record(list.clone(), 0, sigs);
         assert!(node.verify_status_list(&sl), "the record starts out honest");
 
-        let mut bytes = sl.to_bytes();
-        let at = bitmap_byte(&bytes, 0b0000_1110);
-        // 0b0000_1110 -> 0b1000_0110: member 3's bit moves to the padding bit 7.
-        // Still three bits against three signatures, so the decoder sees nothing
-        // wrong; the record now claims members 1, 2 and 7 of a committee of 5.
-        bytes[at] = 0b1000_0110;
+        let bytes = sl.to_bytes();
+        // Bits 1, 2, 3 are the signers; bit 5 is the sentinel carrying the length.
+        const HONEST: u8 = 0b0010_1110;
+        let at = bitmap_byte(&bytes, HONEST);
 
-        let forged = StatusList::from_bytes(&bytes)
-            .expect("the population still matches, so the decoder lets this through");
-        assert_eq!(forged.signer_count(), 3);
-        assert_eq!(forged.signatures().len(), 3);
-        assert_eq!(
-            forged.signer_indices().collect::<Vec<_>>(),
-            vec![1, 2, 7],
-            "index 7 is past member {} — this is the value that must never reach \
-             the anchor",
-            N - 1
-        );
+        let mut decoded = 0;
+        let mut accepted = 0;
+        for byte in 0..=u8::MAX {
+            let mut forged = bytes.clone();
+            forged[at] = byte;
 
+            let Ok(sl) = StatusList::from_bytes(&forged) else {
+                continue; // refusing to parse is a valid way to refuse
+            };
+            decoded += 1;
+
+            let slots = sl.signer_slots();
+            for i in sl.signer_indices() {
+                assert!(
+                    i < slots,
+                    "bitmap {byte:#010b}: index {i} is outside the {slots} declared"
+                );
+            }
+
+            if node.verify_status_list(&sl) {
+                accepted += 1;
+                assert_eq!(
+                    byte, HONEST,
+                    "bitmap {byte:#010b} verified, and it is not the honest one"
+                );
+            }
+        }
+
+        assert_eq!(accepted, 1, "exactly one bitmap may authorize this record");
         assert!(
-            !node.verify_status_list(&forged),
-            "a bitmap naming a member the committee does not have must be refused"
+            decoded > 1,
+            "only {decoded} of 256 bitmaps decoded, so the in-range assertion \
+             above was barely exercised"
         );
     }
 

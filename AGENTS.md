@@ -32,7 +32,7 @@ cargo run --release --bin verifier -- [dir]            # split: verify-only, exi
 cargo run --release --example footprint -- prover      # RAM of setup alone; also: verifier | none
 cargo test                                             # 48 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
-tools/mutate.py                                        # mutation testing: 25 checks, each must be caught by a test
+tools/mutate.py                                        # mutation testing: 24 checks, each must be caught by a test
 ```
 
 **Always `--release`** for anything touching the prover; it is unusable in a debug
@@ -87,6 +87,11 @@ Library:
   out-of-order and repeated-signer variants are unconstructible rather than
   defended against. `from_bytes` additionally rejects a bitmap whose population
   disagrees with the signature count.
+  The signer bitmap is an SSZ `BitList`, capped at `MAX_COMMITTEE_SIZE` (2048),
+  which is the only thing about `N` fixed at compile time — the real committee
+  size always comes from the anchor. Its length in bits rides in a sentinel bit,
+  so bits past member `N-1` cannot exist and an index outside the committee is
+  unrepresentable rather than checked for.
 - `src/committee.rs` — the anchor and **nothing else**: members, `t`,
   `genesis_slot`, the SSZ wire encoding, and `slot_for` (the **only** place the
   slot is derived). `from_bytes` re-checks `t ∈ 1..=N`, the one invariant a wire
@@ -101,7 +106,7 @@ Library:
 - `src/signer_node.rs` — one member: keypair + counter. `sign` for the local-slot
   path, `sign_at` for the derived-slot one.
 - `src/verifier_node.rs` — one relying party on the **raw** path: `verify` for a
-  single member signature, `verify_status_list` for the whole record (the six
+  single member signature, `verify_status_list` for the whole record (the five
   checks that decide whether an update is authorized). It is a method on the node
   and not a free function because every answer depends on the anchor it holds:
   the same bytes verify under one committee and not under another. Needs no
@@ -281,11 +286,13 @@ It also caps version inflation, since a slot-consistent forgery needs a key
 covering `genesis + version`.
 
 `VerifierNode::verify_status_list` is the same five checks for the raw form, with
-two differences worth knowing: membership is structural (an index *is* a member,
-so check 1 disappears), and the bitmap needs two extra well-formedness checks —
-exact width
-`ceil(N/8)`, and padding bits past member `N-1` clear, without which one signer
-set has several valid encodings.
+two differences worth knowing. Membership is structural — an index *is* a member,
+so check 1 disappears — and in its place the bitmap must name exactly this
+committee: `signer_slots() == N`. That is one check rather than the two it used
+to be, because the bitmap is an SSZ `BitList` whose length in bits is carried by a
+sentinel and recovered on decode. A byte array fixed only the byte count, leaving
+the bits above member `N-1` free, which took a second check to police and made an
+index past the end of the committee representable at all.
 
 When touching either function, every check must survive; dropping one is silently
 exploitable, and on the SNARK path the current artifacts would still pass for the

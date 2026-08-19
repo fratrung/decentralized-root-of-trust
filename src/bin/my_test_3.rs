@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 const GENESIS: u32 = 46;
 const KEY_SLOTS: u32 = 256;
 const N_MEMBERS: u32 = 70;
-const THRESHOLD: usize = 50;
+const THRESHOLD: usize = 35;
 /// Where each member's durable slot counter lives, one file per key.
 const STATE_DIR: &str = "signers";
 
@@ -118,14 +118,14 @@ fn main() {
     // threshold: the record still verifies without them.
     let mut signatures: Vec<(usize, XmssSignature)> = Vec::new();
     for (i, n) in signers.iter_mut().enumerate() {
-        if i >= committee.threshold() {
+        if signatures.len() >= committee.threshold() {
             break;
         }
-/* 
+ 
         if i % 2 != 1 {
             continue;
         }
-*/
+
         let signature = n
             .sign_at(&status_list_poseidon2_digest, slot)
             .unwrap_or_else(|e| panic!("signing failed: {e}"));

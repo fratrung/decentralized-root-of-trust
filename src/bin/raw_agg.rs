@@ -101,9 +101,11 @@ fn main() {
     let verifier = VerifierNode::new(committee.clone());
 
     println!("committee N={N_MEMBERS} t={T}; {N_UPDATES} updates rotating the signers");
+    // `N + 1` bits: the SSZ BitList appends a sentinel bit after the last member,
+    // which is what makes its length in bits recoverable on decode.
     println!(
         "aggregate = {T} raw XMSS signatures + a {}-byte signer bitmap (no proof)\n",
-        N_MEMBERS.div_ceil(8)
+        (N_MEMBERS + 1).div_ceil(8)
     );
 
     // ---- N_UPDATES updates. For each: t signers sign the (list, version) root,

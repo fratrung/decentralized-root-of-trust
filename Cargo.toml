@@ -24,6 +24,10 @@ sha3 = "0.10.8"
 # elements rejected on decode, so nothing here has to canonicalize them by hand.
 ssz = { package = "ethereum_ssz", version = "0.10.4" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10.1" }
+# Only to name the compile-time ceiling on the signer bitmap: SSZ BitList takes
+# its maximum as a type-level integer. Already in the tree via `ssz`, so this
+# adds no crate, only the ability to write the bound down.
+typenum = "1"
 
 # Not used by the library: the local scratch binaries (`src/bin/my_test*.rs`,
 # gitignored) build JCS-canonical JSON credentials with them.

@@ -828,6 +828,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha3 0.10.9",
+ "typenum",
 ]
 
 [[package]]

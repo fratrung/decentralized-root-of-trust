@@ -83,6 +83,28 @@ impl Committee {
         &self.members
     }
 
+    /// Where this key sits in the anchor, or `None` if it is not a member.
+    ///
+    /// The inverse of indexing [`Committee::members`], and it lives here rather
+    /// than being spelled out at each call site because a signer naming itself in
+    /// a published record must produce exactly the number the verifier will use
+    /// to look it up. Two independent `position(...)` expressions are two places
+    /// to drift, which is the same reason [`Committee::slot_for`] is the only
+    /// place `genesis + version` is computed.
+    ///
+    /// A signer calls it **once**, at startup, against the anchor it was given:
+    /// the index is a property of the anchor, not something assigned over the
+    /// network, so nobody has to be trusted to hand it out and a committee
+    /// rotation renumbers everyone by construction.
+    ///
+    /// It answers *where is this key*, not *is this key allowed*. A relying party
+    /// that used it to decide membership would be duplicating a check the
+    /// verification predicates already own — and on the raw path that check does
+    /// not exist at all, because an index **is** a member there.
+    pub fn index_of(&self, member: &XmssPublicKey) -> Option<usize> {
+        self.members.iter().position(|pk| pk == member)
+    }
+
     pub fn threshold(&self) -> usize {
         self.t
     }
@@ -283,6 +305,30 @@ mod tests {
                 "threshold {bad} outside 1..={N} must be refused"
             );
         }
+    }
+
+    /// Every member finds itself, and finds only itself. The round trip through
+    /// `members()` is what makes this an *inverse* rather than merely a lookup
+    /// that happens to agree today.
+    #[test]
+    fn every_member_finds_its_own_index_and_an_outsider_finds_none() {
+        let c = committee_in(6);
+
+        for i in 0..N {
+            let pk = xmss_key_gen_from_seed(seed(6, i as u8), u64::from(GENESIS), WINDOW)
+                .expect("keygen")
+                .0;
+            let found = c.index_of(&pk).expect("a member must find itself");
+            assert_eq!(found, i, "member {i} reported index {found}");
+            assert_eq!(&c.members()[found], &pk, "index_of is not the inverse of members()");
+        }
+
+        // Member 200: outside any committee this suite builds, so it cannot
+        // collide with a namespace no matter how many tests are added.
+        let outsider = xmss_key_gen_from_seed(seed(6, 200), u64::from(GENESIS), WINDOW)
+            .expect("keygen")
+            .0;
+        assert_eq!(c.index_of(&outsider), None);
     }
 
     #[test]

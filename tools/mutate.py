@@ -93,18 +93,14 @@ MUTANTS = {
     "raw-t-zero": ("src/verifier_node.rs", """        if self.committee.threshold() == 0 {
             return false;
         }""", "        if false { return false; }"),
-    "raw-bitmap-width": ("src/verifier_node.rs", """        if bitmap.len() != n.div_ceil(8) {
+    # Not merely canonicity: this is also what keeps `members[i]` in range, since
+    # every index the bitmap yields is below the length it declares. There used to
+    # be a second mutant here, "raw-padding-bits", deleting a sweep for set bits
+    # above member n - 1. An SSZ BitList carries its length in a sentinel bit, so
+    # those bits cannot exist and there is no longer a check to delete.
+    "raw-bitmap-width": ("src/verifier_node.rs", """        if status_list.signer_slots() != n {
             return false;
         }""", "        if false { return false; }"),
-    # Not merely canonicity: this is what keeps `members[i]` in range. Removing
-    # it turns a two-bit edit of a genuine record into a remote panic.
-    "raw-padding-bits": ("src/verifier_node.rs", """        if !n.is_multiple_of(8)
-            && let Some(last) = bitmap.last()
-            && (last >> (n % 8)) != 0
-        {
-            return false;
-        }
-""", ""),
     "raw-quorum": ("src/verifier_node.rs", """        if count < self.committee.threshold() || count != status_list.signatures().len() {
             return false;
         }""", "        if false { return false; }"),

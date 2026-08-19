@@ -186,7 +186,7 @@ before leanVM v0.9 are not compatible and must be regenerated.
 | | `StatusList` | `SnarkStatusList` |
 |---|---|---|
 | evidence | the `t` raw signatures + a signer bitmap | one aggregated SNARK proof |
-| naming the signers | `ceil(N/8)` = 25 B bitmap | public keys inside the aggregate |
+| naming the signers | 26 B bitmap (`N + 1` bits) | public keys inside the aggregate |
 | prover | none | 750 ms · 2.1 GB |
 | verifier setup | none | ~5 s · 651 MB resident |
 | verify | `t` × `xmss_verify`, linear in `t` | one check, flat in `t` |
@@ -207,9 +207,16 @@ the bitmap buys three things:
 - **No key material on the wire.** Membership stops being a check at all: an
   index *is* a member, so a non-member is unnameable rather than merely rejected.
 
-Two encodings of one signer set would still be possible if the bits past member
-`N-1` were free, so `VerifierNode::verify_status_list` requires them clear, and
-`from_bytes` rejects a bitmap whose population disagrees with the number of
+The bitmap is an SSZ `BitList`, not a byte array, and that is a security choice.
+A byte array pins down how many *bytes* there are but never how many *bits* mean
+something, so the bits above member `N-1` are free: one signer set gets several
+encodings, and an index past the end of the committee becomes representable — a
+verifier that indexed its member list with one would panic. A `BitList` appends a
+sentinel bit after the last real bit, so the length in bits is recovered exactly
+on decode, excess bits are rejected, and the whole class disappears. It costs one
+bit, and it turns two hand-written checks into a single comparison against the
+anchor. What no schema can express is a relation between two fields, so
+`from_bytes` still rejects a bitmap whose population disagrees with the number of
 signatures.
 
 What the bitmap does **not** hide is the participation pattern: anyone holding the
@@ -858,8 +865,8 @@ member's seat. The binary exits non-zero if any is accepted.
 
 `cargo test` adds the cases that are awkward to stage in a binary: a member
 supplying the whole quorum by itself, signatures re-attributed to other indices,
-padding bits set past member `N-1`, and the wire encoding being independent of the
-order the signers were collected in.
+every possible bitmap byte on a five-member committee, and the wire encoding
+being independent of the order the signers were collected in.
 
 Two of them are worth calling out because they guard things the binaries cannot
 reach:
@@ -895,9 +902,11 @@ ever started accepting one — which is the same drift that once removed the slo
 check from the verifier wrapper.
 
 Every check named in this section has a mutant in `tools/mutate.py`, which
-deletes one and reports which test complains. 25 of them. The last full sweep
-caught all 25; the patterns were updated for leanVM v0.9 and verified to still
-match their targets, but the sweep itself has not been re-run since. Its findings
-so far: three checks that no test reached at all (`verify_status_list`'s padding
-bits, the bitmap width, and `t == 0`), plus a padding test that had been locating
-the bitmap by searching a signature blob for a byte value.
+deletes one and reports which test complains. 24 of them — it was 25 until the
+signer bitmap became an SSZ `BitList` and one of the checks stopped being a check
+at all. The last full sweep caught every mutant; the patterns have been updated
+since and verified to still match their targets, but the sweep itself has not
+been re-run. Its findings so far: three checks that no test reached at all
+(`verify_status_list`'s padding bits, the bitmap width, and `t == 0`), plus a
+padding test that had been locating the bitmap by searching a signature blob for
+a byte value.
