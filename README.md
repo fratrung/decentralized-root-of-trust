@@ -82,19 +82,7 @@ are listed in [`AGENTS.md`](AGENTS.md) rather than left for the reader to discov
 
 ![The committee signs one status-list root at a slot derived from the anchor; the quorum is then published either as raw signatures with a signer bitmap, or as one aggregated SNARK proof. Both are checked against the same anchor.](docs/architecture.png)
 
-Editable source: [`docs/architecture.svg`](docs/architecture.svg). The README
-points at the PNG because SVG rendering in the GitHub mobile app is unreliable.
-
-### How to read the rest
-
-[Trust model](#trust-model) and [Signature scheme](#signature-scheme) state what
-is assumed and what is proved. [Two published forms](#two-published-forms),
-[Slot derivation](#slot-derivation) and
-[Versioning and freshness](#versioning-and-freshness) are the design core — the
-three places where a plausible-looking shortcut would break the scheme, and why.
-[Build & run](#build--run) and [Split deployment](#split-deployment) are
-operational. [Benchmark](#benchmark) is the measurement methodology and the
-numbers.
+Editable source: [`docs/architecture.svg`](docs/architecture.svg).
 
 ---
 
@@ -134,16 +122,28 @@ slots of its own choosing. See [Slot derivation](#slot-derivation).
 
 ## Signature scheme
 
-Signing uses **leanVM's own synchronized XMSS** (Poseidon2, `[F; 8]` messages,
-`LOG_LIFETIME = 32`) — the scheme leanVM can aggregate. It is a *stateful*
-signature: a given `(key, slot)` must sign **at most once**, so each update uses
-a new slot.
+Signing uses **leanVM's own synchronized XMSS** (Poseidon2, `LOG_LIFETIME = 32`)
+— the scheme leanVM can aggregate. Since leanVM v0.9 its public API takes a raw
+32-byte message and embeds it into the eight field elements the WOTS encoding
+consumes; this project hands it `status_list_message`, the canonical packing of
+the Poseidon2 root described under [Two published forms](#two-published-forms).
 
-> Note: the standalone `leanSig` XMSS (Poseidon1, `[u8; 32]`, `LOG_LIFETIME = 18`)
+It is a *stateful* signature: a given `(key, slot)` must sign **at most once**, so
+each update uses a new slot. v0.9 narrowed what that protects without removing
+the rule. Signing is now derandomized — the randomness is derived from
+`(secret seed, slot, attempt, hashed message)` — so re-signing the *same* message
+at the same slot returns a bit-identical signature and is harmless. Two
+**different** messages at one slot still expose enough of the WOTS hash chains to
+forge, and that is the case the durable slot counter exists for. It cannot tell
+the two apart without keeping a history of every message it has signed, which is
+exactly the state a counter exists to avoid.
+
+> Note: the standalone `leanSig` XMSS (Poseidon1, `LOG_LIFETIME = 18`)
 > is a **different, incompatible** parametrization and **cannot** be fed to
 > leanVM's aggregator. This project therefore signs with leanVM's XMSS only.
 
-A key is generated for a **window** `slot_start..=slot_end`, and the window is
+A key is generated for a **window** — an activation slot and a slot count, or
+`SLOT..=SLOT + KEY_SLOTS` as this project states it — and the window is
 baked into its identity: leaves outside it are pseudorandom fillers
 (`gen_random_node`) that feed the Merkle root, so regenerating the same seed with
 a wider window yields a *different* public key. A window cannot be extended — an
@@ -166,12 +166,22 @@ record one valid byte representation: malformed offsets, trailing bytes and
 alternative length encodings are rejected. This makes a content-addressed record
 stable — equal records have equal bytes and therefore the same object identifier.
 
-leanVM's XMSS signatures and aggregate proof retain leanVM's native postcard
-encoding inside SSZ byte fields. At the boundary they are decoded and re-encoded;
-the bytes must match exactly. Canonicality therefore includes the embedded
-cryptographic objects, not only the outer container. This is a wire-format
-commitment: artifacts created with the former postcard record format are not
-compatible and must be regenerated.
+The committee anchor is SSZ too, which matters because the freshness gate
+fingerprints it to identify its trust domain: a second byte-encoding of the same
+committee would read as a rotation and silently reset the anti-rollback mark.
+
+Since leanVM v0.9 the cryptographic objects *inside* those containers are SSZ as
+well. `XmssSignature` is a fixed 1208 bytes and `XmssPublicKey` a fixed 32, field
+elements written as canonical little-endian `u32` and refused on decode at or
+above the modulus. So canonicality is a property of the schema rather than
+something this project enforces by decoding and re-encoding, as it had to when
+those objects were opaque postcard blobs. The one exception is the aggregate
+proof, which cannot be a typed field — deserializing it needs the process-global
+aggregation bytecode — and is therefore still canonicalized by re-encoding and
+comparing.
+
+This is a wire-format commitment. Records, anchors, keys and proofs produced
+before leanVM v0.9 are not compatible and must be regenerated.
 
 | | `StatusList` | `SnarkStatusList` |
 |---|---|---|
@@ -180,7 +190,7 @@ compatible and must be regenerated.
 | prover | none | 750 ms · 2.1 GB |
 | verifier setup | none | ~5 s · 651 MB resident |
 | verify | `t` × `xmss_verify`, linear in `t` | one check, flat in `t` |
-| payload at `t=128` | ≈ 189 KB | ≈ 234 KB |
+| payload at `t=128` | ≈ 155 KB | ≈ 234 KB |
 | entry point | `VerifierNode::verify_status_list` | `PQSNARKVerifierModule::verify` |
 
 A signer is named by its **index into the committee's member list**. The anchor
@@ -379,7 +389,9 @@ src/
 tests/
   raw_path_round.rs     end-to-end: rotating quorums over durable counters, then the rollback refusal
   snark_path.rs         the five checks of PQSNARKVerifierModule::verify, each broken in isolation
+  snark_modules.rs      the two SNARK node types as the binaries use them (slot derived from the anchor)
   lock_two_processes.rs the cross-process slot lock, checked by re-executing the test binary
+  hostile_bytes.rs      the decoders against attacker-written bytes: no panic, no bomb, no forgery
 examples/
   footprint.rs          RAM cost of setup_prover vs setup_verifier
 docs/
@@ -396,13 +408,24 @@ uses none of them: everything it needs comes from the committee anchor it loads.
 
 The leanVM dependencies are **git-pinned** (no vendored clones):
 
-- `lean-multisig`, `backend` — from `leanEthereum/leanVM` at a fixed revision.
-  leanVM ships its own field/hash backend and **does not depend on Plonky3**, so
-  the whole tree resolves reproducibly.
+- `lean-multisig`, `backend` — from `leanEthereum/leanVM`, pinned to the **v0.9**
+  release by its commit `a5909d1` rather than by the tag name, since a tag can be
+  moved. leanVM ships its own field/hash backend and **does not depend on
+  Plonky3**, so the whole tree resolves reproducibly.
 - `ethereum_ssz` / `ethereum_ssz_derive` — SSZ encoding compatible with the
-  Ethereum consensus specification.
-- `rand`, `sha3`, `postcard`, `serde` — from crates.io. `postcard` is retained
-  only for leanVM-native cryptographic objects, not published record containers.
+  Ethereum consensus specification. leanVM v0.9 uses the same crate for its own
+  keys and signatures, which is what lets them appear as typed fields in the
+  schemas here instead of opaque byte-lists.
+- `rand`, `sha3` — from crates.io. `serde` and `postcard` are no longer direct
+  dependencies: every wire format in the library is SSZ, and the one leanVM-native
+  blob left is written through leanVM's own `to_bytes` / `from_bytes`.
+  (`serde_json` and `serde_jcs` remain in the manifest for the gitignored scratch
+  binaries under `src/bin/my_test*.rs`; nothing in the library uses them.)
+
+Upgrading leanVM across a breaking release invalidates persisted state as well as
+wire formats: v0.9 changed the XMSS leaf hash, so keys, signatures and proofs from
+v0.8 no longer verify. Delete `artifacts/` and any durable slot state before
+re-running — a counter is bound to a fingerprint of its key.
 
 `Cargo.lock` is committed. The direct leanVM revision alone does not lock its
 transitive tree; the lockfile is part of the reproducible build contract and
@@ -490,7 +513,9 @@ cargo run --release --bin prover && cargo run --release --bin verifier
 **Why bother:** a verify-only process calls `setup_verifier()` and nothing else.
 It skips the arena and the DFT twiddles, and — more importantly — it never runs
 `zk_alloc::enable_arena()`, which sets `M_TRIM_THRESHOLD = -1` so that a *prover*
-process never returns freed memory to the OS. The measured effect:
+process never returns freed memory to the OS. The measured effect on RSS
+(*resident set size* — the physical pages a process actually holds, and the
+quantity behind every memory row in this document):
 
 At the **small** committee (`N=10, t=7`), median of 30 runs:
 
@@ -528,7 +553,6 @@ different runs are not interchangeable — start from a clean directory.
 RUNS=30 WARMUP=3 ./benchmark.sh
 TARGETS="prover verifier" RUNS=50 ./benchmark.sh
 STRICT_ENV=1 PIN_CPUS=0-7 RUNS=30 ./benchmark.sh  # settings for numbers you publish
-INTERLEAVE=0 ./benchmark.sh                       # old block order, for back-comparison
 PROJECT_CM4=1 ./benchmark.sh                      # adds an explicitly-labelled ESTIMATE
 ```
 
@@ -540,7 +564,7 @@ writes to `bench-<timestamp>/`:
 | file | contents |
 |---|---|
 | `env.txt` | CPU, governor, turbo/SMT, THP, ASLR, toolchain, git commit, pinned leanVM rev, parameters — the reproducibility appendix |
-| `samples.csv` | tidy raw data, one row per individual update/verification |
+| `samples.csv` | tidy raw data, one row per individual update/verification, for `prover`, `verifier` and `raw_agg` (the `combined` demo reports per-run aggregates only) |
 | `runs.csv` | one row per process run |
 | `summary.csv` / `.txt` | aggregates: n, min, q1, median, q3, max, mean, sd, CV%, CI95 |
 
@@ -560,12 +584,30 @@ Design points that matter if you quote these numbers:
   (n = RUNS). Updates inside one process share allocator and cache state and are
   not independent; `samples.csv` keeps every raw observation if you prefer to
   report the pooled distribution.
-- Every target reports **both** of its phases: `work_*` is the primary one
-  (prove, or verify for the verify-only targets) and `work2_*` the secondary
-  (sign; verify for the combined process). `work_total_ms` is always the sum of
-  the *primary phase*, so it is comparable across targets — it is not the wall
-  clock of the update loop, which for `combined` also contains signing,
-  verification and printing.
+- Phases are recorded under **their own names** — `sign_*`, `prove_*`,
+  `verify_*` — and a target leaves blank the ones it does not run, so no column
+  ever holds two different quantities. Each `<phase>_total_ms` is the sum of that
+  phase alone, not the wall clock of the update loop, which for `combined` also
+  contains the other two phases and the printing.
+- **Fixed costs are three separate rows**, because they are three different
+  things: `setup` is the leanVM circuit (the SNARK path's *extra* cost — the raw
+  path has no setup row at all), `keygen` is the *N*-key generation that every
+  path pays, and `slot_state` is the *N* durable slot counters that only a real
+  signer pays. Reading one against another compares unlike costs and inverts the
+  answer.
+- **`sd` / `cv%` / `ci95` are between-run figures.** They say how reproducible
+  the sweep is, not how much one call varies — a single prove or sign varies far
+  more, and `samples.csv` is where to look for that. Do not quote
+  `median ± ci95` as the cost of one operation.
+- **A `/ update` row is a median and a `total / run` row is a sum**, so the two
+  do not satisfy `total = n × per-update` unless the phase is symmetric.
+  Verification is near-deterministic and does match; signing has stragglers
+  several times the median and its total sits visibly above `n × median`.
+- The `sign` rows of `raw_agg` and of `prover`/`combined` are **not
+  like-for-like**: `raw_agg` signs through `SignerNode`, so every signature is
+  preceded by a durable slot burn (write, `fsync`, rename, `fsync` dir), while
+  the SNARK binaries call `xmss_sign` directly and pay none of it. The gap is
+  disk, not cryptography.
 - **`n_items`** records how many updates or verifications each run actually
   measured. A run that measured zero would otherwise report `0.000 ms` medians,
   which is indistinguishable from a very fast result; the script aborts on a zero
@@ -592,6 +634,11 @@ aarch64/NEON path exists).
 Host **AMD Ryzen 7 4800H** (8c/16t), CPU governor `performance`, medians across
 n=30 runs.
 
+> **The timings below predate the leanVM v0.9 upgrade** and need `./benchmark.sh`
+> re-run on a quiesced host before they can be quoted again. Sizes are current:
+> they are deterministic, and the raw record shrank from ≈189 KB to ≈155 KB when
+> `XmssSignature` became a fixed 1208-byte SSZ object. The proof is unchanged.
+
 **Current defaults — `N=200, t=128`, 20 updates:**
 
 Each *update* is one publication of a new status-list version. Three distinct
@@ -610,7 +657,7 @@ never per signature:
 | sign / update (`t` sigs) | 917 ms | — | 917 ms | 950 ms |
 | **prove / update** | ~718 ms&nbsp;† | — | **718 ms** | — |
 | **verify / update** | — | **31.3 ms** | 31.3 ms | 54.3 ms |
-| bytes / update | 234 208 B | — | 233 846 B | 193 357 B |
+| bytes / update | 234 208 B | — | 233 846 B | 155 018 B |
 | resident after setup | 792 MB | **676 MB** | 755 MB | 3 MB |
 | peak RSS (VmHWM) | 2053 MB | **692 MB** | 2014 MB | **3 MB** |
 
@@ -619,33 +666,31 @@ SNARK aggregates genuine XMSS signatures, it does not replace them. So the
 marginal cost of proving is +76% on top of a production cost both schemes share
 (950 ms → ~1 670 ms), not "718 ms against zero".
 
-Committee keygen (200 keys × 65 slots) is a further ~3.65 s, paid once and
-outside every figure above. Raw XMSS needs **no setup at all** — it is pure
-Poseidon2, with no WHIR bytecode to materialise. That absence is itself a result.
+Committee keygen (200 keys × 65 slots) is a further ~3.65 s, paid once. It is
+**not** part of the `setup` row: `setup` is the leanVM circuit and nothing else,
+while keygen is paid by every path including the raw one, which is why
+`benchmark.sh` gives it a row of its own on every target. The raw path
+additionally pays a `slot state` row (~0.6 s): `N` durable `AtomicSlotCounter`s,
+one `fsync`'d file each.
 
-† The `prover` target's own reading was contaminated by external CPU contention:
-runs 1–6 sit at 1212–1275 ms, runs 8–30 at 690–776 ms. `setup_ms` stayed flat
-(CV 2.3%) across all 30, which is how you tell contention from a regression — the
-single-threaded setup is unaffected while the multi-threaded prove is not. The
-independent `combined` target reports 718.12 ms at CV 3.6%, agreeing with the
-clean prover window (median 719.1 ms) to 0.1%. Quote 718 ms.
+Raw XMSS needs **no circuit setup at all** — it is pure Poseidon2, with no WHIR
+bytecode to materialise. That absence is itself a result, and it shows up as an
+empty `setup` row.
+
+† The `prover` target's own reading was contaminated by external CPU contention
+in that sweep, so the figure comes from the independent `combined` target
+(718.12 ms, CV 3.6%), which agrees with the clean prover window to 0.1%. Flat
+`setup_ms` across a sweep with a moving prove time is how contention is told
+apart from a regression: the single-threaded setup is unaffected, the
+multi-threaded prove is not.
 
 prove/update is strongly governor-sensitive: on `schedutil` the same measurement
 inflates by ~60% because the CPU underclocks the sustained prover — always pin
 `performance` before quoting prove time. Memory does not depend on the governor.
 
-‡ **The raw column predates the bitmap record and needs a re-run.** `raw_agg` now
-goes through `SignerNode` / `VerifierNode` and the `StatusList` type, which moves
-two numbers in opposite directions (single-run figures, not n=30 medians):
-
-| | old `Vec<(pubkey, signature)>` | now `StatusList` |
-|---|---|---|
-| sign / update | 950 ms | **1140 ms** — every signature now burns its slot durably first (one `fsync` pair each), a cost `prover.rs` never pays |
-| bytes / update | 193 357 B | **188 731 B** — the `t` public keys are gone, replaced by a 25-byte bitmap |
-| verify / update | 54.3 ms | **52.5 ms** — including the wire decode |
-
-Compare *verify* and *size* across the two paths freely; compare *sign* knowing
-only one side pays for durability. Re-run `./benchmark.sh` for quotable medians.
+‡ `raw_agg` signs through `SignerNode`, so each signature is preceded by a
+durable slot burn that `prover.rs` never pays. Compare *verify* and *size* across
+the two paths freely; compare *sign* knowing only one side pays for durability.
 
 **Small committee — `N=10, t=7`:**
 
@@ -660,9 +705,10 @@ only one side pays for durability. Re-run `./benchmark.sh` for quotable medians.
 
 ### Where the SNARK starts paying off
 
-The `raw_agg` baseline costs **0.424 ms and 1 511 B per signature**, both strictly
-linear in `t`. The SNARK's verify cost and proof size grow roughly
-*logarithmically*, and its verifier memory does not grow at all. Measured across
+The `raw_agg` baseline costs **0.424 ms and exactly 1 208 B per signature**, both
+strictly linear in `t` — the byte figure is `SIGNATURE_SSZ_LEN`, a constant of the
+scheme rather than a measurement. The SNARK's verify cost and proof size grow
+roughly *logarithmically*, and its verifier memory does not grow at all. Across
 the two operating points:
 
 | | t=70 | t=128 | Δ for +83% signers |
@@ -671,7 +717,7 @@ the two operating points:
 | proof size | 222 238 B | 234 208 B | **+5.4%** |
 | peak RSS, verifier | 691.5 MB | 692.0 MB | **+0.07%** |
 | verify, raw | 28.31 ms | 54.29 ms | +92% |
-| aggregate size, raw | 105 750 B | 193 357 B | +83% |
+| aggregate size, raw | 84 954 B | 155 018 B | +83% |
 
 That +0.07% is the property the whole construction exists for: **verification cost
 is independent of committee size**, because the verifier touches only the anchor
@@ -679,9 +725,11 @@ root and never the members' public keys. The break-even points follow:
 
 - **Verify time: `t ≈ 74`** — crossed. At `t=128` the SNARK verifies **1.73×
   faster** than checking the signatures individually.
-- **Proof size: `t ≈ 158`** — not yet crossed. At `t=128` the proof is still
-  1.21× *larger* than the raw bundle. `t=256` is the first configuration that
-  wins on both axes (projected ~3.3× on verify, ~1.56× on size).
+- **Proof size: `t ≈ 207`** — not crossed, and it moved *up* with leanVM v0.9:
+  fixed-width SSZ signatures made the raw bundle 18% smaller, so the SNARK has
+  further to go. At `t=128` the proof is 1.51× *larger* than the raw bundle. Both
+  figures are projections off two operating points; the raw side of them is exact
+  arithmetic, the proof side is not.
 - **Verifier RAM: never.** 692 MB against 3 MB is a fixed floor the SNARK never
   recovers, at any `t`. Irrelevant on a server, disqualifying on a small board.
 
@@ -737,11 +785,16 @@ the circuit, grows linearly in `t`). Dropping to `t=4` cuts prove time by 31% bu
 peak RSS by only 9%, because the ~678 MB floor dominates.
 
 *At large `t`* the padding is no longer what dominates, and prove time becomes
-essentially **linear**: 406.5 ms at `t=70` against 718.1 ms at `t=128`, where a
-linear extrapolation from `t=70` predicts 743 ms — within 3.4%. Equivalently, a
-flat **~5.7 ms per aggregated signature** (5.81 at `t=70`, 5.61 at `t=128`). Peak
-RSS grows sub-linearly over the same interval (1451 → 2053 MB, +41% for +83% in
-`t`) because the ~678 MB bytecode floor does not move.
+essentially **linear**: 406.5 ms at `t=70` against 718.1 ms at `t=128`. Through
+those two points the marginal cost is **~5.4 ms per aggregated signature**
+((718.1 − 406.5) / 58) over a `t`-independent floor of ~31 ms. The ratios
+`prove/t` — 5.81 ms at `t=70`, 5.61 ms at `t=128` — are *averages*, not slopes:
+they still carry that floor, which is why they drift downward as `t` grows and
+why neither is the number to use when projecting a different `t`. Two points is
+also the minimum that makes a slope meaningful at all; a per-signature figure
+quoted from a single `t` is just that measurement divided by `t`. Peak RSS grows
+sub-linearly over the same interval (1451 → 2053 MB, +41% for +83% in `t`)
+because the ~678 MB bytecode floor does not move.
 
 **Do not extrapolate the step behaviour past a few dozen signers** — it is an
 artifact of a small trace, not a property of the scheme. Setup cost,
@@ -841,9 +894,10 @@ the call hands `PQSNARKProverModule` a slot, and this is what would notice if it
 ever started accepting one — which is the same drift that once removed the slot
 check from the verifier wrapper.
 
-Every check named in this section is verified to be load-bearing by
-`tools/mutate.py`, which deletes one and reports which test complains. 25 mutants,
-all caught. Its findings so far: three checks that no test reached at all
-(`verify_status_list`'s padding bits, the bitmap width, and `t == 0`), plus a
-padding test that had been locating the bitmap by searching a signature blob for
-a byte value.
+Every check named in this section has a mutant in `tools/mutate.py`, which
+deletes one and reports which test complains. 25 of them. The last full sweep
+caught all 25; the patterns were updated for leanVM v0.9 and verified to still
+match their targets, but the sweep itself has not been re-run since. Its findings
+so far: three checks that no test reached at all (`verify_status_list`'s padding
+bits, the bitmap width, and `t == 0`), plus a padding test that had been locating
+the bitmap by searching a signature blob for a byte value.

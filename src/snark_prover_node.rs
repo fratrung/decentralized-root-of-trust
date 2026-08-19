@@ -16,14 +16,13 @@
 //! takes an explicit slot because the *negative* tests need to build records the
 //! honest path structurally cannot express.
 
-use backend::KoalaBear;
 use lean_multisig::{
-    XmssPublicKey, XmssSecretKey, XmssSignature, aggregate_single_message_signatures, setup_prover,
-    xmss_sign,
+    MESSAGE_LEN_BYTES, XmssPublicKey, XmssSecretKey, XmssSignature,
+    aggregate_single_message_signatures, setup_prover, xmss_sign,
 };
 
 use crate::committee::Committee;
-use crate::status_list::status_list_root_fe;
+use crate::status_list::status_list_message;
 
 pub struct PQSNARKProverModule {}
 
@@ -54,12 +53,12 @@ impl PQSNARKProverModule {
         let slot = committee
             .slot_for(version)
             .expect("version has no slot under this anchor");
-        let message = status_list_root_fe(status_list_elem, version);
+        let message = status_list_message(status_list_elem, version);
         self.aggregate(raws, message, slot, log_inv_rate)
     }
 
     /// Aggregates already-produced signatures at an **explicit** slot, returning
-    /// the postcard bytes to store in `SnarkStatusList.zk_proof`. `message` is the
+    /// the bytes to store in `SnarkStatusList.zk_proof`. `message` is the packed
     /// Poseidon2 root of the status list — what the issuers actually signed.
     ///
     /// Prefer [`PQSNARKProverModule::make_proof`], which derives both from the
@@ -68,13 +67,13 @@ impl PQSNARKProverModule {
     pub fn aggregate(
         &self,
         raws: Vec<(XmssPublicKey, XmssSignature)>,
-        message: [KoalaBear; 8],
+        message: [u8; MESSAGE_LEN_BYTES],
         slot: u32,
         log_inv_rate: usize,
     ) -> Vec<u8> {
-        let aggregate = aggregate_single_message_signatures(&[], raws, message, slot, log_inv_rate)
-            .expect("aggregation failed");
-        postcard::to_allocvec(&aggregate).expect("proof serialization failed")
+        aggregate_single_message_signatures(&[], raws, message, slot, log_inv_rate)
+            .expect("aggregation failed")
+            .to_bytes()
     }
 
     /// Has the `signers` (indices into `keypairs`) sign `message` at `slot`, then
@@ -83,14 +82,13 @@ impl PQSNARKProverModule {
     /// # Panics
     ///
     /// If `signers` contains a repeated index — see [`reject_repeated_signers`].
-    pub fn sign_and_prove<R: rand::CryptoRng>(
+    pub fn sign_and_prove(
         &self,
         keypairs: &[(XmssSecretKey, XmssPublicKey)],
         signers: &[usize],
-        message: [KoalaBear; 8],
+        message: [u8; MESSAGE_LEN_BYTES],
         slot: u32,
         log_inv_rate: usize,
-        rng: &mut R,
     ) -> Vec<u8> {
         reject_repeated_signers(signers, slot);
 
@@ -100,7 +98,7 @@ impl PQSNARKProverModule {
                 let (sk, pk) = &keypairs[i];
                 (
                     pk.clone(),
-                    xmss_sign(rng, sk, &message, slot).expect("signing failed"),
+                    xmss_sign(sk, slot, &message).expect("signing failed"),
                 )
             })
             .collect();
@@ -110,18 +108,26 @@ impl PQSNARKProverModule {
 
 /// Panics if one member appears twice in the quorum.
 ///
-/// XMSS is stateful and one member appearing twice means one secret key signs at
-/// one slot twice — and that is not the harmless case it looks like, even though
-/// both signatures cover the *same* message: `xmss_sign` draws fresh randomness
-/// per call (leanVM's `find_randomness_for_wots_encoding` rejection-samples until
-/// the WOTS encoding is valid), so the two signatures reveal *different* hash-chain
-/// positions. That is exactly the disclosure a stateful scheme exists to prevent.
+/// **What this guards changed in leanVM v0.9, and the guard survived the change.**
+/// It used to be about key material: `xmss_sign` drew fresh randomness per call,
+/// so one key signing one slot twice — even over the *same* message — published
+/// two different WOTS chain positions, which is precisely the disclosure a
+/// stateful scheme exists to prevent. v0.9 derives the randomness from
+/// `(secret seed, slot, attempt, hashed message)`, so those two calls now return
+/// the identical signature and nothing leaks.
 ///
-/// It has to be checked *before* signing, because nothing downstream can: leanVM's
-/// `aggregate_single_message_signatures` sorts and dedups its input, so the
-/// finished aggregate looks perfectly ordinary and verifies. The key is already
-/// damaged by then — the second signature was produced before the aggregator ever
-/// saw it.
+/// What is left is a quorum bug, and a silent one.
+/// `aggregate_single_message_signatures` sorts and *dedups* its input, so a
+/// quorum of `t` indices containing a repeat aggregates `t - 1` distinct keys.
+/// The finished proof is perfectly valid and says so — but it says `t - 1`, which
+/// the verifier's check 4 then refuses, after the prover has spent seconds and
+/// gigabytes on it. Catching it here turns a wasted proof into a loud caller bug.
+///
+/// Note what this does **not** cover, and cannot: one key signing *two different
+/// messages* at one slot is still fatal in v0.9, and it is unreachable from here
+/// because every signer in one call signs one message. That case belongs to
+/// [`crate::atomic_slot_counter`], which is why it is a durable counter and not a
+/// check.
 ///
 /// A panic rather than a `Result` because no legitimate caller can hit it: the
 /// quorum is chosen by the protocol, and a repeated index is a bug in that choice,
@@ -147,10 +153,11 @@ mod tests {
     use super::*;
 
     /// leanVM sorts and dedups the aggregate's input, so a repeated signer is
-    /// invisible in the finished proof — but both signatures were already
-    /// produced, and `xmss_sign` randomises each one, so they reveal different
-    /// WOTS chain positions. The guard has to fire before any signing happens,
-    /// which is also why this test needs neither keys nor a prover.
+    /// invisible in the finished proof: it silently aggregates one key fewer than
+    /// the caller asked for, and the shortfall only surfaces at the verifier's
+    /// quorum check, after the proof has been paid for. The guard fires before
+    /// any signing happens, which is also why this test needs neither keys nor a
+    /// prover.
     #[test]
     #[should_panic(expected = "appears twice in the quorum")]
     fn a_repeated_signer_is_refused_before_signing() {

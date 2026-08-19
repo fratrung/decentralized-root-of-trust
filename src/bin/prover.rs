@@ -17,11 +17,13 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
-use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
+use decentralized_root_of_trust::params::{
+    KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
+};
 use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
 use decentralized_root_of_trust::stats::Series;
 use decentralized_root_of_trust::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
+    Algorithms, SnarkStatusList, hash_any, status_list_message,
 };
 use lean_multisig::{XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign};
 use rand::RngExt;
@@ -75,11 +77,26 @@ fn main() {
     let mut rng = rand::rng();
 
     // The committee: N_MEMBERS XMSS keys, each valid over a KEY_SLOTS-wide window.
+    //
+    // Timed, and reported separately from `setup_ms`, because the two fixed costs
+    // are not the same cost. `setup_ms` is the leanVM circuit and is what the SNARK
+    // path pays *extra*; keygen is paid by every path, `raw_agg` included. Leaving
+    // it unmeasured made the summary table read as "SNARK setup 5.0 s vs raw 4.3 s",
+    // i.e. as if the SNARK were the cheaper of the two — the comparison inverted,
+    // because the raw column was keygen and the SNARK column was not.
+    //
+    // `xmss_key_gen` samples the seed from the RNG itself since leanVM v0.9 and
+    // returns `(public, secret)`; this crate carries `(secret, public)`, so the
+    // pair is swapped here, at the boundary. The types are distinct, so the swap
+    // is compile-checked rather than a convention to remember.
+    let t_keygen = Instant::now();
     let mut keypairs: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..N_MEMBERS {
-        let seed: [u8; 32] = rng.random();
-        keypairs.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("keygen failed"));
+        let (pk, sk) =
+            xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("keygen failed");
+        keypairs.push((sk, pk));
     }
+    let keygen_time = t_keygen.elapsed();
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
     // Kept rather than built inline and dropped: every slot below is derived
     // through `slot_for`, so the anchor stays the only place `genesis + version`
@@ -108,7 +125,7 @@ fn main() {
         // through the anchor rather than spelled out a second time.
         let version = i as u32;
         let slot = committee.slot_for(version).expect("slot overflow");
-        let message = status_list_root_fe(&list, version);
+        let message = status_list_message(&list, version);
 
         // Signing and proving are timed apart: signing is `t` plain XMSS
         // signatures outside the circuit and scales linearly in `t`, proving is
@@ -120,7 +137,7 @@ fn main() {
             let (sk, pk) = &keypairs[k];
             raws.push((
                 pk.clone(),
-                xmss_sign(&mut rng, sk, &message, slot).expect("signing failed"),
+                xmss_sign(sk, slot, &message).expect("signing failed"),
             ));
         }
         let sign_time = t_sign.elapsed();
@@ -191,10 +208,9 @@ fn main() {
     let good_proof = prover.sign_and_prove(
         &keypairs,
         &quorum,
-        status_list_root_fe(&list, attack_version),
+        status_list_message(&list, attack_version),
         attack_slot,
         LOG_INV_RATE,
-        &mut rng,
     );
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION"));
@@ -209,17 +225,17 @@ fn main() {
     //    Defeated by check 1 (membership).
     let mut outsiders: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..T {
-        let seed: [u8; 32] = rng.random();
-        outsiders.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("outsider keygen"));
+        let (pk, sk) =
+            xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("outsider keygen");
+        outsiders.push((sk, pk));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
     let out_proof = prover.sign_and_prove(
         &outsiders,
         &quorum,
-        status_list_root_fe(&out_list, 0),
+        status_list_message(&out_list, 0),
         SLOT,
         LOG_INV_RATE,
-        &mut rng,
     );
     write(
         outdir,
@@ -246,10 +262,9 @@ fn main() {
     let versioned_proof = prover.sign_and_prove(
         &keypairs,
         &quorum,
-        status_list_root_fe(&list, signed_version),
+        status_list_message(&list, signed_version),
         spoof_slot,
         LOG_INV_RATE,
-        &mut rng,
     );
     write(
         outdir,
@@ -279,6 +294,7 @@ fn main() {
 
     println!("\n{N_UPDATES} updates + 3 forgeries written");
     println!("setup_prover           : {setup_time:.2?}");
+    println!("keygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
     println!("sign  min/med/max      : {sg_min:.1} / {sg_med:.1} / {sg_max:.1} ms");
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
     println!("proof size (median)    : {proof_med} bytes");
@@ -290,13 +306,19 @@ fn main() {
 
     // One-line machine-readable record, parsed by benchmark.sh.
     println!(
-        "\nPROVER setup_ms={:.3} n_updates={} sign_med_ms={sg_med:.3} sign_mean_ms={:.3} \
+        "\nPROVER setup_ms={:.3} keygen_ms={:.3} n_updates={} sign_med_ms={sg_med:.3} \
+         sign_mean_ms={:.3} sign_total_ms={:.3} \
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
          prove_max_ms={pv_max:.3} prove_total_ms={:.3} proof_med_bytes={proof_med} \
          rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={}",
         ms(setup_time),
+        ms(keygen_time),
         prove.len(),
         sign.mean(),
+        // Emitted so the harness can carry a sign *total* for this target too. It
+        // used to publish only a median, and 20 x median is not the sum when the
+        // phase is right-skewed — which signing is.
+        sign.sum(),
         prove.mean(),
         prove.stddev(),
         prove.sum(),

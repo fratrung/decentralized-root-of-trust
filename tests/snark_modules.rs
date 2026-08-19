@@ -43,13 +43,14 @@ use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
 use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
 use decentralized_root_of_trust::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
+    Algorithms, SnarkStatusList, hash_any, status_list_message,
 };
-use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen, xmss_sign};
+use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign};
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
+/// Last usable slot, inclusive; `WINDOW + 1` is the count leanVM v0.9 takes.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this is the deployed configuration.
 const LOG_INV_RATE: usize = 2;
@@ -70,23 +71,25 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     let prover = PQSNARKProverModule::init_prover();
 
     let keys: Vec<_> = (0..N)
-        .map(|i| xmss_key_gen(seed(i as u8), GENESIS, GENESIS + WINDOW, false).expect("keygen"))
+        .map(|i| {
+            xmss_key_gen_from_seed(seed(i as u8), u64::from(GENESIS), u64::from(WINDOW) + 1)
+                .expect("keygen")
+        })
         .collect();
-    let members: Vec<XmssPublicKey> = keys.iter().map(|(_, pk)| pk.clone()).collect();
+    let members: Vec<XmssPublicKey> = keys.iter().map(|(pk, _)| pk.clone()).collect();
     let committee = Committee::new(members, T, GENESIS);
 
     // Round 0. The signers sign the message the *verifier* will recompute, at the
     // slot the anchor assigns — the prover module is handed `version`, never a slot.
     let version = 0u32;
     let list = vec![hash_any(b"row-a"), hash_any(b"row-b")];
-    let message = status_list_root_fe(&list, version);
+    let message = status_list_message(&list, version);
     let slot = committee.slot_for(version).expect("slot in window");
-    let mut rng = rand::rng();
     let raws: Vec<(XmssPublicKey, XmssSignature)> = (0..T)
         .map(|i| {
             (
-                keys[i].1.clone(),
-                xmss_sign(&mut rng, &keys[i].0, &message, slot).expect("sign"),
+                keys[i].0.clone(),
+                xmss_sign(&keys[i].1, slot, &message).expect("sign"),
             )
         })
         .collect();
@@ -99,11 +102,11 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     // it ever started taking one from a caller instead, this is what would catch it.
     let inner = honest.proof().expect("the aggregate decodes");
     assert_eq!(
-        inner.info.slot,
+        inner.info.core.slot,
         committee.slot_for(version).expect("slot in window"),
         "the prover module did not sign at the slot the anchor assigns to this version"
     );
-    assert_eq!(inner.info.slot, slot);
+    assert_eq!(inner.info.core.slot, slot);
 
     // (2) The verifier module accepts it, and its anchor is the one it was given.
     let verifier = PQSNARKVerifierModule::new(committee.clone(), version);

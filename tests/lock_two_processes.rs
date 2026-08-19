@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use decentralized_root_of_trust::atomic_slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
-use lean_multisig::{XmssPublicKey, xmss_key_gen};
+use lean_multisig::{XmssPublicKey, xmss_key_gen_from_seed};
 
 const GENESIS: u32 = 100;
 const WINDOW: u32 = 16;
@@ -48,9 +48,11 @@ const DIRECT: &str = "PROBE=invoked-directly";
 fn key() -> XmssPublicKey {
     let mut seed = [0u8; 32];
     seed[0] = 4;
-    xmss_key_gen(seed, GENESIS, GENESIS + WINDOW, false)
+    // leanVM v0.9 takes an activation slot and a slot *count*, half-open, and
+    // returns `(public, secret)`.
+    xmss_key_gen_from_seed(seed, u64::from(GENESIS), u64::from(WINDOW) + 1)
         .expect("keygen")
-        .1
+        .0
 }
 
 /// Runs the probe in a fresh process and returns its marker line.

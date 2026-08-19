@@ -13,18 +13,19 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
-use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
+use decentralized_root_of_trust::params::{
+    KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
+};
 use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
 use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
 use decentralized_root_of_trust::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
+    Algorithms, SnarkStatusList, hash_any, status_list_message,
 };
 use lean_multisig::{
     XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover, setup_verifier, xmss_key_gen,
     xmss_sign,
 };
 use rand::RngExt;
-use rand::rngs::ThreadRng;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -74,18 +75,17 @@ fn run_flow(
     signers: &[usize],
     list: Vec<[u8; 32]>,
     version: u32,
-    rng: &mut ThreadRng,
 ) -> (SnarkStatusList, Duration, Duration, Duration) {
     let committee = verifier.committee_as_ref();
     // The signed message binds both the list and its version (Option B).
-    let message = status_list_root_fe(&list, version);
+    let message = status_list_message(&list, version);
     let slot = committee.slot_for(version).expect("slot overflow");
 
     let t_sign = Instant::now();
     let mut raws: Vec<(XmssPublicKey, XmssSignature)> = Vec::new();
     for &i in signers {
         let (sk, pk) = &keypairs[i];
-        let sig = xmss_sign(rng, sk, &message, slot).expect("signing failed");
+        let sig = xmss_sign(sk, slot, &message).expect("signing failed");
         raws.push((pk.clone(), sig));
     }
     let sign_time = t_sign.elapsed();
@@ -114,15 +114,13 @@ fn make_signed_proof(
     list: &[[u8; 32]],
     slot: u32,
     version: u32,
-    rng: &mut ThreadRng,
 ) -> Vec<u8> {
     prover.sign_and_prove(
         keypairs,
         signers,
-        status_list_root_fe(list, version),
+        status_list_message(list, version),
         slot,
         LOG_INV_RATE,
-        rng,
     )
 }
 
@@ -154,11 +152,25 @@ fn main() {
     let mut rng = rand::rng();
 
     // Committee: N_MEMBERS WOTS-XMSS keys.
+    //
+    // Timed apart from setup and reported as its own field: keygen is a fixed cost
+    // *every* path pays, where `setup_*` is the leanVM circuit that only the SNARK
+    // path pays. Folding them together — or, as before, measuring one and not the
+    // other — makes `raw_agg`'s keygen column look like the SNARK's setup column
+    // and inverts the comparison between the two.
+    //
+    // `xmss_key_gen` samples the seed from the RNG itself since v0.9 and returns
+    // `(public, secret)`; this crate carries `(secret, public)` throughout, so the
+    // pair is swapped here, at the boundary. The two types are distinct, so the
+    // swap is compile-checked rather than a convention to remember.
+    let t_keygen = Instant::now();
     let mut keypairs: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..N_MEMBERS {
-        let seed: [u8; 32] = rng.random();
-        keypairs.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("keygen failed"));
+        let (pk, sk) =
+            xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("keygen failed");
+        keypairs.push((sk, pk));
     }
+    let keygen_time = t_keygen.elapsed();
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
     // The fixed trust anchor, built once and shared by every verification below.
     let committee = Committee::new(members, T, SLOT);
@@ -203,7 +215,6 @@ fn main() {
             &signers,
             list.clone(),
             version,
-            &mut rng,
         );
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
@@ -244,7 +255,6 @@ fn main() {
         &list,
         honest_slot,
         honest_version,
-        &mut rng,
     );
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION")); // row not authorized by the committee
@@ -255,11 +265,12 @@ fn main() {
     // B) proof from signers OUTSIDE the committee (keys not in it).
     let mut outsiders: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..T {
-        let seed: [u8; 32] = rng.random();
-        outsiders.push(xmss_key_gen(seed, SLOT, SLOT + KEY_SLOTS, false).expect("outsider keygen"));
+        let (pk, sk) =
+            xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("outsider keygen");
+        outsiders.push((sk, pk));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
-    let out_proof = make_signed_proof(&prover, &outsiders, &quorum, &out_list, SLOT, 0, &mut rng);
+    let out_proof = make_signed_proof(&prover, &outsiders, &quorum, &out_list, SLOT, 0);
     let sl_outsider = SnarkStatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof);
     let outsider_rejected = !verifier.verify(&sl_outsider);
 
@@ -288,7 +299,6 @@ fn main() {
         &list,
         spoof_slot,
         signed_version,
-        &mut rng,
     );
     let sl_spoofed = SnarkStatusList::new(
         Algorithms::WotsXmss,
@@ -317,6 +327,7 @@ fn main() {
     println!("setup_verifier (bytecode)      : {setup_verifier_time:.2?}");
     println!("setup_prover extra (arena+FFT) : {setup_prover_extra:.2?}");
     println!("setup_prover total             : {setup_prover_total:.2?}");
+    println!("keygen ({N_MEMBERS} keys, all paths) : {keygen_time:.2?}");
 
     println!("--- {N_UPDATES} updates: min / median / max ---");
     println!("sign     : {sg_min:.1} / {sg_med:.1} / {sg_max:.1} ms");
@@ -344,6 +355,7 @@ fn main() {
         format!("setup_verifier_ms={:.3}", ms(setup_verifier_time)),
         format!("setup_prover_extra_ms={:.3}", ms(setup_prover_extra)),
         format!("setup_total_ms={:.3}", ms(setup_prover_total)),
+        format!("keygen_ms={:.3}", ms(keygen_time)),
         format!("n_updates={}", prove_ts.len()),
         format!("upd_sign_med_ms={sg_med:.3}"),
         format!("upd_sign_total_ms={:.3}", sum_ms(&sign_ts)),

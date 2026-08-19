@@ -5,8 +5,7 @@
 //! this module adds is the one place where a slot is actually spent, and the
 //! guarantee that it is spent *forward only*.
 
-use backend::KoalaBear;
-use lean_multisig::{XmssPublicKey, XmssSecretKey, XmssSignature, xmss_sign};
+use lean_multisig::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSecretKey, XmssSignature, xmss_sign};
 
 use crate::atomic_slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 
@@ -82,13 +81,19 @@ impl SignerNode {
     /// that slot is never handed out again. There is no rollback path, on purpose:
     /// every one of those situations costs one slot out of `2^32`, while retrying
     /// on the same slot costs the key.
-    pub fn sign<R: rand::CryptoRng>(
+    ///
+    /// leanVM v0.9 derandomized signing, so re-signing the *same* message at a
+    /// spent slot now returns the identical signature and is harmless. That does
+    /// not soften anything here: the counter exists for the case that is still
+    /// fatal — a *different* message at a slot already used — and it cannot tell
+    /// the two apart without keeping the message history the counter deliberately
+    /// does not keep.
+    pub fn sign(
         &mut self,
-        rng: &mut R,
-        message: &[KoalaBear; 8],
+        message: &[u8; MESSAGE_LEN_BYTES],
     ) -> Result<(u32, XmssSignature), SignerNodeError> {
         let slot = self.a_slot_counter.reserve()?;
-        let signature = xmss_sign(rng, &self.sk, message, slot)
+        let signature = xmss_sign(&self.sk, slot, message)
             .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))?;
         Ok((slot, signature))
     }
@@ -104,14 +109,13 @@ impl SignerNode {
     /// fault. It means this member is past that round, so it **abstains** rather
     /// than signing a second message under a spent slot. It catches up as soon as
     /// the published version passes its counter.
-    pub fn sign_at<R: rand::CryptoRng>(
+    pub fn sign_at(
         &mut self,
-        rng: &mut R,
-        message: &[KoalaBear; 8],
+        message: &[u8; MESSAGE_LEN_BYTES],
         slot: u32,
     ) -> Result<XmssSignature, SignerNodeError> {
         self.a_slot_counter.reserve_at(slot)?;
-        xmss_sign(rng, &self.sk, message, slot)
+        xmss_sign(&self.sk, slot, message)
             .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))
     }
 }
@@ -121,22 +125,25 @@ impl SignerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status_list::{hash_any, status_list_root_fe};
-    use lean_multisig::{xmss_key_gen, xmss_verify};
+    use crate::status_list::{hash_any, status_list_message};
+    use lean_multisig::{xmss_key_gen_from_seed, xmss_verify};
     use std::path::PathBuf;
 
     const START: u32 = 100;
     const END: u32 = 110;
+    /// `START..=END`, as the count leanVM v0.9 takes instead of an inclusive end.
+    const WINDOW: u64 = (END - START + 1) as u64;
 
     /// Same seed discipline as `verifier_node::tests`, where it is documented in
     /// full: `[FILE, namespace, member, 0…]`, one namespace per test.
     ///
     /// All three tests below used to share `[3u8; 32]`, so one key signed slot 100
-    /// in every one of them — three different messages under the same `(key, slot)`
-    /// pair, which is the exact XMSS failure this crate is built to prevent.
-    /// `xmss_sign` re-randomises each signature, so those three reveal different
-    /// WOTS chain positions. Nothing is at risk (the keys authorize nothing), but
-    /// the invariant should not be one the tests are the first to break.
+    /// in every one of them — three *different* messages under the same
+    /// `(key, slot)` pair, which is the exact XMSS failure this crate is built to
+    /// prevent, and which leanVM v0.9's derandomized signing does not fix: it
+    /// makes a repeated *message* harmless, nothing more. Nothing is at risk here
+    /// (the keys authorize nothing), but the invariant should not be one the tests
+    /// are the first to break.
     const FILE: u8 = 6;
 
     fn seed(ns: u8) -> [u8; 32] {
@@ -159,7 +166,7 @@ mod tests {
     }
 
     fn node(path: &PathBuf, counter_end: u32, ns: u8) -> SignerNode {
-        let (sk, pk) = xmss_key_gen(seed(ns), START, END, false).expect("keygen");
+        let (pk, sk) = xmss_key_gen_from_seed(seed(ns), u64::from(START), WINDOW).expect("keygen");
         let counter = AtomicSlotCounter::create(path, &pk, START, counter_end).expect("counter");
         SignerNode::new(pk, sk, counter)
     }
@@ -168,14 +175,13 @@ mod tests {
     fn signs_consecutive_slots_and_the_signatures_verify() {
         let path = scratch("ok");
         let mut signer = node(&path, END, 1);
-        let mut rng = rand::rng();
         let list = vec![hash_any(b"vc-1")];
 
         for expected in START..START + 3 {
-            let message = status_list_root_fe(&list, expected);
-            let (slot, sig) = signer.sign(&mut rng, &message).expect("sign");
+            let message = status_list_message(&list, expected);
+            let (slot, sig) = signer.sign(&message).expect("sign");
             assert_eq!(slot, expected);
-            assert!(xmss_verify(signer.public_key(), &message, &sig, slot).is_ok());
+            assert!(xmss_verify(signer.public_key(), slot, &message, &sig).is_ok());
         }
         assert_eq!(signer.next_slot(), START + 3);
     }
@@ -187,25 +193,25 @@ mod tests {
     fn a_failed_signature_still_consumes_its_slot() {
         let path = scratch("burn");
         let mut signer = node(&path, END + 5, 2); // counter outlives the key window
-        let mut rng = rand::rng();
-        let message = status_list_root_fe(&[hash_any(b"vc")], 0);
+        let message = status_list_message(&[hash_any(b"vc")], 0);
 
-        // Drain the slots the key can actually sign.
+        // Drain the slots the key can actually sign. One message over many slots
+        // is fine — it is one slot over many messages that destroys a key.
         for _ in START..=END {
-            signer.sign(&mut rng, &message).expect("in-window sign");
+            signer.sign(&message).expect("in-window sign");
         }
         assert_eq!(signer.next_slot(), END + 1);
 
         // Now leanVM refuses: the slot is outside the key's range.
         assert!(matches!(
-            signer.sign(&mut rng, &message),
+            signer.sign(&message),
             Err(SignerNodeError::Sign(_))
         ));
         // ...and the slot was spent anyway. This is the point.
         assert_eq!(signer.next_slot(), END + 2);
 
         // A second failure burns another one rather than retrying END + 1.
-        assert!(signer.sign(&mut rng, &message).is_err());
+        assert!(signer.sign(&message).is_err());
         assert_eq!(signer.next_slot(), END + 3);
     }
 
@@ -213,14 +219,13 @@ mod tests {
     fn exhaustion_is_reported_not_wrapped_around() {
         let path = scratch("exhaust");
         let mut signer = node(&path, START + 1, 3);
-        let mut rng = rand::rng();
-        let message = status_list_root_fe(&[hash_any(b"vc")], 0);
+        let message = status_list_message(&[hash_any(b"vc")], 0);
 
-        signer.sign(&mut rng, &message).expect("first");
-        signer.sign(&mut rng, &message).expect("second");
+        signer.sign(&message).expect("first");
+        signer.sign(&message).expect("second");
         assert_eq!(signer.remaining_slots(), 0);
         assert!(matches!(
-            signer.sign(&mut rng, &message),
+            signer.sign(&message),
             Err(SignerNodeError::Slot(
                 AtomicSlotCounterError::Exhausted { .. }
             ))

@@ -18,20 +18,24 @@
 use std::fmt;
 
 use backend::*;
-use lean_multisig::XmssSignature;
-use serde::{Deserialize, Serialize};
+use lean_multisig::{SingleMessageAggregateSignature, XmssSignature};
 use sha3::{Digest, Sha3_256};
 use ssz::{Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum Algorithms {
     WotsXmss,
 }
 
-/// SSZ wire schema for the raw form.  LeanVM's signature type is external to
-/// this crate, so its canonical postcard representation is carried as an opaque
-/// SSZ byte-list and checked while decoding.
+/// SSZ wire schema for the raw form.
+///
+/// `signatures` holds leanVM's own type directly: since v0.9 `XmssSignature`
+/// implements SSZ natively as a fixed 1208-byte object whose field elements are
+/// canonical little-endian `u32`s, rejected on decode when out of range. It used
+/// to be an opaque byte-list carrying a postcard blob that this module had to
+/// re-encode and byte-compare to prove canonical; the schema now says what the
+/// bytes are, and the decoder enforces it.
 #[derive(SszEncode, SszDecode)]
 #[ssz(struct_behaviour = "container")]
 struct RawStatusListWire {
@@ -39,13 +43,13 @@ struct RawStatusListWire {
     status_list: Vec<[u8; 32]>,
     version: u32,
     signers: Vec<u8>,
-    signatures: Vec<Vec<u8>>,
+    signatures: Vec<XmssSignature>,
 }
 
-/// SSZ wire schema for the SNARK form.  `zk_proof` remains an opaque byte-list
-/// here because leanVM requires verifier setup before its aggregate can be
-/// deserialized; [`SnarkStatusList::proof`] checks its inner encoding before
-/// verification.
+/// SSZ wire schema for the SNARK form.  `zk_proof` is an opaque byte-list here
+/// because leanVM requires verifier setup before its aggregate can be
+/// deserialized, so it cannot be a typed field; [`SnarkStatusList::proof`] checks
+/// its inner encoding before verification.
 #[derive(SszEncode, SszDecode)]
 #[ssz(struct_behaviour = "container")]
 struct SnarkStatusListWire {
@@ -66,22 +70,6 @@ fn algorithm_from_tag(tag: u8) -> Result<Algorithms, String> {
         0 => Ok(Algorithms::WotsXmss),
         _ => Err(format!("unknown status-list algorithm tag {tag}")),
     }
-}
-
-fn canonical_signature_bytes(signature: &XmssSignature) -> Vec<u8> {
-    postcard::to_allocvec(signature).expect("XMSS signature serialization failed")
-}
-
-fn decode_canonical_signature(bytes: &[u8]) -> Result<XmssSignature, String> {
-    let (signature, rest) = postcard::take_from_bytes::<XmssSignature>(bytes)
-        .map_err(|e| format!("signature not deserializable: {e}"))?;
-    if !rest.is_empty() {
-        return Err(format!("{} trailing byte(s) after signature", rest.len()));
-    }
-    if canonical_signature_bytes(&signature) != bytes {
-        return Err("signature is not canonically encoded".into());
-    }
-    Ok(signature)
 }
 
 /// SHA3-256 of arbitrary bytes, used to build status-list entries.
@@ -106,9 +94,11 @@ pub fn entry_to_field(entry: &[u8; 32]) -> [KoalaBear; 8] {
 }
 
 /// Poseidon2 "hash-tree root" of the status list *and its version*: a fold over
-/// the entries, closed by one more compression that mixes in the version. The
-/// output is already `[F; 8]`, i.e. the native message format of leanVM's XMSS.
-/// This is the message the committee signs and the proof is bound to.
+/// the entries, closed by one more compression that mixes in the version.
+///
+/// This is the digest the whole protocol is built on. What the committee actually
+/// signs is [`status_list_message`], its canonical 32-byte packing — leanVM's XMSS
+/// takes raw bytes since v0.9 and does the field embedding itself.
 ///
 /// Folding the version in (Option B) is what makes the cleartext `version` field
 /// trustworthy: a proof attests to `(list, version)` jointly, so the version
@@ -126,8 +116,31 @@ pub fn status_list_root_fe(list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
     poseidon16_compress_pair(&acc, &ver)
 }
 
+/// The 32-byte message the committee signs, and the one the proof is bound to.
+///
+/// leanVM's XMSS API takes a raw `[u8; 32]` and hashes it into the eight field
+/// elements the WOTS encoding consumes, so the Poseidon2 fold above is closed by
+/// a packing step instead of being handed to the signer as field elements. Each
+/// element goes out as its canonical `u32`, little-endian — exactly the encoding
+/// leanVM uses for its own SSZ objects.
+///
+/// The packing is injective, which is the only property the binding argument
+/// needs: a KoalaBear element has exactly one canonical representative below the
+/// modulus, so two distinct roots cannot pack to one message. Everything check 2
+/// of [`crate::snark_verifier_node::PQSNARKVerifierModule::verify`] claims about
+/// `(list, version)` therefore carries over unchanged from the fold.
+pub fn status_list_message(list: &[[u8; 32]], version: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (chunk, fe) in out
+        .chunks_exact_mut(4)
+        .zip(status_list_root_fe(list, version))
+    {
+        chunk.copy_from_slice(&fe.as_canonical_u32().to_le_bytes());
+    }
+    out
+}
+
 /// The SNARK-attested form: one succinct proof in place of the `t` signatures.
-#[derive(Serialize, Deserialize)]
 pub struct SnarkStatusList {
     pub alg: Algorithms,
     status_list: Vec<[u8; 32]>,
@@ -154,7 +167,7 @@ impl SnarkStatusList {
         self.version
     }
 
-    /// Raw bytes of the aggregated proof (postcard-encoded leanVM aggregate).
+    /// Raw bytes of the aggregated proof, in leanVM's own encoding.
     pub fn proof_bytes(&self) -> &[u8] {
         &self.zk_proof
     }
@@ -172,19 +185,16 @@ impl SnarkStatusList {
     /// Requires the aggregation bytecode to be initialized: `setup_prover()`
     /// or `setup_verifier()` MUST be called first.
     ///
-    /// The aggregate remains postcard-encoded because that is leanVM's native
-    /// representation. It is canonicalized here: after decoding, its unique
-    /// postcard encoding must byte-match the stored blob. This closes the only
-    /// non-SSZ field before the verifier trusts the record.
-    pub fn proof(&self) -> Result<lean_multisig::SingleMessageAggregateSignature, String> {
-        let (value, rest) = postcard::take_from_bytes::<
-            lean_multisig::SingleMessageAggregateSignature,
-        >(&self.zk_proof)
-        .map_err(|e| format!("proof not deserializable: {e}"))?;
-        if !rest.is_empty() {
-            return Err(format!("{} trailing byte(s) after proof", rest.len()));
-        }
-        if postcard::to_allocvec(&value).expect("proof serialization failed") != self.zk_proof {
+    /// The aggregate keeps leanVM's own encoding — it is the one object here that
+    /// cannot be an SSZ field, since decoding it needs the process-global bytecode.
+    /// It is canonicalized instead: `from_bytes` already refuses trailing bytes,
+    /// and re-encoding must reproduce the stored blob byte for byte, which is what
+    /// rules out the padded-varint spellings the format would otherwise admit. A
+    /// record therefore has exactly one wire form, proof included.
+    pub fn proof(&self) -> Result<SingleMessageAggregateSignature, String> {
+        let value = SingleMessageAggregateSignature::from_bytes(&self.zk_proof)
+            .ok_or("proof not deserializable")?;
+        if value.to_bytes() != self.zk_proof {
             return Err("proof is not canonically encoded".to_string());
         }
         Ok(value)
@@ -236,7 +246,13 @@ impl SnarkStatusList {
 /// It does not hide the participation pattern: anyone holding the anchor learns
 /// who signed. That is unavoidable — a verifier cannot check a signature without
 /// knowing whose key to check it against.
-#[derive(Serialize, Deserialize)]
+// Deliberately NOT `#[derive(Serialize, Deserialize)]`. The published encoding is
+// SSZ, via `to_bytes`/`from_bytes` and the `RawStatusListWire` schema. A derived
+// `Deserialize` is generated inside this module, so it builds the struct field by
+// field regardless of their privacy — a second construction path that skips both
+// `new` (sorting, duplicate and bound checks) and `from_bytes` (bitmap population
+// against signature count). That would make the guarantee `new` documents below
+// false for any caller who reached for serde instead.
 pub struct StatusList {
     pub alg: Algorithms,
     status_list: Vec<[u8; 32]>,
@@ -336,11 +352,7 @@ impl StatusList {
             status_list: self.status_list.clone(),
             version: self.version,
             signers: self.signers.clone(),
-            signatures: self
-                .signatures
-                .iter()
-                .map(canonical_signature_bytes)
-                .collect(),
+            signatures: self.signatures.clone(),
         }
         .as_ssz_bytes()
     }
@@ -348,23 +360,19 @@ impl StatusList {
     /// Inverse of [`StatusList::to_bytes`].
     ///
     /// Decodes the SSZ schema and rejects a bitmap whose population does not
-    /// match the number of signatures. Each embedded leanVM signature must also
-    /// be its unique postcard representation, so no non-canonical encoding is
-    /// smuggled inside an otherwise canonical SSZ container.
+    /// match the number of signatures. The signatures are decoded by leanVM's own
+    /// SSZ implementation, which fixes their length at 1208 bytes and refuses a
+    /// field element outside the modulus, so a non-canonical encoding cannot be
+    /// smuggled inside an otherwise canonical container.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let value = RawStatusListWire::from_ssz_bytes(bytes)
             .map_err(|e| format!("raw status list is not valid SSZ: {e:?}"))?;
-        let signatures: Vec<XmssSignature> = value
-            .signatures
-            .iter()
-            .map(|bytes| decode_canonical_signature(bytes))
-            .collect::<Result<_, _>>()?;
         let value = Self {
             alg: algorithm_from_tag(value.alg)?,
             status_list: value.status_list,
             version: value.version,
             signers: value.signers,
-            signatures,
+            signatures: value.signatures,
         };
         if value.signer_count() != value.signatures.len() {
             return Err(format!(
@@ -444,5 +452,88 @@ impl fmt::Display for StatusList {
         writeln!(f, "\n  ]")?;
         writeln!(f, "  signatures : {}", self.signatures.len())?;
         write!(f, "}}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries() -> Vec<[u8; 32]> {
+        vec![hash_any(b"vc-1"), hash_any(b"vc-2")]
+    }
+
+    /// The packing is the new seam between this crate's Poseidon2 fold and
+    /// leanVM's byte-oriented XMSS API, and every binding argument in the protocol
+    /// rests on it being injective. It cannot be tested exhaustively, so what is
+    /// pinned here is the property that makes it injective: each of the eight
+    /// 4-byte groups is a field element's *canonical* representative, and the map
+    /// from the eight elements to the 32 bytes is a bijection onto that set.
+    #[test]
+    fn the_message_is_the_canonical_packing_of_the_root() {
+        let list = entries();
+        let root = status_list_root_fe(&list, 3);
+        let message = status_list_message(&list, 3);
+
+        for (i, (chunk, fe)) in message.chunks_exact(4).zip(root).enumerate() {
+            let value = u32::from_le_bytes(chunk.try_into().expect("4 bytes"));
+            assert_eq!(value, fe.as_canonical_u32(), "limb {i} is not the element");
+            assert!(
+                value < KoalaBear::ORDER_U32,
+                "limb {i} is outside the field, so the packing is not canonical"
+            );
+        }
+        assert_eq!(
+            message,
+            status_list_message(&list, 3),
+            "the message must be a function of (list, version) alone"
+        );
+    }
+
+    /// Check 2 of both verification paths is "the proof is bound to THIS list and
+    /// THIS version". That is only worth anything if the message actually moves
+    /// when either does — the packing must not collapse the distinction the fold
+    /// makes.
+    #[test]
+    fn the_message_moves_with_both_the_list_and_the_version() {
+        let list = entries();
+        let base = status_list_message(&list, 0);
+
+        assert_ne!(base, status_list_message(&list, 1), "version not bound");
+        assert_ne!(
+            base,
+            status_list_message(&[list[0]], 0),
+            "a removed entry left the message unchanged"
+        );
+
+        let mut appended = list.clone();
+        appended.push(hash_any(b"FAKE-REVOCATION"));
+        assert_ne!(
+            base,
+            status_list_message(&appended, 0),
+            "an appended entry left the message unchanged"
+        );
+
+        // The version is folded in as 16-bit limbs, so the high half has to reach
+        // the message too: a `u32 & 0xFFFF` truncation would alias these two.
+        assert_ne!(
+            status_list_message(&list, 1),
+            status_list_message(&list, 1 + (1 << 16)),
+            "versions differing only above bit 16 must not alias"
+        );
+    }
+
+    /// A documented gap, pinned so it cannot change silently: the fold is
+    /// sequential, so one logical revocation set has `n!` distinct roots. Sorting
+    /// inside the fold would fix it and would break the wire format, which is why
+    /// it has not been done — see AGENTS.md, "Known gaps in the model".
+    #[test]
+    fn the_fold_is_order_sensitive() {
+        let list = entries();
+        let reversed = vec![list[1], list[0]];
+        assert_ne!(
+            status_list_message(&list, 0),
+            status_list_message(&reversed, 0)
+        );
     }
 }

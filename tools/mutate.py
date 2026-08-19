@@ -76,10 +76,10 @@ MUTANTS = {
         {
             return false;
         }""", "        if false { return false; }"),
-    "snark-2-message": ("src/snark_verifier_node.rs", """        if agg.info.message != status_list_root_fe(status_list.list(), status_list.version()) {
+    "snark-2-message": ("src/snark_verifier_node.rs", """        if agg.info.core.message != status_list_message(status_list.list(), status_list.version()) {
             return false;
         }""", "        if false { return false; }"),
-    "snark-3-slot": ("src/snark_verifier_node.rs", """        if self.committee.slot_for(status_list.version()) != Some(agg.info.slot) {
+    "snark-3-slot": ("src/snark_verifier_node.rs", """        if self.committee.slot_for(status_list.version()) != Some(agg.info.core.slot) {
             return false;
         }""", "        if false { return false; }"),
     "snark-4-quorum": ("src/snark_verifier_node.rs", """        if agg.info.pubkeys.len() < self.committee.threshold() {
@@ -110,7 +110,7 @@ MUTANTS = {
         }""", "        if false { return false; }"),
     "raw-signatures": (
         "src/verifier_node.rs",
-        "            .all(|(i, sig)| xmss_verify(&members[i], &message, sig, slot).is_ok())",
+        "            .all(|(i, sig)| xmss_verify(&members[i], slot, &message, sig).is_ok())",
         "            .all(|(i, sig)| { let _ = (i, sig); true })",
     ),
 
@@ -180,10 +180,13 @@ MUTANTS = {
     "dup-signer-guard": ("src/snark_prover_node.rs", "        duplicated.is_none(),", "        true,"),
 
     # --- wire format ------------------------------------------------------
-    "anchor-canonical": ("src/committee.rs", """        if value.to_bytes() != bytes {
-            return Err("anchor is not canonically encoded".to_string());
-        }
-""", ""),
+    # Was "anchor-canonical", deleting the re-encode-and-compare that ruled out
+    # postcard's padded varints. SSZ cannot express that ambiguity, so the check
+    # is gone and there is nothing to mutate. What remains in `from_bytes` is the
+    # invariant no wire format knows about: `t = 0` makes an unsigned record reach
+    # quorum, `t > N` is unsatisfiable, and deserialization bypasses `new`.
+    "anchor-threshold": ("src/committee.rs", """        if !(1..=value.members.len()).contains(&t) {""",
+                         "        if false {"),
     "bitmap-population": (
         "src/status_list.rs",
         "        if value.signer_count() != value.signatures.len() {",

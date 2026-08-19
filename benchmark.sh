@@ -6,8 +6,9 @@
 #   verifier  verifies a FIXED artifact corpus      (src/bin/verifier.rs)
 #   combined  the single-process demo, for contrast (src/main.rs)
 #   raw_agg   crude multisig baseline, NO SNARK      (src/bin/raw_agg.rs)
-#             t raw XMSS sign+verify per update; work = verify (scales with t),
-#             proof_size = the raw aggregate size (t signatures on the wire)
+#             t raw XMSS sign+verify per update; verify scales with t, unlike the
+#             constant-time SNARK verify, and proof_size is the raw aggregate
+#             size (t signatures on the wire) rather than a proof
 #
 # Produces, in $OUTDIR:
 #   env.txt      full environment capture (reproducibility appendix)
@@ -209,11 +210,32 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
 # that measured zero reports 0.000 ms medians, which is indistinguishable from a
 # very fast result — so it is recorded and checked rather than assumed.
 #
-# `work2_*` is the run's secondary phase (sign, where the target has one; verify
-# for the combined process). It used to be measured by the binaries and dropped
-# on the floor here, which is why the sign figures in the write-up could not be
-# reproduced from summary.csv.
-echo 'target,run,t_start,setup_ms,n_items,work_med_ms,work_mean_ms,work_sd_ms,work_min_ms,work_max_ms,work_total_ms,work2_med_ms,work2_total_ms,proof_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures' > "$RUNS_CSV"
+# Phases are carried under their OWN names — `sign_*`, `prove_*`, `verify_*` —
+# and a target simply leaves blank the ones it does not have. They used to share
+# two positional slots, `work_*` for the primary phase and `work2_*` for the
+# secondary one, which meant the same column held prove for one target and verify
+# for another, and sign (1220 ms) for one target and verify (32 ms) for the next.
+# summary.txt relabelled them per target, so it read correctly; summary.csv did
+# not, so anyone plotting a column got two different quantities on one axis.
+#
+# `setup_ms` is the leanVM circuit and ONLY that; `keygen_ms` is the N-key
+# generation every path pays, `raw_agg` included; `slot_state_ms` is the N durable
+# slot counters, which only a real signer pays. Keeping them apart is what makes
+# the fixed-cost columns comparable across targets: `raw_agg` leaves `setup_ms`
+# empty because it has no circuit, which is the result, rather than borrowing the
+# column for its keygen and making the SNARK look like the cheaper setup.
+echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,proof_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures' > "$RUNS_CSV"
+
+# Column indices into runs.csv, named once. Every awk gate and every summary row
+# below addresses columns through these, so inserting a column is one edit here
+# rather than a hunt through half a dozen hardcoded `$17`s — one of which is the
+# security gate, where a stale index fails open.
+C_SETUP=4;      C_KEYGEN=5;     C_SLOTSTATE=6;  C_ITEMS=7
+C_SIGN_MED=8;   C_SIGN_TOT=9
+C_PROVE_MED=10; C_PROVE_TOT=15
+C_VERIFY_MED=16; C_VERIFY_TOT=21
+C_PROOF=22;     C_RSS_SETUP=23; C_RSS_MAX=24
+C_PEAK=25;      C_KERNEL=26;    C_FAIL=27
 
 RUN_T_START=""
 
@@ -254,44 +276,60 @@ emit_run_row() { # $1 target  $2 run index
   [ -n "$line" ] || { echo "run $run ($target): record line missing" >&2; exit 1; }
   awk -v t="$target" -v r="$run" -v k="$kmax" -v ts="$RUN_T_START" '{
     for (i=2;i<=NF;i++){ split($i,kv,"="); v[kv[1]]=kv[2] }
-    # w2 is the secondary phase; empty where the target has only one.
-    w2=""; w2t=""
+    # Every phase field starts empty, and a target fills only the phases it ran.
+    # `col()` drops empty cells, so an absent phase yields no summary row at all —
+    # which is the honest answer, rather than a 0.000 ms that reads as "instant".
+    setup=""; keygen=""; slotstate=""
+    sg_med=""; sg_tot=""
+    pv_med=""; pv_mean=""; pv_sd=""; pv_lo=""; pv_hi=""; pv_tot=""
+    vf_med=""; vf_mean=""; vf_sd=""; vf_lo=""; vf_hi=""; vf_tot=""
     if (t=="prover") {
-      setup=v["setup_ms"]; n=v["n_updates"]
-      med=v["prove_med_ms"]; mean=v["prove_mean_ms"]; sd=v["prove_sd_ms"]
-      lo=v["prove_min_ms"]; hi=v["prove_max_ms"]; tot=v["prove_total_ms"]
-      w2=v["sign_med_ms"]
+      setup=v["setup_ms"]; keygen=v["keygen_ms"]; n=v["n_updates"]
+      sg_med=v["sign_med_ms"]; sg_tot=v["sign_total_ms"]
+      pv_med=v["prove_med_ms"]; pv_mean=v["prove_mean_ms"]; pv_sd=v["prove_sd_ms"]
+      pv_lo=v["prove_min_ms"]; pv_hi=v["prove_max_ms"]; pv_tot=v["prove_total_ms"]
       pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]; f=0
     } else if (t=="verifier") {
+      # No keygen and no signing: this process only ever holds public keys.
       setup=v["setup_ms"]; n=v["n_verified"]
-      med=v["verify_med_ms"]; mean=v["verify_mean_ms"]; sd=v["verify_sd_ms"]
-      lo=v["verify_min_ms"]; hi=v["verify_max_ms"]; tot=v["verify_total_ms"]
+      vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
+      vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
       # An absent `failures=` key yields "", which awk would later coerce to 0 —
       # a silent pass for the one target that reports real accept/reject verdicts.
       # Missing means "this run told us nothing", which is a failure, not a zero.
       pb=""; rs=v["rss_setup_mb"]; rm=v["rss_verify_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["failures"]=="")?1:v["failures"]
     } else if (t=="raw_agg") {
-      # Baseline: work = verify (scales with t); proof_size = raw aggregate bytes;
-      # setup = keygen; the tamper sanity check drives the failure gate.
-      setup=v["keygen_ms"]; n=v["n_updates"]
-      med=v["verify_med_ms"]; mean=v["verify_mean_ms"]; sd=v["verify_sd_ms"]
-      lo=v["verify_min_ms"]; hi=v["verify_max_ms"]; tot=v["verify_total_ms"]
-      w2=v["sign_med_ms"]; w2t=v["sign_total_ms"]
+      # Baseline. `setup` stays EMPTY on purpose: this path builds no circuit, and
+      # that absence is the headline result. It used to carry keygen instead, which
+      # put a cost both paths pay into the column that means "what the SNARK costs
+      # extra" — and made the SNARK setup look cheaper than a keygen it was not
+      # being compared against. proof_size = the raw aggregate; the tamper sanity
+      # check drives the failure gate.
+      keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_updates"]
+      sg_med=v["sign_med_ms"]; sg_tot=v["sign_total_ms"]
+      vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
+      vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
       pb=v["agg_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["tamper_rejected"]=="1")?0:1
     } else {
       # `updates_total_ms` is the whole loop (sign + prove + verify + printing);
-      # the phase total is what compares with the prover column.
-      setup=v["setup_total_ms"]; n=v["n_updates"]
-      med=v["upd_prove_med_ms"]; mean=""; sd=""
-      lo=v["upd_prove_min_ms"]; hi=v["upd_prove_max_ms"]; tot=v["upd_prove_total_ms"]
-      w2=v["upd_verify_med_ms"]; w2t=v["upd_verify_total_ms"]
+      # the phase totals are what compare with the prover column. All three phases
+      # live in one process here, and all three are now carried: the sign figures
+      # were emitted by the binary and dropped on the floor at this line.
+      setup=v["setup_total_ms"]; keygen=v["keygen_ms"]; n=v["n_updates"]
+      sg_med=v["upd_sign_med_ms"]; sg_tot=v["upd_sign_total_ms"]
+      pv_med=v["upd_prove_med_ms"]
+      pv_lo=v["upd_prove_min_ms"]; pv_hi=v["upd_prove_max_ms"]; pv_tot=v["upd_prove_total_ms"]
+      vf_med=v["upd_verify_med_ms"]; vf_tot=v["upd_verify_total_ms"]
       pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["sec_ok"]=="1")?0:1
     }
-    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-      t,r,ts,setup,n,med,mean,sd,lo,hi,tot,w2,w2t,pb,rs,rm,pk,k,f
+    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+      t,r,ts,setup,keygen,slotstate,n,sg_med,sg_tot,
+      pv_med,pv_mean,pv_sd,pv_lo,pv_hi,pv_tot,
+      vf_med,vf_mean,vf_sd,vf_lo,vf_hi,vf_tot,
+      pb,rs,rm,pk,k,f
   }' <<<"$line" >> "$RUNS_CSV"
 
   # Raw per-update samples.
@@ -319,7 +357,7 @@ emit_run_row() { # $1 target  $2 run index
 # what a renamed or missing key produces. Every branch of `emit_run_row` always
 # assigns `f`, so a blank failures column means the row itself is wrong.
 count_failed_runs() {
-  awk -F, 'NR>1 { if ($19 !~ /^[0-9]+$/ || $19+0>0) n++ } END{print n+0}' "$RUNS_CSV"
+  awk -F, -v c="$C_FAIL" 'NR>1 { if ($c !~ /^[0-9]+$/ || $c+0>0) n++ } END{print n+0}' "$RUNS_CSV"
 }
 
 # A run that measured nothing is not a fast run. `Series` returns 0.0 for an empty
@@ -330,10 +368,10 @@ count_failed_runs() {
 # shrinks halfway through a sweep would otherwise silently change what the
 # per-run medians are medians of.
 count_bad_item_counts() {
-  awk -F, 'NR>1 {
-    if ($5 !~ /^[0-9]+$/ || $5+0==0) { n++; next }
-    if (seen[$1] && count[$1] != $5) n++
-    seen[$1]=1; count[$1]=$5
+  awk -F, -v c="$C_ITEMS" 'NR>1 {
+    if ($c !~ /^[0-9]+$/ || $c+0==0) { n++; next }
+    if (seen[$1] && count[$1] != $c) n++
+    seen[$1]=1; count[$1]=$c
   } END{print n+0}' "$RUNS_CSV"
 }
 
@@ -446,42 +484,49 @@ emit() { # target metric unit column
   printf '%s,%s,%s,%s\n' "$1" "$2" "$3" "$(tr ' ' ',' <<<"$st")" >> "$SUMMARY_CSV"
 }
 
+# The metric id in summary.csv now names the phase, so the file is readable on its
+# own: `prove_per_item` and `verify_per_item` are different rows rather than the
+# same `work_per_item` meaning different things on different lines.
 for target in $TARGETS; do
-  emit "$target" setup            ms    4
-  emit "$target" work_per_item    ms    6
-  emit "$target" work_total       ms    11
-  emit "$target" work2_per_item   ms    12
-  emit "$target" work2_total      ms    13
-  emit "$target" proof_size       bytes 14
-  emit "$target" rss_after_setup  MB    15
-  emit "$target" rss_max          MB    16
-  emit "$target" peak_rss_vmhwm   MB    17
-  emit "$target" peak_rss_kernel  MB    18
+  emit "$target" setup            ms    "$C_SETUP"
+  emit "$target" keygen           ms    "$C_KEYGEN"
+  emit "$target" slot_state       ms    "$C_SLOTSTATE"
+  emit "$target" sign_per_item    ms    "$C_SIGN_MED"
+  emit "$target" sign_total       ms    "$C_SIGN_TOT"
+  emit "$target" prove_per_item   ms    "$C_PROVE_MED"
+  emit "$target" prove_total      ms    "$C_PROVE_TOT"
+  emit "$target" verify_per_item  ms    "$C_VERIFY_MED"
+  emit "$target" verify_total     ms    "$C_VERIFY_TOT"
+  emit "$target" proof_size       bytes "$C_PROOF"
+  emit "$target" rss_after_setup  MB    "$C_RSS_SETUP"
+  emit "$target" rss_max          MB    "$C_RSS_MAX"
+  emit "$target" peak_rss_vmhwm   MB    "$C_PEAK"
+  emit "$target" peak_rss_kernel  MB    "$C_KERNEL"
 done
 
+# Human labels. Only `raw_agg` needs its own cases now — everything else follows
+# from the metric name, which is the point of naming metrics after phases.
 label() {
   case "$1:$2" in
-    prover:work_per_item)   echo "prove / update" ;;
-    verifier:work_per_item) echo "verify / update" ;;
-    combined:work_per_item) echo "prove / update" ;;
-    raw_agg:work_per_item)  echo "verify / update (raw)" ;;
-    prover:work2_per_item)  echo "sign / update" ;;
-    combined:work2_per_item) echo "verify / update" ;;
-    raw_agg:work2_per_item) echo "sign / update (raw)" ;;
-    prover:work_total)      echo "prove total / run" ;;
-    combined:work_total)    echo "prove total / run" ;;
-    verifier:work_total)    echo "verify total / run" ;;
-    raw_agg:work_total)     echo "verify total / run" ;;
-    combined:work2_total)   echo "verify total / run" ;;
-    raw_agg:work2_total)    echo "sign total / run" ;;
-    raw_agg:setup)          echo "keygen (once/process)" ;;
-    raw_agg:proof_size)     echo "aggregate size (t sigs)" ;;
-    *:setup)                echo "setup (once/process)" ;;
-    *:proof_size)           echo "proof size" ;;
-    *:rss_after_setup)      echo "RSS after setup" ;;
-    *:rss_max)              echo "RSS max during work" ;;
-    *:peak_rss_vmhwm)       echo "peak RSS (VmHWM)" ;;
-    *:peak_rss_kernel)      echo "peak RSS (kernel)" ;;
+    raw_agg:sign_per_item)   echo "sign / update (raw)" ;;
+    raw_agg:verify_per_item) echo "verify / update (raw)" ;;
+    raw_agg:proof_size)      echo "aggregate size (t sigs)" ;;
+    *:setup)                 echo "setup (circuit, once)" ;;
+    *:keygen)                echo "keygen (N keys, once)" ;;
+    *:slot_state)            echo "slot state (counters)" ;;
+    *:sign_per_item)         echo "sign / update" ;;
+    *:sign_total)            echo "sign total / run" ;;
+    *:prove_per_item)        echo "prove / update" ;;
+    *:prove_total)           echo "prove total / run" ;;
+    *:verify_per_item)       echo "verify / update" ;;
+    *:verify_total)          echo "verify total / run" ;;
+    *:proof_size)            echo "proof size" ;;
+    # RSS is expanded once, in the header legend above; these four then use the
+    # acronym alone, which is what keeps the varying part of each label visible.
+    *:rss_after_setup)       echo "RSS after setup" ;;
+    *:rss_max)               echo "RSS max during work" ;;
+    *:peak_rss_vmhwm)        echo "peak RSS (VmHWM)" ;;
+    *:peak_rss_kernel)       echo "peak RSS (kernel)" ;;
     *) echo "$2" ;;
   esac
 }
@@ -501,19 +546,27 @@ label() {
   echo "            PRECISION interval for the mean of repeated runs on THIS host in"
   echo "            THIS session. It says nothing about other hardware, other"
   echo "            builds, or this machine on another day."
+  # The acronym is expanded here, once, and every memory row below is then free
+  # to say just "RSS" — spelling it out on each of four rows per target buries
+  # the one thing that actually differs between them (which peak, whose reading).
+  echo "memory    : the MB rows are RSS, resident set size — the physical pages"
+  echo "            the process holds. A 'peak' row is the high-water mark over"
+  echo "            the whole run, read two independent ways: VmHWM is the"
+  echo "            process's own /proc/self/status, kernel is ru_maxrss from"
+  echo "            /usr/bin/time -v."
   echo
-  printf '%-9s %-22s %-6s %3s %10s %10s %10s %10s %10s %8s %7s\n' \
+  printf '%-9s %-23s %-6s %3s %10s %10s %10s %10s %10s %8s %7s\n' \
     target metric unit n min median max mean sd 'cv%' 'ci95±'
   awk -F, 'NR>1' "$SUMMARY_CSV" | while IFS=, read -r t m u n mn q1 md q3 mx mean sd cv ci; do
     d=2; [ "$u" = bytes ] && d=0; [ "$u" = MB ] && d=1
-    printf '%-9s %-22s %-6s %3s %10.*f %10.*f %10.*f %10.*f %10.*f %7.1f%% %7.*f\n' \
+    printf '%-9s %-23s %-6s %3s %10.*f %10.*f %10.*f %10.*f %10.*f %7.1f%% %7.*f\n' \
       "$t" "$(label "$t" "$m")" "$u" "$n" $d "$mn" $d "$md" $d "$mx" $d "$mean" $d "$sd" "$cv" $d "$ci"
   done
 
   # Headline comparison: the reason the split exists. Guard on the RAW columns,
   # not on stats() output: stats() emits "0" for an empty column, so testing its
   # result would pass with c=0 and divide by zero when a run omits these targets.
-  vp_raw="$(col verifier 17)"; cp_raw="$(col combined 17)"
+  vp_raw="$(col verifier "$C_PEAK")"; cp_raw="$(col combined "$C_PEAK")"
   if [ -n "$vp_raw" ] && [ -n "$cp_raw" ]; then
     vp="$(printf '%s\n' "$vp_raw" | stats | awk '{print $4}')"
     cp="$(printf '%s\n' "$cp_raw" | stats | awk '{print $4}')"
@@ -532,7 +585,7 @@ label() {
   # kernel only refreshes mm->hiwater_rss at certain points. Printing both and
   # never comparing them is not a cross-check, so compare them here.
   for target in $TARGETS; do
-    self_raw="$(col "$target" 17)"; kern_raw="$(col "$target" 18)"
+    self_raw="$(col "$target" "$C_PEAK")"; kern_raw="$(col "$target" "$C_KERNEL")"
     [ -n "$self_raw" ] && [ -n "$kern_raw" ] || continue
     s="$(printf '%s\n' "$self_raw" | stats | awk '{print $4}')"
     k="$(printf '%s\n' "$kern_raw" | stats | awk '{print $4}')"
@@ -562,17 +615,51 @@ label() {
   echo "    M_TRIM_THRESHOLD=-1: its RSS never decreases, so 'peak' means"
   echo "    'high-water mark of a monotonic curve'. A verify-only process keeps"
   echo "    normal malloc behaviour and its RSS is flat in the number of verifications."
-  echo "  * Setup is paid once per process and is not persisted across restarts."
-  echo "    It dominates total time; never fold it into per-update figures."
+  echo "  * Setup is paid once per process and is not persisted across restarts:"
+  echo "    every run re-executes the binary, so each target above paid it on all"
+  echo "    $((RUNS + WARMUP)) of its executions. It dominates total time; never fold it into"
+  echo "    per-update figures."
+  echo "  * 'setup' is the leanVM circuit and nothing else. Keygen is a separate row"
+  echo "    because EVERY path pays it, raw_agg included — so the SNARK's extra fixed"
+  echo "    cost is the setup row alone, and raw_agg has no setup row at all. Reading"
+  echo "    raw_agg's keygen against the others' setup compares two different things"
+  echo "    and inverts the answer."
   echo "  * Per-update samples within a run are not independent (shared allocator"
   echo "    and cache state). The table's unit is the per-run median; samples.csv"
   echo "    holds every raw observation if you need the pooled distribution."
-  echo "  * Prove cost is driven by t, not by the number of updates. At small t the"
-  echo "    trace padding to a power of two makes it a step function (t=5..=8 all"
-  echo "    cost the same); from a few dozen signers upward the linear term"
-  echo "    dominates and prove time is ~linear in t (measured: 406 ms at t=70,"
-  echo "    718 ms at t=128 -- a flat ~5.7 ms per aggregated signature). Do not"
-  echo "    extrapolate the step behaviour past small t."
+  echo "  * sd / cv% / ci95 describe the spread BETWEEN runs, i.e. how reproducible"
+  echo "    the experiment is — not how much one operation varies. A single"
+  echo "    operation varies far more: see samples.csv, and the min/max columns of"
+  echo "    the *_total rows. Do not quote 'median ± ci95' as the cost of one call."
+  echo "  * '<phase> / update' is a median and '<phase> total / run' is a sum, so"
+  echo "    total != n x per-update whenever the phase is skewed. Signing is: it"
+  echo "    has stragglers several times the median, and its total runs visibly"
+  echo "    above n x median. Verification is near-deterministic and does match."
+  echo "  * raw_agg's sign includes a durable slot burn (write + fsync + rename +"
+  echo "    fsync dir) before EVERY signature, because it signs through SignerNode."
+  echo "    prover/combined call xmss_sign directly and pay none of it, so their"
+  echo "    sign rows are not a like-for-like comparison — the gap is disk, not"
+  echo "    cryptography, and a prover made stateful-safe would close it."
+
+  # Derived from THIS sweep, never remembered. This block used to print figures
+  # from an older run (406 ms at t=70, 718 ms at t=128) as if they were results,
+  # which then contradicted the table a few lines above it in the same file.
+  t_param="$(sed -n 's/^pub const T: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+  pv_raw="$(col prover "$C_PROVE_MED")"
+  [ -n "$pv_raw" ] || pv_raw="$(col combined "$C_PROVE_MED")"
+  if [ -n "$pv_raw" ] && [ -n "$t_param" ]; then
+    pv="$(printf '%s\n' "$pv_raw" | stats | awk '{print $4}')"
+    awk -v m="$pv" -v tt="$t_param" 'BEGIN{
+      printf "  * Prove cost is driven by t, not by the number of updates. At small t\n"
+      printf "    the trace pads to a power of two, so prove time is a step function\n"
+      printf "    (t=5..=8 all cost the same); from a few dozen signers upward the\n"
+      printf "    linear term dominates. This sweep measured ONE t: t=%d at %.1f ms,\n", tt, m
+      printf "    i.e. %.2f ms per aggregated signature -- a single point, not a\n", m/tt
+      printf "    slope, since it still carries the t-independent part of the proof.\n"
+      printf "    Re-run at a second t before quoting any per-signature figure, and\n"
+      printf "    do not extrapolate the step behaviour past small t.\n"
+    }'
+  fi
 
   if [ "$PROJECT_CM4" = 1 ]; then
     echo
@@ -580,8 +667,19 @@ label() {
     echo "  Naive linear scaling x${CM4_LOW}..x${CM4_HIGH} of host wall-clock. It ignores"
     echo "  microarchitecture, memory bandwidth and thermal behaviour. Do not"
     echo "  publish these as results; run benchmark.sh natively on the board."
+    # Column -> metric name, so the projected rows carry the same labels as the
+    # table above and a target silently skips the phases it never ran.
+    cm4_metric() {
+      case "$1" in
+        "$C_SETUP")      echo setup ;;
+        "$C_KEYGEN")     echo keygen ;;
+        "$C_SIGN_MED")   echo sign_per_item ;;
+        "$C_PROVE_MED")  echo prove_per_item ;;
+        "$C_VERIFY_MED") echo verify_per_item ;;
+      esac
+    }
     for target in $TARGETS; do
-      for c in 4 6; do
+      for c in "$C_SETUP" "$C_KEYGEN" "$C_SIGN_MED" "$C_PROVE_MED" "$C_VERIFY_MED"; do
         # Guard on the RAW column, not on stats() output: stats() prints
         # "0 0 0 ..." for an empty column, so `[ -n "$v" ]` never fires and a
         # target with no data prints a bogus "host 0.0 ms -> CM4 0.0 .. 0.0 ms"
@@ -589,9 +687,9 @@ label() {
         raw="$(col "$target" "$c")"
         [ -n "$raw" ] || continue
         v="$(printf '%s\n' "$raw" | stats | awk '{print $4}')"
-        awk -v t="$target" -v l="$(label "$target" "$([ "$c" = 4 ] && echo setup || echo work_per_item)")" \
+        awk -v t="$target" -v l="$(label "$target" "$(cm4_metric "$c")")" \
             -v m="$v" -v a="$CM4_LOW" -v b="$CM4_HIGH" 'BEGIN{
-          f="%s"; printf "  %-9s %-22s host %8.1f ms  ->  CM4 %8.1f .. %8.1f ms\n", t, l, m, m*a, m*b }'
+          printf "  %-9s %-23s host %8.1f ms  ->  CM4 %8.1f .. %8.1f ms\n", t, l, m, m*a, m*b }'
       done
     done
     echo "  RAM does not scale with CPU: the peak figures above carry over unchanged."

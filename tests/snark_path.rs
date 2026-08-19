@@ -46,16 +46,17 @@ use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
 use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
 use decentralized_root_of_trust::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_root_fe,
+    Algorithms, SnarkStatusList, hash_any, status_list_message,
 };
 use lean_multisig::{
-    SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen,
-    xmss_sign,
+    MESSAGE_LEN_BYTES, SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey, XmssSignature,
+    xmss_key_gen_from_seed, xmss_sign,
 };
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
+/// Last usable slot, inclusive; leanVM v0.9's keygen takes `WINDOW + 1` instead.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this exercises the deployed configuration.
 const LOG_INV_RATE: usize = 2;
@@ -87,10 +88,14 @@ fn seed(member: u8) -> [u8; 32] {
     s
 }
 
+fn keypair(member: u8) -> Keypair {
+    let (pk, sk) = xmss_key_gen_from_seed(seed(member), u64::from(GENESIS), u64::from(WINDOW) + 1)
+        .expect("keygen");
+    (sk, pk)
+}
+
 fn committee() -> (Vec<Keypair>, Committee) {
-    let keys: Vec<Keypair> = (0..N)
-        .map(|i| xmss_key_gen(seed(i as u8), GENESIS, GENESIS + WINDOW, false).expect("keygen"))
-        .collect();
+    let keys: Vec<Keypair> = (0..N).map(|i| keypair(i as u8)).collect();
     let members = keys.iter().map(|(_, pk)| pk.clone()).collect();
     (keys, Committee::new(members, T, GENESIS))
 }
@@ -99,18 +104,12 @@ fn committee() -> (Vec<Keypair>, Committee) {
 /// `aggregate_single_message_signatures` wants.
 fn sign_at(
     signers: &[&Keypair],
-    message: [backend::KoalaBear; 8],
+    message: [u8; MESSAGE_LEN_BYTES],
     slot: u32,
 ) -> Vec<(XmssPublicKey, XmssSignature)> {
-    let mut rng = rand::rng();
     signers
         .iter()
-        .map(|(sk, pk)| {
-            (
-                pk.clone(),
-                xmss_sign(&mut rng, sk, &message, slot).expect("sign"),
-            )
-        })
+        .map(|(sk, pk)| (pk.clone(), xmss_sign(sk, slot, &message).expect("sign")))
         .collect()
 }
 
@@ -135,7 +134,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // Three of five members, at the slot the anchor derives for this round.
     let slot = c.slot_for(ROUND).expect("slot");
     assert_eq!(slot, GENESIS + ROUND);
-    let message = status_list_root_fe(&list, ROUND);
+    let message = status_list_message(&list, ROUND);
     let proof = prover.aggregate(
         sign_at(&[&keys[0], &keys[1], &keys[2]], message, slot),
         message,
@@ -164,11 +163,11 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         // thing that has moved is the list the message is computed over.
         let agg = info_of(&tampered);
         assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(c.slot_for(ROUND), Some(agg.info.slot));
+        assert_eq!(c.slot_for(ROUND), Some(agg.info.core.slot));
         assert!(agg.info.pubkeys.len() >= T);
         assert_ne!(
-            agg.info.message,
-            status_list_root_fe(tampered.list(), tampered.version()),
+            agg.info.core.message,
+            status_list_message(tampered.list(), tampered.version()),
             "the tampered list must actually change the message, or this case is \
              vacuous"
         );
@@ -191,7 +190,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // choosing instead of the one the anchor derives. The signatures are genuine
     // and internally consistent — the slot is authenticated inside each of them —
     // so what breaks is the *policy*: one slot per round, the same for everybody.
-    let message_1 = status_list_root_fe(&list, 1);
+    let message_1 = status_list_message(&list, 1);
     let chosen_slot = GENESIS;
     assert_ne!(c.slot_for(1), Some(chosen_slot));
     let wrong_slot = record(
@@ -208,9 +207,9 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         // Everything but the slot is in order, so the rejection can only be check 3.
         let agg = info_of(&wrong_slot);
         assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(agg.info.message, message_1);
+        assert_eq!(agg.info.core.message, message_1);
         assert!(agg.info.pubkeys.len() >= T);
-        assert_eq!(agg.info.slot, chosen_slot);
+        assert_eq!(agg.info.core.slot, chosen_slot);
     }
     assert!(
         !verifier.verify(&wrong_slot),
@@ -220,7 +219,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // -------------------------------------------------- check 4: the quorum --
     // Two members against a threshold of three. A perfectly valid aggregate.
     let slot_3 = c.slot_for(3).expect("slot");
-    let message_3 = status_list_root_fe(&list, 3);
+    let message_3 = status_list_message(&list, 3);
     let thin = record(
         list.clone(),
         3,
@@ -234,8 +233,8 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     {
         let agg = info_of(&thin);
         assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(agg.info.message, message_3);
-        assert_eq!(agg.info.slot, slot_3);
+        assert_eq!(agg.info.core.message, message_3);
+        assert_eq!(agg.info.core.slot, slot_3);
         assert_eq!(agg.info.pubkeys.len(), T - 1, "one short, and only that");
     }
     assert!(
@@ -250,10 +249,9 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // to look them up.
     // Member index 200: outside any committee, so it cannot collide with a seed
     // some future test claims for a real member.
-    let outsider: Keypair =
-        xmss_key_gen(seed(200), GENESIS, GENESIS + WINDOW, false).expect("keygen");
+    let outsider: Keypair = keypair(200);
     let slot_4 = c.slot_for(4).expect("slot");
-    let message_4 = status_list_root_fe(&list, 4);
+    let message_4 = status_list_message(&list, 4);
     let intruded = record(
         list.clone(),
         4,
@@ -266,8 +264,8 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     );
     {
         let agg = info_of(&intruded);
-        assert_eq!(agg.info.message, message_4);
-        assert_eq!(agg.info.slot, slot_4);
+        assert_eq!(agg.info.core.message, message_4);
+        assert_eq!(agg.info.core.slot, slot_4);
         assert!(agg.info.pubkeys.len() >= T, "the count alone is satisfied");
         assert_eq!(
             agg.info
@@ -297,13 +295,13 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let forged = record(
         list.clone(),
         ROUND,
-        postcard::to_allocvec(&spliced).expect("re-encodes"),
+        spliced.to_bytes(),
     );
     {
         let agg = info_of(&forged);
         assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(agg.info.message, message);
-        assert_eq!(c.slot_for(ROUND), Some(agg.info.slot));
+        assert_eq!(agg.info.core.message, message);
+        assert_eq!(c.slot_for(ROUND), Some(agg.info.core.slot));
         assert!(agg.info.pubkeys.len() >= T);
     }
     assert!(

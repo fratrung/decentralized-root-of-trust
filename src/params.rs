@@ -30,8 +30,18 @@ pub const T: usize = 128;
 /// bound is `N_UPDATES < KEY_SLOTS`, not `N_UPDATES <= KEY_SLOTS`.
 pub const N_UPDATES: usize = 20;
 
-/// Width of the XMSS slot window each committee key is generated for.
+/// Width of the XMSS slot window each committee key is generated for: the last
+/// usable slot is `SLOT + KEY_SLOTS`, **inclusive**.
 pub const KEY_SLOTS: u32 = 64;
+
+/// The same window as the slot *count* `xmss_key_gen` takes since leanVM v0.9,
+/// where the old API took an inclusive `(slot_start, slot_end)` pair.
+///
+/// The `+ 1` lives here and nowhere else. It is exactly the off-by-one the
+/// assertion below is about, and a second copy of it in each keygen call site is
+/// a second place to get it wrong — silently, since a window one slot short only
+/// shows up when the last security test fails to sign.
+pub const KEY_SLOT_COUNT: u64 = KEY_SLOTS as u64 + 1;
 
 // The bound above, enforced rather than described. `main.rs` and `prover.rs` hold
 // the committee secret keys and sign by plain arithmetic on these two constants —
@@ -41,9 +51,13 @@ pub const KEY_SLOTS: u32 = 64;
 // `N_UPDATES == KEY_SLOTS` is the dangerous value, and it fails silently: the
 // updates end at `SLOT + KEY_SLOTS - 1`, then the tampered-list forgery derives
 // `SLOT + N_UPDATES` and the version forgery derives `SLOT + KEY_SLOTS` — the same
-// slot, still inside the key window (`xmss_key_gen`'s range is inclusive at both
-// ends), so `t` members sign two different messages there and the demo prints
+// slot, still inside the key window (`KEY_SLOT_COUNT` covers `SLOT + KEY_SLOTS`),
+// so `t` members sign two *different* messages there and the demo prints
 // `security OK: true` while the secret keys are being destroyed.
+//
+// leanVM v0.9's derandomized signing does not save this: it makes a repeated
+// (slot, message) pair bit-identical, and the two forgeries deliberately sign
+// different messages.
 //
 // One past that (`N_UPDATES == KEY_SLOTS + 1`) is loud instead — the forgery slot
 // falls outside the window and `xmss_sign` fails — but relying on that is relying

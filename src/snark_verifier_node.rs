@@ -15,7 +15,7 @@
 use lean_multisig::{setup_verifier, verify_single_message_aggregate};
 
 use crate::committee::Committee;
-use crate::status_list::{SnarkStatusList, status_list_root_fe};
+use crate::status_list::{SnarkStatusList, status_list_message};
 
 pub struct PQSNARKVerifierModule {
     committee: Committee,
@@ -63,7 +63,7 @@ impl PQSNARKVerifierModule {
         //    `version` field trustworthy: once this check passes,
         //    status_list.version() is authentic and can safely drive the freshness
         //    / anti-rollback decisions the DHT layer makes in `select_freshest`.
-        if agg.info.message != status_list_root_fe(status_list.list(), status_list.version()) {
+        if agg.info.core.message != status_list_message(status_list.list(), status_list.version()) {
             return false;
         }
 
@@ -74,7 +74,7 @@ impl PQSNARKVerifierModule {
         //    round, the same one for everybody, derived rather than chosen. Without
         //    it a quorum could keep re-signing a version at slots of its own
         //    choosing.
-        if self.committee.slot_for(status_list.version()) != Some(agg.info.slot) {
+        if self.committee.slot_for(status_list.version()) != Some(agg.info.core.slot) {
             return false;
         }
 

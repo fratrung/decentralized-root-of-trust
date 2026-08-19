@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use lean_multisig::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
+use ssz::Encode as _;
 
 /// Writes `next_free` so that it survives a power cut, then returns.
 ///
@@ -99,8 +100,12 @@ fn acquire_lock(state_path: &Path) -> Result<File, AtomicSlotCounterError> {
     Ok(file)
 }
 
+/// Ties a state file to one key. Over the public key's canonical SSZ bytes (32,
+/// fixed) rather than a self-describing encoding: the tag must be stable for a
+/// given key and distinct for every other, and a format with alternative
+/// spellings of the same value cannot promise the first half of that.
 fn key_fingerprint(pk: &XmssPublicKey) -> String {
-    let bytes = postcard::to_allocvec(pk).expect("public key serialization failed");
+    let bytes = pk.as_ssz_bytes();
     Sha3_256::digest(&bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -244,8 +249,12 @@ impl AtomicSlotCounter {
     }
 
     /// Resumes an existing counter. `slot_end` must be the same bound the key was
-    /// generated for; it is passed here because leanVM keeps the secret key's
-    /// `slot_start` / `slot_end` `pub(crate)`, so this crate cannot read them back.
+    /// generated for. It is passed rather than read back because a counter is
+    /// keyed to the *public* key — that is what the anchor names a member by — and
+    /// a public key carries no slot window: it is a Merkle root, identical in
+    /// shape whatever range it covers. (The secret key does know, via
+    /// `XmssSecretKey::activation_slots()`, but the holder of a secret key is the
+    /// signer, not whoever opens the counter file.)
     ///
     /// A missing, truncated, or foreign state file is an error, never a fresh
     /// start. If you genuinely have a new key, call [`AtomicSlotCounter::create`].
@@ -387,7 +396,7 @@ impl AtomicSlotCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lean_multisig::{XmssSecretKey, xmss_key_gen};
+    use lean_multisig::{XmssSecretKey, xmss_key_gen_from_seed};
 
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("slotctr-{name}-{}", std::process::id()));
@@ -401,8 +410,12 @@ mod tests {
         p
     }
 
+    /// Slots 100..=140 — 41 of them. leanVM v0.9 takes an activation slot and a
+    /// count where the old API took an inclusive pair, so the `+ 1` is explicit
+    /// here rather than hidden in the callee.
     fn key(seed: u8) -> (XmssSecretKey, XmssPublicKey) {
-        xmss_key_gen([seed; 32], 100, 140, false).expect("keygen")
+        let (pk, sk) = xmss_key_gen_from_seed([seed; 32], 100, 41).expect("keygen");
+        (sk, pk)
     }
 
     #[test]

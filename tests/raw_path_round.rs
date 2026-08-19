@@ -14,20 +14,24 @@ use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::signer_node::{SignerNode, SignerNodeError};
 use decentralized_root_of_trust::status_list::{
-    Algorithms, StatusList, hash_any, status_list_root_fe,
+    Algorithms, StatusList, hash_any, status_list_message,
 };
 use decentralized_root_of_trust::verifier_node::VerifierNode;
-use lean_multisig::xmss_key_gen;
+use lean_multisig::xmss_key_gen_from_seed;
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
+/// Last usable slot, inclusive: `GENESIS..=GENESIS + WINDOW`.
 const WINDOW: u32 = 16;
+/// The same window as the slot *count* leanVM v0.9's keygen takes.
+const SLOT_COUNT: u64 = WINDOW as u64 + 1;
 
 /// Seeds are `[FILE, ns, member, 0, ..]`. Each test gets its own `ns` because
 /// each also gets its own scratch dir, so the durable slot counters do *not*
 /// deduplicate across tests — without this, node 0 would sign slot `GENESIS` once
-/// per test with one key. The window is not a namespace: leanVM derives the
+/// per test with one key, over messages that differ from test to test, which is
+/// the repeat leanVM v0.9's derandomized signing does *not* make harmless. The window is not a namespace: leanVM derives the
 /// one-time key from the seed alone (`gen_wots_secret_key(seed, slot,
 /// gen_public_param(seed))`), so two keys with the same seed share every chain
 /// however they were generated. `FILE` keeps this file disjoint from
@@ -57,8 +61,8 @@ fn bring_up(dir: &std::path::Path, ns: u8) -> (VerifierNode, Vec<SignerNode>) {
     let mut members = Vec::with_capacity(N);
 
     for i in 0..N {
-        let (sk, pk) =
-            xmss_key_gen(seed(ns, i as u8), GENESIS, GENESIS + WINDOW, false).expect("keygen");
+        let (pk, sk) = xmss_key_gen_from_seed(seed(ns, i as u8), u64::from(GENESIS), SLOT_COUNT)
+            .expect("keygen");
         let counter = AtomicSlotCounter::create(
             dir.join(format!("member-{i}")),
             &pk,
@@ -85,15 +89,14 @@ fn publish(
     version: u32,
     signers: &[usize],
 ) -> StatusList {
-    let message = status_list_root_fe(list, version);
+    let message = status_list_message(list, version);
     let slot = committee.slot_for(version).expect("slot");
-    let mut rng = rand::rng();
 
     let signatures = signers
         .iter()
         .map(|&i| {
             let sig = nodes[i]
-                .sign_at(&mut rng, &message, slot)
+                .sign_at(&message, slot)
                 .unwrap_or_else(|e| panic!("member {i} refused round {version}: {e}"));
             (i, sig)
         })
@@ -113,7 +116,10 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     let mut list = vec![hash_any(b"revoke-alice")];
     let v0 = publish(verifier.get_committee(), &mut nodes, &list, 0, &[0, 1, 2]);
 
-    assert!(verifier.verify_status_list(&v0), "honest round 0 must verify");
+    assert!(
+        verifier.verify_status_list(&v0),
+        "honest round 0 must verify"
+    );
     assert!(matches!(hwm.try_advance(v0.version()), Decision::Accepted));
 
     // --- round 1: members 2,3,4. Only member 2 overlaps, which is the case
@@ -121,7 +127,10 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     list.push(hash_any(b"revoke-bob"));
     let v1 = publish(verifier.get_committee(), &mut nodes, &list, 1, &[2, 3, 4]);
 
-    assert!(verifier.verify_status_list(&v1), "honest round 1 must verify");
+    assert!(
+        verifier.verify_status_list(&v1),
+        "honest round 1 must verify"
+    );
     assert!(matches!(hwm.try_advance(v1.version()), Decision::Accepted));
     assert_eq!(hwm.current(), Some(1));
 
@@ -151,18 +160,19 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
     let (verifier, mut nodes) = bring_up(&dir, 2);
 
     let list = vec![hash_any(b"revoke-alice")];
-    let round0 = status_list_root_fe(&list, 0);
+    let round0 = status_list_message(&list, 0);
     let slot0 = verifier.get_committee().slot_for(0).expect("slot");
-    let mut rng = rand::rng();
 
-    assert!(nodes[0].sign_at(&mut rng, &round0, slot0).is_ok());
+    assert!(nodes[0].sign_at(&round0, slot0).is_ok());
 
-    // A second message under the same (key, slot) is what leaks an XMSS secret
-    // key. The counter refuses before the key is ever touched — and refusing is a
-    // normal outcome: the member abstains and the quorum proceeds without it.
-    let conflicting = status_list_root_fe(&[hash_any(b"revoke-nobody")], 0);
+    // A second *message* under the same (key, slot) is what leaks an XMSS secret
+    // key — and it is exactly the case leanVM v0.9's derandomized signing leaves
+    // fatal, since the derivation includes the message. The counter refuses before
+    // the key is ever touched, and refusing is a normal outcome: the member
+    // abstains and the quorum proceeds without it.
+    let conflicting = status_list_message(&[hash_any(b"revoke-nobody")], 0);
     assert!(matches!(
-        nodes[0].sign_at(&mut rng, &conflicting, slot0),
+        nodes[0].sign_at(&conflicting, slot0),
         Err(SignerNodeError::Slot(AtomicSlotCounterError::AlreadySpent {
             requested,
             next
@@ -186,7 +196,8 @@ fn a_restart_does_not_replay_spent_slots() {
     let _ = publish(verifier.get_committee(), &mut nodes, &list, 0, &[0, 1, 2]);
     drop(nodes); // releases every lock, as a process exit would
 
-    let (_, pk) = xmss_key_gen(seed(3, 0), GENESIS, GENESIS + WINDOW, false).expect("keygen");
+    let (pk, _) =
+        xmss_key_gen_from_seed(seed(3, 0), u64::from(GENESIS), SLOT_COUNT).expect("keygen");
     let counter =
         AtomicSlotCounter::open(dir.join("member-0"), &pk, GENESIS + WINDOW).expect("reopen");
     assert_eq!(

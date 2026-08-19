@@ -7,24 +7,28 @@ edition = "2024"
 # leanVM: the SNARK prover that aggregates the XMSS signatures into a single
 # proof. leanVM ships its own field/hash backend and does NOT depend on
 # Plonky3, so the whole dependency tree is git-pinned and reproducible.
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "12e61512416548e743040aab4daf83c58a5c5476" }
-backend       = { git = "https://github.com/leanEthereum/leanVM.git", rev = "12e61512416548e743040aab4daf83c58a5c5476" }
+#
+# Pinned to the `v0.9` tag by its commit, not by the tag name: a tag can be moved,
+# a commit cannot. v0.9 is a breaking release — keys, signatures and proofs from
+# any earlier revision are rejected, so artifacts must be regenerated after a
+# bump (see AGENTS.md, "leanVM constraints").
+lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
+backend       = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
 
 rand = "0.10"
 sha3 = "0.10.8"
 
-
-# serde binary format used to (de)serialize the leanVM aggregate stored in the
-# StatusList `zk_proof` field. Same format leanVM uses internally.
-postcard = { version = "1.1.3", features = ["alloc"] }
-# Needed for the committee anchor and leanVM-native cryptographic objects. Public
-# status-list containers use SSZ instead.
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_jcs  = "0.2"
-# Canonical, schema-driven wire format for published status records.
+# Canonical, schema-driven wire format for every published object. Since leanVM
+# v0.9 this covers the leanVM types too: `XmssPublicKey` (32 B) and
+# `XmssSignature` (1208 B) implement SSZ natively, with non-canonical field
+# elements rejected on decode, so nothing here has to canonicalize them by hand.
 ssz = { package = "ethereum_ssz", version = "0.10.4" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10.1" }
+
+# Not used by the library: the local scratch binaries (`src/bin/my_test*.rs`,
+# gitignored) build JCS-canonical JSON credentials with them.
+serde_json = "1.0"
+serde_jcs  = "0.2"
 
 # `tests/snark_path.rs` runs a real leanVM prover, which is not usable at
 # `opt-level = 0` — plain `cargo test` would otherwise take hours instead of

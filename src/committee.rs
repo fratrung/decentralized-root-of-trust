@@ -13,7 +13,19 @@
 //! members are, what `t` is, and the single derivation `slot = genesis + version`.
 
 use lean_multisig::XmssPublicKey;
-use serde::{Deserialize, Serialize};
+use ssz::{Decode as _, Encode as _};
+use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
+
+/// SSZ wire schema for the anchor. `XmssPublicKey` is a fixed 32-byte SSZ object
+/// in leanVM v0.9, so `members` is an ordinary list of them and the container is
+/// canonical by construction — see [`Committee::from_bytes`].
+#[derive(SszEncode, SszDecode)]
+#[ssz(struct_behaviour = "container")]
+struct CommitteeWire {
+    members: Vec<XmssPublicKey>,
+    t: u64,
+    genesis_slot: u32,
+}
 
 /// The FIXED trust anchor, embedded once in every verifier — the replacement for
 /// the old single root-of-trust public key. It is the only thing a verifier must
@@ -21,7 +33,7 @@ use serde::{Deserialize, Serialize};
 /// The member order is part of the anchor, so a member's **index** is a stable,
 /// authenticated identifier. That is what lets an update name its signers with a
 /// bitmap instead of shipping their public keys.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub struct Committee {
     members: Vec<XmssPublicKey>,
     t: usize,
@@ -101,49 +113,56 @@ impl Committee {
     /// Wire encoding of the anchor. A real verifier compiles this in; the split
     /// demo ships it as a file the verifier loads once at startup.
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("committee serialization failed")
+        CommitteeWire {
+            members: self.members.clone(),
+            t: self.t as u64,
+            genesis_slot: self.genesis_slot,
+        }
+        .as_ssz_bytes()
     }
 
-    /// Inverse of [`Committee::to_bytes`]. Rejects trailing bytes, and rejects a
-    /// threshold outside `1..=N` — the same invariant [`Committee::new`] asserts,
-    /// re-checked here because deserialization bypasses the constructor.
+    /// Inverse of [`Committee::to_bytes`].
     ///
-    /// It also insists the input is exactly what [`Committee::to_bytes`] would
-    /// produce. Rejecting trailing bytes on its own does **not** make an encoding
-    /// canonical: postcard's varint decoder only errors when the last permitted
-    /// byte overflows the type, so `87 00` and `07` both decode to `7`, and every
-    /// length prefix in the anchor admits the same padding. Two byte-different
-    /// anchors that mean the same committee would otherwise both be accepted —
-    /// which matters here because the anchor is what the freshness gate
-    /// fingerprints to identify its trust domain, so a re-encoding would silently
-    /// look like a committee rotation and reset the anti-rollback mark.
+    /// The anchor must have exactly one wire form. It is what
+    /// [`crate::freshness::HighWaterMark`] fingerprints to identify its trust
+    /// domain, so a second encoding of the same committee would read as a
+    /// rotation and silently reset the anti-rollback mark.
     ///
-    /// The anchor is decoded once at startup, so the extra encode is free at the
-    /// scale that matters.
+    /// SSZ gives that for free, and this is why the encoding is SSZ and not a
+    /// self-describing format: every field here is fixed-width or a list of
+    /// fixed-width items, so there are no length varints to pad, no alternative
+    /// spelling of an integer, and trailing bytes are a decode error rather than
+    /// something to check for afterwards. leanVM's own `XmssPublicKey` decoder
+    /// additionally refuses a field element at or above the modulus, so a member
+    /// key has one encoding too. The predecessor of this function had to re-encode
+    /// the decoded value and byte-compare it to rule out postcard's padded
+    /// varints; nothing here can express the ambiguity in the first place.
+    ///
+    /// What SSZ cannot know is the protocol invariant: `t` outside `1..=N` is
+    /// refused here, the same bound [`Committee::new`] asserts, because
+    /// deserialization bypasses the constructor.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let (value, rest) = postcard::take_from_bytes::<Self>(bytes)
-            .map_err(|e| format!("committee not deserializable: {e}"))?;
-        if !rest.is_empty() {
-            return Err(format!("{} trailing byte(s) after committee", rest.len()));
-        }
-        if !(1..=value.members.len()).contains(&value.t) {
+        let value = CommitteeWire::from_ssz_bytes(bytes)
+            .map_err(|e| format!("committee is not valid SSZ: {e:?}"))?;
+        let t = usize::try_from(value.t).map_err(|_| format!("anchor threshold {} too large", value.t))?;
+        if !(1..=value.members.len()).contains(&t) {
             return Err(format!(
-                "anchor threshold {} outside 1..={}",
-                value.t,
+                "anchor threshold {t} outside 1..={}",
                 value.members.len()
             ));
         }
-        if value.to_bytes() != bytes {
-            return Err("anchor is not canonically encoded".to_string());
-        }
-        Ok(value)
+        Ok(Committee {
+            members: value.members,
+            t,
+            genesis_slot: value.genesis_slot,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lean_multisig::xmss_key_gen;
+    use lean_multisig::xmss_key_gen_from_seed;
 
     /// Deliberately not a multiple of 8, so the bitmap has padding bits and the
     /// checks that police them are actually exercised — over in
@@ -169,12 +188,17 @@ mod tests {
         s
     }
 
+    /// The key window as leanVM v0.9 states it: an activation slot and a *count*,
+    /// half-open, where the old API took an inclusive `(start, end)` pair. Nine
+    /// slots is `GENESIS..=GENESIS + 8`.
+    const WINDOW: u64 = 9;
+
     fn committee_in(ns: u8) -> Committee {
         let members = (0..N)
             .map(|i| {
-                xmss_key_gen(seed(ns, i as u8), GENESIS, GENESIS + 8, false)
+                xmss_key_gen_from_seed(seed(ns, i as u8), u64::from(GENESIS), WINDOW)
                     .expect("keygen")
-                    .1
+                    .0
             })
             .collect();
         Committee::new(members, T, GENESIS)
@@ -207,31 +231,58 @@ mod tests {
 
     /// The anchor identifies the trust domain the freshness gate is scoped to, so
     /// two byte-different encodings of one committee would read as two domains and
-    /// silently reset the anti-rollback mark. Rejecting trailing bytes does not
-    /// cover this: postcard accepts non-minimal varints, and `members` is the first
-    /// field, so byte 0 is its length prefix — `83 00` is a padded `3`.
+    /// silently reset the anti-rollback mark.
+    ///
+    /// Under the old postcard encoding that took an explicit re-encode-and-compare,
+    /// because a varint has padded spellings (`83 00` is a padded `3`). SSZ has no
+    /// varints: the only degree of freedom left is *inside* a member key, where a
+    /// field element could be written at or above the KoalaBear modulus and still
+    /// reduce to a legal value. leanVM's own decoder refuses that, which is what
+    /// makes the anchor canonical end to end rather than only at the container
+    /// level.
     #[test]
-    fn a_non_canonically_encoded_anchor_is_refused() {
+    fn a_member_key_outside_the_field_is_refused() {
         let c = committee_in(3);
-        let canonical = c.to_bytes();
+        let mut bytes = c.to_bytes();
+        assert!(Committee::from_bytes(&bytes).is_ok());
+
+        // Fixed section: the `members` offset (4) + `t` (8) + `genesis_slot` (4).
+        // The member list therefore starts at byte 16, and its first four bytes are
+        // member 0's first field element, little-endian.
+        const FIXED_LEN: usize = 4 + 8 + 4;
         assert_eq!(
-            canonical[0], N as u8,
-            "first byte is the member-count varint"
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
+            FIXED_LEN,
+            "the members list starts right after the fixed section"
         );
+        bytes[FIXED_LEN..FIXED_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 
-        let mut padded = vec![0x80 | N as u8, 0x00];
-        padded.extend_from_slice(&canonical[1..]);
-        assert_ne!(padded, canonical);
-
-        // It really is the same committee to a decoder that does not check.
-        let (value, rest) = postcard::take_from_bytes::<Committee>(&padded).expect("still decodes");
         assert!(
-            rest.is_empty(),
-            "the padding is inside the varint, not trailing"
+            Committee::from_bytes(&bytes).is_err(),
+            "a field element at or above the modulus must not decode"
         );
-        assert_eq!(value.members().len(), N);
+    }
 
-        assert!(Committee::from_bytes(&padded).is_err());
+    /// The invariant SSZ cannot know. `t = 0` would make a record nobody signed
+    /// reach quorum — see the guard in
+    /// [`crate::verifier_node::VerifierNode::verify_status_list`] — and `t > N` is
+    /// an anchor no quorum can satisfy. `new` asserts both; deserialization
+    /// bypasses `new`, so `from_bytes` re-checks them.
+    #[test]
+    fn a_threshold_outside_the_committee_is_refused() {
+        let c = committee_in(5);
+        let bytes = c.to_bytes();
+        assert!(Committee::from_bytes(&bytes).is_ok());
+
+        // `t` sits in the fixed section, right after the 4-byte members offset.
+        for bad in [0u64, N as u64 + 1] {
+            let mut forged = bytes.clone();
+            forged[4..12].copy_from_slice(&bad.to_le_bytes());
+            assert!(
+                Committee::from_bytes(&forged).is_err(),
+                "threshold {bad} outside 1..={N} must be refused"
+            );
+        }
     }
 
     #[test]

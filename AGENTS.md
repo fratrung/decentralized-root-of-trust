@@ -30,7 +30,7 @@ cargo run --release --bin raw_agg                      # the same protocol with 
 cargo run --release --bin prover   -- [outdir]         # split: sign + aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --example footprint -- prover      # RAM of setup alone; also: verifier | none
-cargo test                                             # 44 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
+cargo test                                             # 48 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
 tools/mutate.py                                        # mutation testing: 25 checks, each must be caught by a test
 ```
@@ -58,9 +58,10 @@ One data flow that forks at the end:
 
 ```
 (Vec<[u8;32]>, version) --status_list_root_fe--> [KoalaBear;8]
-    --t x xmss_sign at slot = genesis + version--> t sigs
-        |-- (index, sig) pairs ------------------------> StatusList { bitmap, signatures }
-        `-- aggregate_single_message_signatures --> SNARK --> SnarkStatusList.zk_proof
+    --pack canonical LE u32--> [u8;32]   (status_list_message)
+        --t x xmss_sign at slot = genesis + version--> t sigs
+            |-- (index, sig) pairs --------------------> StatusList { bitmap, signatures }
+            `-- aggregate_single_message_signatures --> SNARK --> SnarkStatusList.zk_proof
 ```
 
 Library:
@@ -71,18 +72,25 @@ Library:
   chain, not a tree**, despite the "root" naming: `acc = compress_pair(acc,
   entry(e))` from `[0;8]`. Cost is O(n) sequential and there are no per-entry
   inclusion proofs. It allocates nothing on the heap, so a large list could be
-  streamed rather than held in RAM.
-  Published records use SSZ containers, so their outer wire encoding is canonical.
-  Raw XMSS signatures and leanVM aggregates remain postcard blobs because those
-  types belong to leanVM; decoding re-encodes and byte-compares them before use,
-  so the embedded representation is canonical too. `StatusList::new` sorts the `(index, signature)` pairs and rejects duplicates
+  streamed rather than held in RAM. `status_list_message` closes it by packing the
+  eight field elements into the 32 bytes leanVM's XMSS signs — canonical LE `u32`
+  each, injective, so the binding argument is the fold's.
+  Everything published is SSZ. Since leanVM v0.9 that includes leanVM's own types:
+  `XmssSignature` (fixed 1208 B) and `XmssPublicKey` (32 B) are SSZ objects that
+  refuse a field element at or above the modulus, so the signatures inside a
+  record and the keys inside the anchor are canonical by schema rather than by a
+  re-encode-and-compare this crate performs. The one exception is the leanVM
+  aggregate, which cannot be a typed field (decoding it needs the process-global
+  bytecode), so `SnarkStatusList::proof` still canonicalizes it by re-encoding.
+  `StatusList::new` sorts the `(index, signature)` pairs and rejects duplicates
   and out-of-range indices, so a value that exists is already canonical — the
   out-of-order and repeated-signer variants are unconstructible rather than
   defended against. `from_bytes` additionally rejects a bitmap whose population
   disagrees with the signature count.
 - `src/committee.rs` — the anchor and **nothing else**: members, `t`,
-  `genesis_slot`, the wire encoding, and `slot_for` (the **only** place the slot
-  is derived). The protocol predicates used to live here as free functions taking
+  `genesis_slot`, the SSZ wire encoding, and `slot_for` (the **only** place the
+  slot is derived). `from_bytes` re-checks `t ∈ 1..=N`, the one invariant a wire
+  format cannot know; canonicity it gets from SSZ, which has no varints to pad. The protocol predicates used to live here as free functions taking
   `&Committee`; they are now methods on the node type that owns the anchor, so a
   participant is one value with the operations its role can perform.
 - `src/atomic_slot_counter.rs` — the durable monotonic slot allocator. Burns the
@@ -106,8 +114,8 @@ Library:
   monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
   committee rotation resets it, persisted with a write-then-rename. Lives *outside*
   the verification predicate, which stays pure.
-- `src/mem.rs`, `src/stats.rs` — RSS probes and descriptive statistics shared by
-  every binary.
+- `src/mem.rs`, `src/stats.rs` — RSS (resident set size) probes and descriptive
+  statistics shared by every binary.
 - `src/snark_prover_node.rs` — the prover. Holding the value *is* the proof that
   `setup_prover()` ran. `make_proof` derives the slot through `Committee::slot_for`
   and takes a `version`, never a slot; `aggregate` takes an explicit slot and
@@ -142,9 +150,21 @@ predicates are not reachable any other way, which is the point — a free functi
 duplicated next to a wrapper is how the verifier module once lost its slot check.
 Local scratch binaries (`src/bin/my_test*.rs`) are gitignored: hand-run
 walkthroughs, not part of the published surface and not covered by the tests.
+They must still **compile**, though — `cargo test` builds every target in the
+package, so one that has drifted out of date fails the whole suite even though
+nothing tests it. Keep them migrated along with the library, or delete them.
+`my_test`/`my_test_2`/`my_test_3` walk the SNARK path, the raw path with a
+committee of one, and the raw path with a real `t`-of-`N` quorum. They write slot
+state into the working directory (`next_slot`, `signers/`), which `.gitignore`
+covers.
 
-Tests (`cargo test`, ~15 s warm, 58 in total):
-- `src/*.rs` unit tests cover each module against its own contract. `stats.rs`'s
+Tests (`cargo test`, ~15 s warm, 57 in total: 56 run plus one `#[ignore]`d):
+- `src/*.rs` unit tests cover each module against its own contract.
+  `status_list.rs`'s pin the seam this crate has with leanVM: that
+  `status_list_message` is the *canonical* packing of the fold (each limb a field
+  element's unique representative), that it moves with both the list and the
+  version — which is the whole content of check 2 — and that the fold stays
+  order-sensitive, a documented gap rather than an accident. `stats.rs`'s
   are worth a note: they are the only guard on the numbers that reach the paper,
   and they pin the two choices a "simplification" would silently undo — the
   median over a lone mean, and the Bessel-corrected (`n-1`) standard deviation
@@ -167,6 +187,15 @@ Tests (`cargo test`, ~15 s warm, 58 in total):
     `cargo test` at seconds while this crate keeps its debug assertions and
     overflow checks. The release profile — what `benchmark.sh` measures — is
     untouched.
+- `tests/snark_modules.rs` covers the two SNARK node types the way the binaries
+  use them, which `snark_path.rs` does not: that `PQSNARKProverModule` derives the
+  slot from the **anchor** rather than from its caller — asserted against the slot
+  recorded inside the finished proof — that the verifier module accepts an honest
+  record and refuses a tampered list and a relabelled version, that
+  `select_freshest` runs those same checks and is not fooled by a candidate that
+  merely *declares* a higher version, that `is_newer` is strict, and that a version
+  with no slot under the anchor panics instead of proving something unverifiable.
+  One aggregation, so a few seconds; one `#[test]`, for the arena reason above.
 - `tests/lock_two_processes.rs` checks the cross-process lock with two **real**
   processes: it re-execs the test binary (`child_probe`, `#[ignore]`d, driven with
   `--ignored --exact`) and reads a marker line back. The unit tests only ever
@@ -175,6 +204,19 @@ Tests (`cargo test`, ~15 s warm, 58 in total):
   `PROBE=acquired:<slot>` naming the slot both holders would issue.
   It also asserts the negative control — after the holder exits, the next process
   gets the lock *and* resumes from the slot the first durably burned.
+- `tests/hostile_bytes.rs` is the only test whose input this crate did not
+  produce, which is the shape the threat model actually has: records arrive from a
+  DHT, so every byte is attacker-chosen. It mutates all three wire formats —
+  truncation, bit flips, insertions, deletions, plus an offset-shaped pattern
+  spliced at every early position — and asserts three properties in increasing
+  order of importance: the decoders never panic, never treat a malformed length as
+  an allocation request, and never accept a record that *means* something other
+  than the one it was derived from (same list, same version, same signer set).
+  The seed is fixed, so a failure is reproducible rather than intermittent, and
+  the test guards its own relevance: it fails if too few mutants decode, or if
+  none reaches `verify_status_list` at all. Raw path only — a fuzzer will not
+  stumble onto a valid aggregate, so the SNARK predicate is covered case by case
+  in `snark_path.rs` instead.
 
 ### The split deployment (and why it exists)
 
@@ -200,6 +242,12 @@ Two consequences that drive design decisions here:
    `M_TRIM_THRESHOLD=-1` and `M_MMAP_MAX=0` — freed memory is never returned to
    the OS. Never call `setup_prover()` in a process that only verifies.
 
+   leanVM v0.9 makes that arena opt-out: `setup_prover_without_arena()` runs the
+   prover on the system allocator — slower, but the RSS curve stops being
+   monotonic. This repo does **not** use it, so every figure here is the arena's.
+   It is the first thing to try for a memory-constrained prover, and it has to be
+   re-measured rather than assumed.
+
 The ~678 MB floor is `Bytecode.instructions_multilinear` in leanVM (the unrolled
 aggregation program's multilinear encoding). It is **not** driven by
 `MAX_XMSS_AGGREGATED` — that constant only appears in asserts — so shrinking it
@@ -212,11 +260,11 @@ signed this message at this slot". Every link to trust is a cleartext check
 outside the circuit, in `PQSNARKVerifierModule::verify` (`src/snark_verifier_node.rs`):
 
 1. every signer ∈ committee — membership against the fixed anchor;
-2. `agg.info.message == status_list_root_fe(list, version)` — **the critical
+2. `agg.info.core.message == status_list_message(list, version)` — **the critical
    binding**; it ties the proof to both the list (without it a valid proof of a
    *different* list can be attached) and the `version` (without it the cleartext
    version field is forgeable — see the versioning note below);
-3. `committee.slot_for(version) == Some(agg.info.slot)` — the slot is the one the
+3. `committee.slot_for(version) == Some(agg.info.core.slot)` — the slot is the one the
    anchor assigns to this round;
 4. `pubkeys.len() >= t` — quorum;
 5. the SNARK verifies.
@@ -253,18 +301,32 @@ quorum check.
   single status list so it keeps a single mark in the artifact dir. Committee
   rotation (the anchor changing) is a separate, deferred protocol.
 - `version` **is** verified: it is folded into the signed message (Option B), so
-  verification recomputes `status_list_root_fe(list, version())` and a tampered
+  verification recomputes `status_list_message(list, version())` and a tampered
   version fails check 2. It is now *also* what fixes the slot, so the two bindings
   break together. `alg` is still never verified (it only appears in `Display`).
 - The status list is never **sorted or deduplicated**, and `status_list_root_fe`
-  folds sequentially, so `root([a,b]) != root([b,a])`: one logical revocation set
+  (the fold behind `status_list_message`) folds sequentially, so `root([a,b]) != root([b,a])`: one logical revocation set
   has `n!` valid roots. Sorting inside the fold would fix it and is a
   wire-format-breaking change.
-- **Published records are canonically encoded.** `StatusList` and
-  `SnarkStatusList` use SSZ containers. XMSS signatures and leanVM aggregates
-  remain native postcard blobs, but they are accepted only when decode followed
-  by re-encode returns byte-for-byte identical data. The old postcard container
-  format is intentionally incompatible; regenerate artifacts after upgrading.
+- **Published records are canonically encoded.** `StatusList`, `SnarkStatusList`
+  and the anchor are SSZ containers, and since leanVM v0.9 the signatures and
+  public keys inside them are SSZ too, with non-canonical field elements refused
+  on decode. Only the leanVM aggregate is still a native blob, accepted only when
+  decode followed by re-encode returns byte-for-byte identical data. Earlier wire
+  formats are intentionally incompatible; regenerate artifacts after upgrading.
+- **The SNARK path still ships the signers' public keys**, inside the aggregate.
+  leanVM v0.9 added `to_bytes_without_pubkeys()` / `from_bytes_without_pubkeys()`
+  for receivers that already know the signer set, which this project's verifier
+  does: it holds the anchor. Adopting it would drop ~4 KB of the ~234 KB record
+  (128 keys × 32 B), and — the part that actually matters — would make check 1
+  *structural* rather than a lookup, exactly as the bitmap already makes it on the
+  raw path, so the two published forms would stop disclosing different things. It
+  is deliberately **not** adopted here: it changes the published schema (the
+  record would have to carry a signer bitmap of its own), which is a protocol
+  change rather than the leanVM alignment it arrived with. Note that
+  `SingleMessageCore::with_pubkeys` sorts and deduplicates, and a signer set
+  different from the aggregated one fails verification — so such a bitmap would
+  have to name exactly the aggregated set, not a superset of it.
 - **Committee rotation is not implemented.** Because the slot is derived, every
   key now runs out at the *same* round (`genesis + KEY_SLOTS`), which turns
   rotation from an asynchronous per-node event into a deadline everybody can
@@ -276,16 +338,32 @@ quorum check.
 
 ## leanVM constraints that shape this code
 
-Dependencies are git-pinned to leanVM rev `12e6151` (source at
-`~/.cargo/git/checkouts/leanvm-*/12e6151` — read it when the API is unclear;
-leanVM ships its own field/hash backend and does not depend on Plonky3).
+Dependencies are git-pinned to leanVM **v0.9** (`a5909d1`, source at
+`~/.cargo/git/checkouts/leanvm-*/a5909d1` — read it when the API is unclear;
+leanVM ships its own field/hash backend and does not depend on Plonky3). The tag
+is pinned by commit, not by name, because a tag can be moved.
 
-- **XMSS is stateful.** A `(key, slot)` pair must sign **at most once** — reuse is
-  insecure even on the same message, because the WOTS encoding randomness is
-  non-deterministic. Every update therefore consumes a new slot. Keys are
-  generated for `SLOT..=SLOT + KEY_SLOTS` (**both bounds inclusive**, so that is
-  `KEY_SLOTS + 1` signatures), and raising `N_UPDATES` past it breaks keygen
-  bounds.
+v0.9 is a breaking release: keys, signatures and proofs from any earlier revision
+are rejected. After a bump, delete `artifacts/` and any durable slot state — the
+key fingerprint the counters are tied to changes with the key.
+
+- **XMSS is stateful.** A `(key, slot)` pair must sign **at most once**, and what
+  "once" protects is the *message*: v0.9 derives the signing randomness from
+  `(secret seed, slot, attempt, hashed message)`, so re-signing the same message
+  at the same slot returns a bit-identical signature and is harmless, while two
+  *different* messages at one slot still expose enough WOTS chain positions to
+  forge. Every update therefore still consumes a new slot. Do not weaken any
+  guard on the strength of the derandomization: the counter cannot tell the two
+  cases apart without keeping the message history it deliberately does not keep.
+- **Keys are generated for `SLOT..=SLOT + KEY_SLOTS`**, both bounds inclusive,
+  i.e. `KEY_SLOTS + 1` signatures. v0.9's `xmss_key_gen` takes an activation slot
+  and a slot **count** instead of an inclusive end, so that `+ 1` lives in
+  `params::KEY_SLOT_COUNT` and nowhere else. Raising `N_UPDATES` past the window
+  breaks keygen bounds — see the `const` assertion in `params.rs`.
+- **`xmss_key_gen` samples its own seed** and returns `(public, secret)`. This
+  crate carries `(secret, public)`, so every call site swaps at the boundary;
+  the two types are distinct, so a missed swap is a compile error.
+  `xmss_key_gen_from_seed` is the deterministic form the tests use.
 - **A key's slot window cannot be extended.** Leaves outside `slot_start..=slot_end`
   are `gen_random_node` fillers that still feed the Merkle root, so the same seed
   with a wider window produces a *different* public key. An exhausted key can only
@@ -297,21 +375,36 @@ leanVM ships its own field/hash backend and does not depend on Plonky3).
   (`xmss_verify` takes a per-signature slot), but the two paths deliberately share
   the derivation so a record can be re-issued either way.
 - **`setup_verifier()` or `setup_prover()` must run before deserializing any
-  proof** — `SingleMessageInfo::deserialize` recomputes the bytecode claim from
-  the process-global bytecode and fails without it.
+  proof** — deserializing a `SingleMessageInfo` recomputes the bytecode claim from
+  the process-global bytecode and fails without it. This is why the aggregate is
+  an opaque byte-list inside `SnarkStatusListWire` rather than a typed field.
+- **The aggregate's public inputs live under `info.core`** since v0.9
+  (`info.core.message`, `info.core.slot`, `info.core.bytecode_claim`), with
+  `info.pubkeys` alongside. The split exists so the signer set can be dropped from
+  the wire — see `to_bytes_without_pubkeys` in the note below.
+- **Messages are 32 raw bytes** (`MESSAGE_LEN_BYTES`), not `[F; 8]`: leanVM hashes
+  them into the field message itself. `status_list_message` is where this crate
+  crosses that boundary.
 - **Never prove two things concurrently in one process**: leanVM's arena
   allocator has a single shared region. Parallelize with separate processes.
+- **The verifier is single-threaded** in v0.9 and allocates plain `Vec`, and
+  `verify_single_message_aggregate` installs a `parallel::forbid_parallelism()`
+  guard for the duration of verification. `setup_verifier()` remains all it needs.
 - Setup is paid **once per process** and is not persisted (~5-8 s, and it
   dominates everything else). Production keeps the prover process alive.
 - Prove time and RAM scale with **`t`**, not with the number of updates. At small
   `t` the padding of the trace to a power of two makes it a step function (`t=5..=8`
   all cost the same, `t=4` is the next step down); from a few dozen signers upward
-  the linear term dominates and prove time is ~linear in `t` — measured 406 ms at
-  `t=70` and 718 ms at `t=128`, a flat ~5.7 ms per aggregated signature. **Do not
-  extrapolate the step behaviour past small `t`.**
-- Only leanVM's own XMSS parametrization (Poseidon2, `[F;8]` messages,
-  `LOG_LIFETIME=32`) can be fed to the aggregator. The standalone `leanSig` XMSS
-  (Poseidon1, `[u8;32]`, `LOG_LIFETIME=18`) is incompatible.
+  the linear term dominates and prove time is ~linear in `t`. **Do not extrapolate
+  the step behaviour past small `t`**, and do not quote a per-signature figure from
+  a single `t`: dividing one measurement by `t` still carries the `t`-independent
+  part of the proof. `benchmark.sh` derives that line from the run it just made —
+  it used to print remembered numbers, which then contradicted the table above them
+  in the same file.
+- Only leanVM's own XMSS parametrization (Poseidon2, `LOG_LIFETIME=32`) can be
+  fed to the aggregator. The standalone `leanSig` XMSS (Poseidon1,
+  `LOG_LIFETIME=18`) is incompatible. Since v0.9 both take a 32-byte message, so
+  the message type no longer tells them apart — check which crate you are calling.
 
 ## Machine-readable record contracts
 
@@ -328,6 +421,23 @@ per-item raw samples when `EMIT_SAMPLES` is set in the environment:
 `benchmark.sh` normalises all four in `emit_run_row`; adding or renaming a field
 means updating that function. The script exits if a summary line is missing, and
 aborts before printing any statistics if any run reports `failures > 0`.
+
+Fixed costs are reported as **three distinct fields**, and conflating them is how
+the comparison between the two paths gets inverted:
+
+| field | what it is | who pays it |
+|---|---|---|
+| `setup_ms` | the leanVM circuit (`setup_prover` / `setup_verifier`) | SNARK path only — `raw_agg` leaves it empty |
+| `keygen_ms` | generating the `N` XMSS keys | every path, `raw_agg` included |
+| `slot_state_ms` | creating the `N` durable `AtomicSlotCounter`s | only a real signer (`raw_agg`) |
+
+Per-update phases are carried into `runs.csv` under their **own names**
+(`sign_*`, `prove_*`, `verify_*`), never under a positional primary/secondary
+slot: `raw_agg`'s secondary phase is signing while `combined`'s is verification,
+so a shared column put ~1.2 s and ~32 ms under one heading and made `summary.csv`
+unreadable on its own. A target leaves blank the phases it does not run, and
+`col()` drops empty cells, so an absent phase produces no row rather than a
+`0.000 ms` that reads as "instant".
 
 ### Artifact conventions between `prover` and `verifier`
 

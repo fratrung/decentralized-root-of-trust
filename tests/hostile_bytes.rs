@@ -35,10 +35,10 @@
 
 use decentralized_root_of_trust::committee::Committee;
 use decentralized_root_of_trust::status_list::{
-    Algorithms, SnarkStatusList, StatusList, hash_any, status_list_root_fe,
+    Algorithms, SnarkStatusList, StatusList, hash_any, status_list_message,
 };
 use decentralized_root_of_trust::verifier_node::VerifierNode;
-use lean_multisig::{xmss_key_gen, xmss_sign};
+use lean_multisig::{xmss_key_gen_from_seed, xmss_sign};
 use rand::{RngExt, SeedableRng};
 
 const N: usize = 5;
@@ -67,23 +67,17 @@ fn entries() -> Vec<[u8; 32]> {
 #[test]
 fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
     let keys: Vec<_> = (0..N)
-        .map(|i| xmss_key_gen(seed(i as u8), GENESIS, GENESIS + 8, false).expect("keygen"))
+        .map(|i| xmss_key_gen_from_seed(seed(i as u8), u64::from(GENESIS), 9).expect("keygen"))
         .collect();
-    let committee = Committee::new(keys.iter().map(|(_, pk)| pk.clone()).collect(), T, GENESIS);
+    let committee = Committee::new(keys.iter().map(|(pk, _)| pk.clone()).collect(), T, GENESIS);
     let verifier = VerifierNode::new(committee);
     let committee = verifier.get_committee();
 
     let list = entries();
-    let message = status_list_root_fe(&list, VERSION);
+    let message = status_list_message(&list, VERSION);
     let slot = committee.slot_for(VERSION).expect("slot");
-    let mut rng = rand::rng();
     let signatures = (0..T)
-        .map(|i| {
-            (
-                i,
-                xmss_sign(&mut rng, &keys[i].0, &message, slot).expect("sign"),
-            )
-        })
+        .map(|i| (i, xmss_sign(&keys[i].1, slot, &message).expect("sign")))
         .collect();
 
     let honest = StatusList::new(Algorithms::WotsXmss, list.clone(), VERSION, N, signatures)
@@ -100,7 +94,9 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
 
     // The wire codec is canonical: decoding then encoding an accepted record
     // yields exactly the original bytes. A trailing byte is not an alternative
-    // spelling of the same record under SSZ.
+    // spelling of the same record under SSZ — and since leanVM v0.9 the same
+    // holds *inside* each signature, which is a fixed 1208-byte SSZ object whose
+    // field elements are refused at or above the modulus.
     assert_eq!(
         StatusList::from_bytes(&raw)
             .expect("honest raw record decodes")
