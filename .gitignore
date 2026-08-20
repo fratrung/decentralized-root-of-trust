@@ -1,6 +1,7 @@
 /target
 /bench_*.csv
 .claude/
+.agents/
 artifacts/
 bench-*/
 

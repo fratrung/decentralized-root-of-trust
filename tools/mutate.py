@@ -68,7 +68,7 @@ if not sys.stdout.isatty():
 
 MUTANTS = {
     # --- PQSNARKVerifierModule::verify: the five checks of the SNARK path --
-    "snark-1-membership": ("src/snark_verifier_node.rs", """        if !agg
+    "snark-1-membership": ("src/node/snark_verifier.rs", """        if !agg
             .info
             .pubkeys
             .iter()
@@ -76,21 +76,21 @@ MUTANTS = {
         {
             return false;
         }""", "        if false { return false; }"),
-    "snark-2-message": ("src/snark_verifier_node.rs", """        if agg.info.core.message != status_list_message(status_list.list(), status_list.version()) {
+    "snark-2-message": ("src/node/snark_verifier.rs", """        if agg.info.core.message != status_list_message(status_list.list(), status_list.version()) {
             return false;
         }""", "        if false { return false; }"),
-    "snark-3-slot": ("src/snark_verifier_node.rs", """        if self.committee.slot_for(status_list.version()) != Some(agg.info.core.slot) {
+    "snark-3-slot": ("src/node/snark_verifier.rs", """        if self.committee.slot_for(status_list.version()) != Some(agg.info.core.slot) {
             return false;
         }""", "        if false { return false; }"),
-    "snark-4-quorum": ("src/snark_verifier_node.rs", """        if agg.info.pubkeys.len() < self.committee.threshold() {
+    "snark-4-quorum": ("src/node/snark_verifier.rs", """        if agg.info.pubkeys.len() < self.committee.threshold() {
             return false;
         }""", "        if false { return false; }"),
-    "snark-5-proof": ("src/snark_verifier_node.rs", """        if verify_single_message_aggregate(&agg).is_err() {
+    "snark-5-proof": ("src/node/snark_verifier.rs", """        if verify_single_message_aggregate(&agg).is_err() {
             return false;
         }""", "        if false { return false; }"),
 
     # --- VerifierNode::verify_status_list: the raw path -------------------
-    "raw-t-zero": ("src/verifier_node.rs", """        if self.committee.threshold() == 0 {
+    "raw-t-zero": ("src/node/raw_verifier.rs", """        if self.committee.threshold() == 0 {
             return false;
         }""", "        if false { return false; }"),
     # Not merely canonicity: this is also what keeps `members[i]` in range, since
@@ -98,14 +98,14 @@ MUTANTS = {
     # be a second mutant here, "raw-padding-bits", deleting a sweep for set bits
     # above member n - 1. An SSZ BitList carries its length in a sentinel bit, so
     # those bits cannot exist and there is no longer a check to delete.
-    "raw-bitmap-width": ("src/verifier_node.rs", """        if status_list.signer_slots() != n {
+    "raw-bitmap-width": ("src/node/raw_verifier.rs", """        if status_list.signer_slots() != n {
             return false;
         }""", "        if false { return false; }"),
-    "raw-quorum": ("src/verifier_node.rs", """        if count < self.committee.threshold() || count != status_list.signatures().len() {
+    "raw-quorum": ("src/node/raw_verifier.rs", """        if count < self.committee.threshold() || count != status_list.signatures().len() {
             return false;
         }""", "        if false { return false; }"),
     "raw-signatures": (
-        "src/verifier_node.rs",
+        "src/node/raw_verifier.rs",
         "            .all(|(i, sig)| xmss_verify(&members[i], slot, &message, sig).is_ok())",
         "            .all(|(i, sig)| { let _ = (i, sig); true })",
     ),
@@ -122,29 +122,29 @@ MUTANTS = {
     # anchor". That cannot be written as a text swap — the parameter does not exist —
     # so the derivation is made wrong instead, which fails in the same way.
     "snark-module-slot": (
-        "src/snark_prover_node.rs",
+        "src/node/snark_prover.rs",
         "            .slot_for(version)",
         "            .slot_for(version + 1)",
     ),
     "snark-module-is-newer": (
-        "src/snark_verifier_node.rs",
+        "src/node/snark_verifier.rs",
         "        status_list.version() > self.status_list_last_version",
         "        status_list.version() >= self.status_list_last_version",
     ),
     "node-membership": (
-        "src/verifier_node.rs",
+        "src/node/raw_verifier.rs",
         "        if !self.committee.members().contains(pub_key) {",
         "        if false {",
     ),
 
     # --- freshness --------------------------------------------------------
     "freshness-floor-strict": (
-        "src/snark_verifier_node.rs",
+        "src/node/snark_verifier.rs",
         "            .filter(|sl| floor.is_none_or(|f| sl.version() > f))",
         "            .filter(|sl| floor.is_none_or(|f| sl.version() >= f))",
     ),
     "freshness-floor-off": (
-        "src/snark_verifier_node.rs",
+        "src/node/snark_verifier.rs",
         "            .filter(|sl| floor.is_none_or(|f| sl.version() > f))\n",
         "",
     ),
@@ -152,28 +152,28 @@ MUTANTS = {
     # newest *declared* version without verifying it hands the choice to whichever
     # peer lies hardest.
     "freshness-select-unverified": (
-        "src/snark_verifier_node.rs",
+        "src/node/snark_verifier.rs",
         "        decoded.into_iter().find(|sl| self.verify(sl))",
         "        decoded.into_iter().next()",
     ),
     "hwm-strict": (
-        "src/freshness.rs",
+        "src/state/freshness.rs",
         "        if self.have && version <= self.current {",
         "        if self.have && version < self.current {",
     ),
 
     # --- the stateful-signature invariants --------------------------------
     "lock-off": (
-        "src/atomic_slot_counter.rs",
+        "src/state/slot_counter.rs",
         "    file.try_lock().map_err(|_| AtomicSlotCounterError::Busy)?;\n",
         "",
     ),
     "create-exists-check": (
-        "src/atomic_slot_counter.rs",
+        "src/state/slot_counter.rs",
         "        if path.exists() {",
         "        if false {",
     ),
-    "dup-signer-guard": ("src/snark_prover_node.rs", "        duplicated.is_none(),", "        true,"),
+    "dup-signer-guard": ("src/node/snark_prover.rs", "        duplicated.is_none(),", "        true,"),
 
     # --- wire format ------------------------------------------------------
     # Was "anchor-canonical", deleting the re-encode-and-compare that ruled out
@@ -181,23 +181,23 @@ MUTANTS = {
     # is gone and there is nothing to mutate. What remains in `from_bytes` is the
     # invariant no wire format knows about: `t = 0` makes an unsigned record reach
     # quorum, `t > N` is unsatisfiable, and deserialization bypasses `new`.
-    "anchor-threshold": ("src/committee.rs", """        if !(1..=value.members.len()).contains(&t) {""",
+    "anchor-threshold": ("src/protocol/committee.rs", """        if !(1..=value.members.len()).contains(&t) {""",
                          "        if false {"),
     "bitmap-population": (
-        "src/status_list.rs",
+        "src/protocol/status_list.rs",
         "        if value.signer_count() != value.signatures.len() {",
         "        if false {",
     ),
 
     # --- the numbers that reach the paper ---------------------------------
-    "stats-bessel": ("src/stats.rs", "/ (n - 1) as f64", "/ n as f64"),
+    "stats-bessel": ("src/bench/stats.rs", "/ (n - 1) as f64", "/ n as f64"),
     "stats-median-even": (
-        "src/stats.rs",
+        "src/bench/stats.rs",
         "(self.0[n / 2 - 1] + self.0[n / 2]) / 2.0",
         "self.0[n / 2]",
     ),
     "stats-sort": (
-        "src/stats.rs",
+        "src/bench/stats.rs",
         '        v.sort_by(|a, b| a.partial_cmp(b).expect("NaN in measurement series"));\n',
         "",
     ),
