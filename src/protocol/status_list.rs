@@ -1,7 +1,7 @@
 //! The published revocation record, in its two forms.
 //!
-//! Both carry the same payload — a list of credential fingerprints and a version
-//! — and both are signed by the same `t`-of-`N` committee over the same message.
+//! Both carry the same payload (a list of credential fingerprints and a version)
+//! and both are signed by the same `t`-of-`N` committee over the same message.
 //! They differ only in how the quorum is *evidenced*:
 //!
 //! * [`StatusList`] ships the `t` raw XMSS signatures plus a bitmap naming their
@@ -12,7 +12,7 @@
 //!
 //! Neither is self-describing, and deliberately so: a record names its signers by
 //! *index*, never by public key, so it discloses no key material and its size does
-//! not grow with `N`. Both forms are meaningless without the anchor — which is the
+//! not grow with `N`. Both forms are meaningless without the anchor, which is the
 //! one thing every verifier already has.
 
 use std::fmt;
@@ -37,16 +37,15 @@ const _: () = assert!(MAX_COMMITTEE_SIZE == <MaxCommittee as typenum::Unsigned>:
 
 /// The signer bitmap: one bit per committee member, LSB-first.
 ///
-/// An SSZ `BitList` rather than a byte array, and that is a security property
-/// rather than a typing preference. A byte array fixes how many *bytes* there
-/// are, never how many *bits* mean something, so the bits above member `N - 1`
-/// are free: one signer set gets several encodings, and — worse — an index past
-/// the end of the committee becomes representable. A `BitList` appends a
-/// sentinel bit after the last real bit, so its length in bits is recovered
-/// exactly on decode, bits above it are rejected as excess, and trailing zero
-/// bytes are rejected too. What used to be two hand-written checks in
-/// [`crate::verifier_node::VerifierNode::verify_status_list`] is now one
-/// comparison against the anchor.
+/// A `BitList` and not a byte array, which is a security property rather than a
+/// typing preference. A byte array fixes how many *bytes* exist, never how many
+/// *bits* mean something, leaving the bits above member `N - 1` free: one signer
+/// set gets several encodings, and an index past the end of the committee becomes
+/// representable. A `BitList` appends a sentinel after the last real bit, so the
+/// length in bits is recovered exactly on decode and both excess bits and trailing
+/// zero bytes are refused. The padding-bit attack class is unrepresentable, and
+/// [`crate::node::raw_verifier::VerifierNode::verify_status_list`] needs one comparison
+/// against the anchor where it once needed two hand-written checks.
 type SignerBits = BitList<MaxCommittee>;
 
 #[derive(Clone, Copy)]
@@ -56,12 +55,10 @@ pub enum Algorithms {
 
 /// SSZ wire schema for the raw form.
 ///
-/// `signatures` holds leanVM's own type directly: since v0.9 `XmssSignature`
-/// implements SSZ natively as a fixed 1208-byte object whose field elements are
-/// canonical little-endian `u32`s, rejected on decode when out of range. It used
-/// to be an opaque byte-list carrying a postcard blob that this module had to
-/// re-encode and byte-compare to prove canonical; the schema now says what the
-/// bytes are, and the decoder enforces it.
+/// `signatures` holds leanVM's own type directly: since v0.9 `XmssSignature` is a
+/// fixed 1208-byte SSZ object whose field elements are canonical little-endian
+/// `u32`s, refused on decode when out of range. The schema says what the bytes
+/// are and the decoder enforces it, so canonicity needs no check here.
 #[derive(SszEncode, SszDecode)]
 #[ssz(struct_behaviour = "container")]
 struct RawStatusListWire {
@@ -119,18 +116,16 @@ pub fn entry_to_field(entry: &[u8; 32]) -> [KoalaBear; 8] {
     poseidon16_compress_pair(&poseidon16_compress(lo), &poseidon16_compress(hi))
 }
 
-/// Poseidon2 "hash-tree root" of the status list *and its version*: a fold over
-/// the entries, closed by one more compression that mixes in the version.
+/// Poseidon2 root of the status list *and* its version: a fold over the entries,
+/// closed by one compression mixing in the version. The committee signs
+/// [`status_list_message`], its canonical 32-byte packing.
 ///
-/// This is the digest the whole protocol is built on. What the committee actually
-/// signs is [`status_list_message`], its canonical 32-byte packing — leanVM's XMSS
-/// takes raw bytes since v0.9 and does the field embedding itself.
+/// Folding the version in is what makes the cleartext `version` field
+/// trustworthy: a record attests to `(list, version)` jointly, so the version
+/// cannot be altered afterwards without breaking verification.
 ///
-/// Folding the version in (Option B) is what makes the cleartext `version` field
-/// trustworthy: a proof attests to `(list, version)` jointly, so the version
-/// cannot be altered after the fact without breaking verification. The version is
-/// split into 16-bit limbs so each stays below the KoalaBear modulus — a bare
-/// `u32` can exceed it and alias two distinct versions to the same field value.
+/// The version goes in as two 16-bit limbs so each stays below the KoalaBear
+/// modulus: a bare `u32` can exceed it and alias two versions to one field value.
 pub fn status_list_root_fe(list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
     let mut acc = [KoalaBear::ZERO; 8];
     for e in list {
@@ -142,19 +137,16 @@ pub fn status_list_root_fe(list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
     poseidon16_compress_pair(&acc, &ver)
 }
 
-/// The 32-byte message the committee signs, and the one the proof is bound to.
+/// The 32-byte message the committee signs, and what every record is bound to.
 ///
-/// leanVM's XMSS API takes a raw `[u8; 32]` and hashes it into the eight field
-/// elements the WOTS encoding consumes, so the Poseidon2 fold above is closed by
-/// a packing step instead of being handed to the signer as field elements. Each
-/// element goes out as its canonical `u32`, little-endian — exactly the encoding
-/// leanVM uses for its own SSZ objects.
+/// leanVM's XMSS takes raw bytes and does the field embedding itself, so the fold
+/// above is closed by packing each element as its canonical little-endian `u32`.
 ///
-/// The packing is injective, which is the only property the binding argument
-/// needs: a KoalaBear element has exactly one canonical representative below the
-/// modulus, so two distinct roots cannot pack to one message. Everything check 2
-/// of [`crate::snark_verifier_node::PQSNARKVerifierModule::verify`] claims about
-/// `(list, version)` therefore carries over unchanged from the fold.
+/// The packing is **injective**, which is the only property the binding argument
+/// needs: a KoalaBear element has one canonical representative below the modulus,
+/// so two distinct roots cannot pack to one message. Everything check 2 of
+/// [`crate::node::snark_verifier::PQSNARKVerifierModule::verify`] claims about
+/// `(list, version)` carries over unchanged from the fold.
 pub fn status_list_message(list: &[[u8; 32]], version: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (chunk, fe) in out
@@ -211,12 +203,11 @@ impl SnarkStatusList {
     /// Requires the aggregation bytecode to be initialized: `setup_prover()`
     /// or `setup_verifier()` MUST be called first.
     ///
-    /// The aggregate keeps leanVM's own encoding — it is the one object here that
-    /// cannot be an SSZ field, since decoding it needs the process-global bytecode.
-    /// It is canonicalized instead: `from_bytes` already refuses trailing bytes,
-    /// and re-encoding must reproduce the stored blob byte for byte, which is what
-    /// rules out the padded-varint spellings the format would otherwise admit. A
-    /// record therefore has exactly one wire form, proof included.
+    /// The aggregate is the one object here that cannot be an SSZ field, because
+    /// decoding it needs the process-global bytecode. It is canonicalized instead:
+    /// re-encoding must reproduce the stored blob byte for byte, which rules out
+    /// the alternative spellings leanVM's format would otherwise admit. A record
+    /// has exactly one wire form, proof included.
     pub fn proof(&self) -> Result<SingleMessageAggregateSignature, String> {
         let value = SingleMessageAggregateSignature::from_bytes(&self.zk_proof)
             .ok_or("proof not deserializable")?;
@@ -257,34 +248,31 @@ impl SnarkStatusList {
 /// The raw form: the `t` XMSS signatures themselves, plus a bitmap saying who
 /// produced them.
 ///
-/// A signer is named by its **index into the committee's member list**, which the
-/// anchor already fixes and authenticates. Against a list of identifiers — public
-/// keys, DIDs, names — that buys:
+/// A signer is named by its **index into the member list**, which the anchor
+/// already fixes and authenticates. Against a list of identifiers (public keys,
+/// DIDs, names) that buys:
 ///
 /// * **Structural distinctness.** A bit is set or it is not, so one member cannot
-///   appear twice. With a list you must remember to reject duplicates, and
-///   forgetting turns a `t`-of-`N` threshold into "one member signs `t` times".
-/// * **A canonical encoding.** A signer set has exactly one bitmap, where a list
-///   of `t` identifiers has `t!` orderings, all valid and all distinct on the
-///   wire — which breaks deduplication once records are content-addressed.
-/// * **No key material on the wire.** 25 bytes name any subset of 200 members.
+///   appear twice. A list must be deduplicated by hand, and forgetting turns
+///   `t`-of-`N` into "one member signs `t` times".
+/// * **A canonical encoding.** A signer set has exactly one bitmap, where `t`
+///   identifiers have `t!` orderings, all valid and all distinct on the wire,
+///   which breaks deduplication once records are content-addressed.
+/// * **No key material on the wire.** 26 bytes name any subset of 200 members.
 ///
-/// It does not hide the participation pattern: anyone holding the anchor learns
-/// who signed. That is unavoidable — a verifier cannot check a signature without
-/// knowing whose key to check it against.
-// Deliberately NOT `#[derive(Serialize, Deserialize)]`. The published encoding is
-// SSZ, via `to_bytes`/`from_bytes` and the `RawStatusListWire` schema. A derived
-// `Deserialize` is generated inside this module, so it builds the struct field by
-// field regardless of their privacy — a second construction path that skips both
-// `new` (sorting, duplicate and bound checks) and `from_bytes` (bitmap population
-// against signature count). That would make the guarantee `new` documents below
-// false for any caller who reached for serde instead.
+/// It does not hide *who* signed, and cannot: a verifier has to know whose key to
+/// check a signature against.
+// Deliberately not `#[derive(Deserialize)]`. A derived impl is generated inside
+// this module, so it builds the struct field by field regardless of privacy: a
+// construction path skipping both `new` (sorting, duplicates, bounds) and
+// `from_bytes` (bitmap population against signature count), which would make the
+// guarantee `new` documents below false for anyone who reached for serde.
 pub struct StatusList {
     pub alg: Algorithms,
     status_list: Vec<[u8; 32]>,
     version: u32,
     /// One bit per committee member. Its length is `N`, which only the anchor
-    /// knows — see [`crate::verifier_node::VerifierNode::verify_status_list`],
+    /// knows; see [`crate::node::raw_verifier::VerifierNode::verify_status_list`],
     /// which compares the two.
     signers: SignerBits,
     /// One signature per set bit, in ascending index order.
@@ -349,7 +337,7 @@ impl StatusList {
         self.status_list.clone()
     }
 
-    /// How many members the bitmap is sized for — the committee this record
+    /// How many members the bitmap is sized for: the committee this record
     /// claims to target. Meaningful only against an anchor, which is where it is
     /// checked.
     pub fn signer_slots(&self) -> usize {
@@ -361,7 +349,7 @@ impl StatusList {
         self.signers.num_set_bits()
     }
 
-    /// The signing members' indices, ascending — the same order as
+    /// The signing members' indices, ascending, the same order as
     /// [`StatusList::signatures`], so the two zip. Every index is `<
     /// signer_slots()` by construction.
     pub fn signer_indices(&self) -> impl Iterator<Item = usize> + '_ {
@@ -390,7 +378,7 @@ impl StatusList {
     /// Inverse of [`StatusList::to_bytes`].
     ///
     /// Decodes the SSZ schema and rejects a bitmap whose population does not
-    /// match the number of signatures — the one relation between two fields that
+    /// match the number of signatures, the one relation between two fields that
     /// no schema can express. The signatures are decoded by leanVM's own
     /// SSZ implementation, which fixes their length at 1208 bytes and refuses a
     /// field element outside the modulus, so a non-canonical encoding cannot be
@@ -523,7 +511,7 @@ mod tests {
 
     /// Check 2 of both verification paths is "the proof is bound to THIS list and
     /// THIS version". That is only worth anything if the message actually moves
-    /// when either does — the packing must not collapse the distinction the fold
+    /// when either does: the packing must not collapse the distinction the fold
     /// makes.
     #[test]
     fn the_message_moves_with_both_the_list_and_the_version() {
@@ -557,7 +545,7 @@ mod tests {
     /// A documented gap, pinned so it cannot change silently: the fold is
     /// sequential, so one logical revocation set has `n!` distinct roots. Sorting
     /// inside the fold would fix it and would break the wire format, which is why
-    /// it has not been done — see AGENTS.md, "Known gaps in the model".
+    /// it has not been done; see AGENTS.md, "Known gaps in the model".
     #[test]
     fn the_fold_is_order_sensitive() {
         let list = entries();

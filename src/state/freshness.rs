@@ -2,7 +2,7 @@
 //!
 //! `verify_proof` is stateless: an old but validly signed `(list, version)` pair
 //! verifies forever, so the cryptographic checks alone cannot stop a peer from
-//! replaying a stale record. For an authorization list that is a real attack — an
+//! replaying a stale record. For an authorization list that is a real attack: an
 //! old status list re-grants access to a node that has since been revoked. This
 //! gate is the missing memory: it records the highest version accepted so far and
 //! refuses anything that is not strictly newer.
@@ -25,7 +25,7 @@ use sha3::{Digest, Sha3_256};
 pub enum Decision {
     /// Strictly newer than the stored mark: it advanced and was persisted.
     Accepted,
-    /// Not newer than the stored high-water (carried here) — refused.
+    /// Not newer than the stored high-water (carried here): refused.
     Stale(u32),
 }
 
@@ -40,7 +40,7 @@ pub struct HighWaterMark {
 impl HighWaterMark {
     /// Loads the mark for the trust domain identified by `anchor`. If the file is
     /// missing, unreadable, or was written for a different anchor, the mark starts
-    /// empty — a rotated committee legitimately resets the counter.
+    /// empty: a rotated committee legitimately resets the counter.
     pub fn load(path: impl Into<PathBuf>, anchor: &[u8]) -> Self {
         let path = path.into();
         let fingerprint = fingerprint(anchor);
@@ -75,7 +75,7 @@ impl HighWaterMark {
         Decision::Accepted
     }
 
-    /// The same four durable steps as [`crate::atomic_slot_counter`]: write a
+    /// The same four durable steps as [`crate::state::slot_counter`]: write a
     /// temporary file, `fsync` its *contents*, `rename` over the target (atomic on
     /// POSIX, so no reader ever sees a half-written mark), then `fsync` the
     /// *directory* so the rename itself survives.
@@ -85,15 +85,15 @@ impl HighWaterMark {
     /// while the directory entry still pointed at the old mark, re-opening exactly
     /// the rollback window this gate exists to close.
     ///
-    /// It stays infallible — the gate is fail-**open** by design, and losing the
-    /// mark costs at most one stale record accepted once — but a failure is
+    /// It stays infallible: the gate is fail-**open** by design, and losing the
+    /// mark costs at most one stale record accepted once, but a failure is
     /// reported rather than swallowed, because a mark that silently stops
     /// persisting is indistinguishable from one that works.
     fn persist(&self) {
         let line = format!("{} {}\n", self.fingerprint, self.current);
         // Appended, not `with_extension`: see `atomic_slot_counter::sibling` for why
         // replacing the extension aliases distinct names onto one temporary file.
-        let tmp = crate::atomic_slot_counter::sibling(&self.path, "tmp");
+        let tmp = crate::state::slot_counter::sibling(&self.path, "tmp");
 
         let durable = || -> std::io::Result<()> {
             let mut f = File::create(&tmp)?;
@@ -124,7 +124,7 @@ fn fingerprint(anchor: &[u8]) -> String {
 }
 
 /// Parses `"<fingerprint> <version>"`, returning the version only if the
-/// fingerprint matches this domain — a different anchor means an unrelated
+/// fingerprint matches this domain: a different anchor means an unrelated
 /// counter, so we treat it as no mark at all.
 fn parse(s: &str, fingerprint: &str) -> Option<(u32, bool)> {
     let mut it = s.split_whitespace();
@@ -155,7 +155,7 @@ mod tests {
     fn only_strictly_newer_versions_advance_the_mark() {
         let mut hwm = HighWaterMark::load(scratch("strict"), b"anchor-A");
 
-        // Nothing accepted yet, so version 0 is still a real advance — this is why
+        // Nothing accepted yet, so version 0 is still a real advance: this is why
         // the type carries `have` instead of treating 0 as "empty".
         assert_eq!(hwm.current(), None);
         assert!(accepted(hwm.try_advance(0)));
@@ -194,7 +194,7 @@ mod tests {
 
     /// The mark is scoped to a trust domain. A version counter only totally-orders
     /// records under one committee, so a rotation must reset it rather than carry a
-    /// number that now means something else — and the old domain's mark must not be
+    /// number that now means something else, and the old domain's mark must not be
     /// destroyed in the process.
     #[test]
     fn a_different_anchor_is_a_different_domain() {

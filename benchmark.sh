@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
 # Reproducible benchmark of the committee status list, split-deployment aware.
 #
-# Measures four targets independently:
-#   prover    signs + aggregates N updates          (src/bin/prover.rs)
-#   verifier  verifies a FIXED artifact corpus      (src/bin/verifier.rs)
-#   combined  the single-process demo, for contrast (src/main.rs)
-#   raw_agg   crude multisig baseline, NO SNARK      (src/bin/raw_agg.rs)
-#             t raw XMSS sign+verify per update; verify scales with t, unlike the
-#             constant-time SNARK verify, and proof_size is the raw aggregate
-#             size (t signatures on the wire) rather than a proof
+# The deployment has three ROLES, and each is measured on the process that would
+# actually run it. No target is ever charged for another role's work:
+#   signer    ONE committee member, one signature + one durable slot burn per
+#             round                                 (src/bin/signer.rs)
+#   prover    the aggregator: N updates, prove only (src/bin/prover.rs)
+#   verifier  a relying party: verifies a FIXED artifact corpus
+#                                                   (src/bin/verifier.rs)
+# plus the baseline the SNARK has to beat:
+#   raw_agg   crude multisig, NO SNARK              (src/bin/raw_agg.rs)
+#             verify scales with t, unlike the constant-time SNARK verify, and
+#             proof_size is the raw aggregate size (t signatures + bitmap on the
+#             wire) rather than a proof
+#
+# `combined` (src/main.rs, the single-process demo) is NOT in the defaults. It
+# measures a process that proves and verifies at once, which is not a role anyone
+# deploys, and its numbers duplicate the prover's: same setup, prove within 0.5%,
+# peak RSS within 2%. It stays available as `TARGETS="... combined"` when an
+# independent second reading of prove time is wanted — that is what it is for.
+#
+# Only `signer` reports a `sign` row, and that is the point. In production nobody
+# produces t signatures: each member signs ONCE per round on its own machine and
+# broadcasts, and the aggregator receives t signatures and produces none. A `sign`
+# figure taken from a process that signs t times is the summed work of t machines
+# billed to one, and describes no process that exists. prover/raw_agg/combined
+# still produce their t signatures — a record needs them — but do not time them.
 #
 # Produces, in $OUTDIR:
 #   env.txt      full environment capture (reproducibility appendix)
@@ -32,7 +49,11 @@
 #   TARGETS="prover verifier" RUNS=50 ./benchmark.sh
 #   STRICT_ENV=1 PIN_CPUS=0-7 RUNS=30 ./benchmark.sh   # publication settings
 #   INTERLEAVE=0 ./benchmark.sh           # old block order, for back-comparison
-#   PROJECT_CM4=1 ./benchmark.sh          # adds an explicitly-labelled ESTIMATE
+#
+# Everything this script prints is MEASURED on the host it ran on. It does not
+# extrapolate to other hardware, and it should not be made to: `target-cpu=native`
+# already makes the binaries host-specific, so the way to get numbers for another
+# machine is to run this script there.
 set -euo pipefail
 
 # Every number here passes through `sort -g` and awk. Both honour LC_NUMERIC, and
@@ -43,11 +64,8 @@ export LC_ALL=C
 
 RUNS="${RUNS:-20}"
 WARMUP="${WARMUP:-2}"
-TARGETS="${TARGETS:-prover verifier combined raw_agg}"
+TARGETS="${TARGETS:-signer prover verifier raw_agg}"
 OUTDIR="${OUTDIR:-bench-$(date +%Y%m%d-%H%M%S)}"
-PROJECT_CM4="${PROJECT_CM4:-0}"
-CM4_LOW="${CM4_LOW:-8}"
-CM4_HIGH="${CM4_HIGH:-15}"
 
 # Run targets round-robin instead of in contiguous blocks (default: on).
 #
@@ -83,7 +101,7 @@ SUMMARY_TXT="$OUTDIR/summary.txt"
 # ---------------------------------------------------------------- build ----
 echo "building --release ..."
 cargo build --release >/dev/null 2>&1
-for b in prover verifier decentralized-root-of-trust raw_agg; do
+for b in signer prover verifier decentralized-root-of-trust raw_agg; do
   [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
 done
 
@@ -125,7 +143,7 @@ sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
   echo "stack ulimit     : $(ulimit -s)"
   echo
   echo "## Storage"
-  # raw_agg fsyncs twice per reserved slot inside its timed region, so its sign
+  # `signer` fsyncs twice per reserved slot INSIDE its timed region, so its sign
   # figure is a property of this filesystem as much as of the scheme. A near-full
   # filesystem allocates differently; record the fill level too.
   echo "TMPDIR           : ${TMPDIR:-/tmp}"
@@ -224,18 +242,18 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
 # the fixed-cost columns comparable across targets: `raw_agg` leaves `setup_ms`
 # empty because it has no circuit, which is the result, rather than borrowing the
 # column for its keygen and making the SNARK look like the cheaper setup.
-echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,proof_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures' > "$RUNS_CSV"
+echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,proof_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures' > "$RUNS_CSV"
 
 # Column indices into runs.csv, named once. Every awk gate and every summary row
 # below addresses columns through these, so inserting a column is one edit here
 # rather than a hunt through half a dozen hardcoded `$17`s — one of which is the
 # security gate, where a stale index fails open.
-C_SETUP=4;      C_KEYGEN=5;     C_SLOTSTATE=6;  C_ITEMS=7
-C_SIGN_MED=8;   C_SIGN_TOT=9
-C_PROVE_MED=10; C_PROVE_TOT=15
-C_VERIFY_MED=16; C_VERIFY_TOT=21
-C_PROOF=22;     C_RSS_SETUP=23; C_RSS_MAX=24
-C_PEAK=25;      C_KERNEL=26;    C_FAIL=27
+C_SETUP=4;       C_KEYGEN=5;      C_SLOTSTATE=6;  C_ITEMS=7
+C_SIGN_MED=8;    C_SIGN_TOT=13
+C_PROVE_MED=14;  C_PROVE_TOT=19
+C_VERIFY_MED=20; C_VERIFY_TOT=25
+C_PROOF=26;      C_RSS_SETUP=27;  C_RSS_MAX=28
+C_PEAK=29;       C_KERNEL=30;     C_FAIL=31
 
 RUN_T_START=""
 
@@ -243,6 +261,7 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
   local target="$1" rc=0
   local -a cmd
   case "$target" in
+    signer)   cmd=("$BIN_DIR/signer") ;;
     prover)   rm -rf "$SCRATCH/pout"; cmd=("$BIN_DIR/prover" "$SCRATCH/pout") ;;
     verifier) cmd=("$BIN_DIR/verifier" "$CORPUS") ;;
     combined) cmd=("$BIN_DIR/decentralized-root-of-trust") ;;
@@ -269,8 +288,8 @@ emit_run_row() { # $1 target  $2 run index
   local target="$1" run="$2" kmax; kmax="$(kernel_maxrss_mb)"
   local tag
   case "$target" in
-    prover) tag='^PROVER ' ;; verifier) tag='^VERIFIER ' ;; combined) tag='^BENCH ' ;;
-    raw_agg) tag='^RAW_AGG ' ;;
+    signer) tag='^SIGNER ' ;; prover) tag='^PROVER ' ;; verifier) tag='^VERIFIER ' ;;
+    combined) tag='^BENCH ' ;; raw_agg) tag='^RAW_AGG ' ;;
   esac
   local line; line="$(grep "$tag" "$SCRATCH/out.txt" || true)"
   [ -n "$line" ] || { echo "run $run ($target): record line missing" >&2; exit 1; }
@@ -280,12 +299,24 @@ emit_run_row() { # $1 target  $2 run index
     # `col()` drops empty cells, so an absent phase yields no summary row at all —
     # which is the honest answer, rather than a 0.000 ms that reads as "instant".
     setup=""; keygen=""; slotstate=""
-    sg_med=""; sg_tot=""
+    sg_med=""; sg_mean=""; sg_sd=""; sg_lo=""; sg_hi=""; sg_tot=""
     pv_med=""; pv_mean=""; pv_sd=""; pv_lo=""; pv_hi=""; pv_tot=""
     vf_med=""; vf_mean=""; vf_sd=""; vf_lo=""; vf_hi=""; vf_tot=""
-    if (t=="prover") {
+    if (t=="signer") {
+      # The only target that reports `sign`, and the only one whose keygen and
+      # slot state are ONE key and ONE counter rather than the whole committee.
+      # `setup` stays empty: a member builds no circuit. proof_size carries the
+      # signature size, which is what one member actually puts on the wire.
+      keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_rounds"]
+      sg_med=v["sign_med_ms"]; sg_mean=v["sign_mean_ms"]; sg_sd=v["sign_sd_ms"]
+      sg_lo=v["sign_min_ms"]; sg_hi=v["sign_max_ms"]; sg_tot=v["sign_total_ms"]
+      pb=v["sig_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_rounds_max_mb"]; pk=v["peak_rss_mb"]
+      # Every round self-verifies; a missing key means the run told us nothing.
+      f=(v["failures"]=="")?1:v["failures"]
+    } else if (t=="prover") {
+      # Aggregator. It signs to have something to aggregate, but does not time it:
+      # those t signatures come from t machines in a deployment, one each.
       setup=v["setup_ms"]; keygen=v["keygen_ms"]; n=v["n_updates"]
-      sg_med=v["sign_med_ms"]; sg_tot=v["sign_total_ms"]
       pv_med=v["prove_med_ms"]; pv_mean=v["prove_mean_ms"]; pv_sd=v["prove_sd_ms"]
       pv_lo=v["prove_min_ms"]; pv_hi=v["prove_max_ms"]; pv_tot=v["prove_total_ms"]
       pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]; f=0
@@ -307,26 +338,25 @@ emit_run_row() { # $1 target  $2 run index
       # being compared against. proof_size = the raw aggregate; the tamper sanity
       # check drives the failure gate.
       keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_updates"]
-      sg_med=v["sign_med_ms"]; sg_tot=v["sign_total_ms"]
       vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
       vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
       pb=v["agg_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["tamper_rejected"]=="1")?0:1
     } else {
       # `updates_total_ms` is the whole loop (sign + prove + verify + printing);
-      # the phase totals are what compare with the prover column. All three phases
-      # live in one process here, and all three are now carried: the sign figures
-      # were emitted by the binary and dropped on the floor at this line.
+      # the phase totals are what compare with the prover column. Prove and verify
+      # live in one process here and both are carried; signing happens too but is
+      # untimed, for the reason at the top of this file.
       setup=v["setup_total_ms"]; keygen=v["keygen_ms"]; n=v["n_updates"]
-      sg_med=v["upd_sign_med_ms"]; sg_tot=v["upd_sign_total_ms"]
       pv_med=v["upd_prove_med_ms"]
       pv_lo=v["upd_prove_min_ms"]; pv_hi=v["upd_prove_max_ms"]; pv_tot=v["upd_prove_total_ms"]
       vf_med=v["upd_verify_med_ms"]; vf_tot=v["upd_verify_total_ms"]
       pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["sec_ok"]=="1")?0:1
     }
-    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-      t,r,ts,setup,keygen,slotstate,n,sg_med,sg_tot,
+    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+      t,r,ts,setup,keygen,slotstate,n,
+      sg_med,sg_mean,sg_sd,sg_lo,sg_hi,sg_tot,
       pv_med,pv_mean,pv_sd,pv_lo,pv_hi,pv_tot,
       vf_med,vf_mean,vf_sd,vf_lo,vf_hi,vf_tot,
       pb,rs,rm,pk,k,f
@@ -336,13 +366,13 @@ emit_run_row() { # $1 target  $2 run index
   awk -v t="$target" -v r="$run" '
     /^SAMPLE / {
       delete v; for (i=2;i<=NF;i++){ split($i,kv,"="); v[kv[1]]=kv[2] }
-      if (v["target"]=="prover") {
-        printf "%s,%d,%s,sign,%s,%s,%s\n",  t,r,v["idx"],v["sign_ms"], v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,prove,%s,%s,%s\n", t,r,v["idx"],v["prove_ms"],v["bytes"],v["rss_mb"]
+      if (v["target"]=="signer") {
+        printf "%s,%d,%s,sign,%s,%s,%s\n",   t,r,v["idx"],v["sign_ms"],  v["bytes"],v["rss_mb"]
+      } else if (v["target"]=="prover") {
+        printf "%s,%d,%s,prove,%s,%s,%s\n",  t,r,v["idx"],v["prove_ms"], v["bytes"],v["rss_mb"]
       } else if (v["target"]=="verifier") {
         printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
       } else if (v["target"]=="raw_agg") {
-        printf "%s,%d,%s,sign,%s,%s,%s\n",   t,r,v["idx"],v["sign_ms"],  v["bytes"],v["rss_mb"]
         printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
       }
     }' "$SCRATCH/out.txt" >> "$SAMPLES"
@@ -397,13 +427,13 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
 
   # Fail fast. This used to run once, after every target had finished, so a
   # broken last target (raw_agg is last by default) discarded an hour of
-  # prover and combined runs. Checking after each row costs one awk pass and
+  # signer and prover runs. Checking after each row costs one awk pass and
   # turns that hour into one run.
   if [ "$(count_failed_runs)" -gt 0 ]; then
     echo
     echo "ABORT: $target run $((i - tw)) reported a security-expectation failure" >&2
     echo "(or an unparseable failure count). Numbers withheld." >&2
-    grep -E '^(PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
+    grep -E '^(SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
     exit 1
   fi
   if [ "$(count_bad_item_counts)" -gt 0 ]; then
@@ -411,14 +441,14 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
     echo "ABORT: $target run $((i - tw)) measured 0 items, or a different number of" >&2
     echo "items than earlier runs of the same target. A per-run median is only" >&2
     echo "meaningful over a fixed workload. Numbers withheld." >&2
-    grep -E '^(PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
+    grep -E '^(SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
     exit 1
   fi
 }
 
-# Per-target run counts: `prover` and `combined` cost ~70 s a run while
-# `verifier` costs ~6 s, so one global RUNS either wastes an hour or
-# under-samples the cheap target. RUNS_<target> overrides; RUNS is the default.
+# Per-target run counts: `prover` costs ~30 s a run while `signer` costs under a
+# second, so one global RUNS either wastes an hour or under-samples the cheap
+# targets. RUNS_<target> overrides; RUNS is the default.
 if [ "$INTERLEAVE" = 1 ]; then
   # Round-robin. Targets have different schedule lengths, so each one is stepped
   # only while it still has runs left; the longest simply finishes alone at the
@@ -508,13 +538,17 @@ done
 # from the metric name, which is the point of naming metrics after phases.
 label() {
   case "$1:$2" in
-    raw_agg:sign_per_item)   echo "sign / update (raw)" ;;
+    signer:keygen)           echo "keygen (1 key, once)" ;;
+    signer:slot_state)       echo "slot state (1 counter)" ;;
+    signer:sign_per_item)    echo "sign / round (1 member)" ;;
+    signer:sign_total)       echo "sign total / run" ;;
+    signer:proof_size)       echo "signature size" ;;
     raw_agg:verify_per_item) echo "verify / update (raw)" ;;
     raw_agg:proof_size)      echo "aggregate size (t sigs)" ;;
     *:setup)                 echo "setup (circuit, once)" ;;
     *:keygen)                echo "keygen (N keys, once)" ;;
     *:slot_state)            echo "slot state (counters)" ;;
-    *:sign_per_item)         echo "sign / update" ;;
+    *:sign_per_item)         echo "sign / round" ;;
     *:sign_total)            echo "sign total / run" ;;
     *:prove_per_item)        echo "prove / update" ;;
     *:prove_total)           echo "prove total / run" ;;
@@ -523,6 +557,10 @@ label() {
     *:proof_size)            echo "proof size" ;;
     # RSS is expanded once, in the header legend above; these four then use the
     # acronym alone, which is what keeps the varying part of each label visible.
+    # The first one is named after whatever fixed cost the target actually paid:
+    # signer and raw_agg build no circuit, so for them the column is post-keygen.
+    signer:rss_after_setup)  echo "RSS after keygen" ;;
+    raw_agg:rss_after_setup) echo "RSS after keygen" ;;
     *:rss_after_setup)       echo "RSS after setup" ;;
     *:rss_max)               echo "RSS max during work" ;;
     *:peak_rss_vmhwm)        echo "peak RSS (VmHWM)" ;;
@@ -563,19 +601,31 @@ label() {
       "$t" "$(label "$t" "$m")" "$u" "$n" $d "$mn" $d "$md" $d "$mx" $d "$mean" $d "$sd" "$cv" $d "$ci"
   done
 
-  # Headline comparison: the reason the split exists. Guard on the RAW columns,
-  # not on stats() output: stats() emits "0" for an empty column, so testing its
-  # result would pass with c=0 and divide by zero when a run omits these targets.
-  vp_raw="$(col verifier "$C_PEAK")"; cp_raw="$(col combined "$C_PEAK")"
-  if [ -n "$vp_raw" ] && [ -n "$cp_raw" ]; then
+  # Headline comparison: the reason the split exists, across the three processes
+  # that actually run in it. Guard on the RAW columns, not on stats() output:
+  # stats() emits "0" for an empty column, so testing its result would pass with
+  # c=0 and divide by zero when a run omits these targets.
+  #
+  # This used to read verifier-vs-combined, which measured the same reduction
+  # against a process nobody deploys. Prover and verifier are two real roles that
+  # already run apart, so comparing them is the same arithmetic with one fewer
+  # fiction — and adding the signer is what shows the span is 1000x, not 3x.
+  sp_raw="$(col signer "$C_PEAK")"
+  vp_raw="$(col verifier "$C_PEAK")"; pp_raw="$(col prover "$C_PEAK")"
+  if [ -n "$vp_raw" ] && [ -n "$pp_raw" ]; then
     vp="$(printf '%s\n' "$vp_raw" | stats | awk '{print $4}')"
-    cp="$(printf '%s\n' "$cp_raw" | stats | awk '{print $4}')"
+    pp="$(printf '%s\n' "$pp_raw" | stats | awk '{print $4}')"
+    sp=""; [ -n "$sp_raw" ] && sp="$(printf '%s\n' "$sp_raw" | stats | awk '{print $4}')"
     echo
-    echo "SPLIT VS COMBINED (median peak RSS)"
-    awk -v v="$vp" -v c="$cp" 'BEGIN{
-      printf "  verify-only process : %.0f MB\n", v
-      printf "  combined process    : %.0f MB\n", c
-      printf "  reduction           : %.1f%% (%.0f MB) for a node that only verifies\n", 100*(c-v)/c, c-v
+    echo "PEAK RSS BY ROLE (median) — why the deployment splits"
+    [ -n "$sp" ] && awk -v s="$sp" 'BEGIN{ printf "  member    (signer)  : %.0f MB\n", s }'
+    awk -v v="$vp" 'BEGIN{ printf "  verifier            : %.0f MB\n", v }'
+    awk -v p="$pp" 'BEGIN{ printf "  aggregator (prover) : %.0f MB\n", p }'
+    awk -v v="$vp" -v p="$pp" 'BEGIN{
+      printf "  a node that only verifies saves %.1f%% (%.0f MB) against proving\n", 100*(p-v)/p, p-v
+    }'
+    [ -n "$sp" ] && awk -v s="$sp" -v p="$pp" 'BEGIN{
+      if (s > 0) printf "  a node that only signs is %.0fx smaller than the aggregator\n", p/s
     }'
   fi
 
@@ -635,11 +685,20 @@ label() {
   echo "    total != n x per-update whenever the phase is skewed. Signing is: it"
   echo "    has stragglers several times the median, and its total runs visibly"
   echo "    above n x median. Verification is near-deterministic and does match."
-  echo "  * raw_agg's sign includes a durable slot burn (write + fsync + rename +"
-  echo "    fsync dir) before EVERY signature, because it signs through SignerNode."
-  echo "    prover/combined call xmss_sign directly and pay none of it, so their"
-  echo "    sign rows are not a like-for-like comparison — the gap is disk, not"
-  echo "    cryptography, and a prover made stateful-safe would close it."
+  echo "  * Exactly one target reports 'sign': signer, which measures ONE member"
+  echo "    doing ONE signature per round, preceded by its durable slot burn (write"
+  echo "    + fsync + rename + fsync dir) through SignerNode. prover, combined and"
+  echo "    raw_agg still produce t signatures — a record needs them — but do not"
+  echo "    time them: in a deployment those t signatures come one each from t"
+  echo "    machines, so timing the loop would bill a committee's work to one node."
+  echo "  * signer's keygen and slot-state rows are for ONE key and ONE counter;"
+  echo "    prover/raw_agg report the whole committee's N. Do not read them as the"
+  echo "    same quantity — divide by N first, or compare signer against N=1."
+  echo "  * A member's signing cost is IDENTICAL on both published forms: same key,"
+  echo "    same 32-byte message, same derived slot. What the two paths differ in is"
+  echo "    only how the quorum is evidenced (t signatures + bitmap vs one proof)"
+  echo "    and what a relying party pays to check it. So the signer row applies"
+  echo "    unchanged to the SNARK and the raw path alike."
 
   # Derived from THIS sweep, never remembered. This block used to print figures
   # from an older run (406 ms at t=70, 718 ms at t=128) as if they were results,
@@ -661,39 +720,6 @@ label() {
     }'
   fi
 
-  if [ "$PROJECT_CM4" = 1 ]; then
-    echo
-    echo "RASPBERRY CM4 (BCM2711) PROJECTION — ESTIMATE, NOT A MEASUREMENT"
-    echo "  Naive linear scaling x${CM4_LOW}..x${CM4_HIGH} of host wall-clock. It ignores"
-    echo "  microarchitecture, memory bandwidth and thermal behaviour. Do not"
-    echo "  publish these as results; run benchmark.sh natively on the board."
-    # Column -> metric name, so the projected rows carry the same labels as the
-    # table above and a target silently skips the phases it never ran.
-    cm4_metric() {
-      case "$1" in
-        "$C_SETUP")      echo setup ;;
-        "$C_KEYGEN")     echo keygen ;;
-        "$C_SIGN_MED")   echo sign_per_item ;;
-        "$C_PROVE_MED")  echo prove_per_item ;;
-        "$C_VERIFY_MED") echo verify_per_item ;;
-      esac
-    }
-    for target in $TARGETS; do
-      for c in "$C_SETUP" "$C_KEYGEN" "$C_SIGN_MED" "$C_PROVE_MED" "$C_VERIFY_MED"; do
-        # Guard on the RAW column, not on stats() output: stats() prints
-        # "0 0 0 ..." for an empty column, so `[ -n "$v" ]` never fires and a
-        # target with no data prints a bogus "host 0.0 ms -> CM4 0.0 .. 0.0 ms"
-        # row. Same trap the SPLIT VS COMBINED block above documents.
-        raw="$(col "$target" "$c")"
-        [ -n "$raw" ] || continue
-        v="$(printf '%s\n' "$raw" | stats | awk '{print $4}')"
-        awk -v t="$target" -v l="$(label "$target" "$(cm4_metric "$c")")" \
-            -v m="$v" -v a="$CM4_LOW" -v b="$CM4_HIGH" 'BEGIN{
-          printf "  %-9s %-23s host %8.1f ms  ->  CM4 %8.1f .. %8.1f ms\n", t, l, m, m*a, m*b }'
-      done
-    done
-    echo "  RAM does not scale with CPU: the peak figures above carry over unchanged."
-  fi
 } | tee "$SUMMARY_TXT"
 
 echo

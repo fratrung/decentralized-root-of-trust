@@ -3,7 +3,7 @@
 //! Deliberately reports the whole shape (min / median / max) rather than a lone
 //! mean: prove and verify times are right-skewed by scheduler and allocator
 //! effects, so a mean alone misrepresents them. `benchmark.sh` consumes the raw
-//! per-sample records anyway — these aggregates are for the human-readable run.
+//! per-sample records anyway; these aggregates are for the human-readable run.
 
 /// A series of millisecond measurements.
 pub struct Series(Vec<f64>);
@@ -83,7 +83,7 @@ mod tests {
 
     /// The constructor sorts, so every order statistic below is a claim about the
     /// *multiset*. If this stopped holding, `median` would silently start
-    /// reporting "whatever landed in the middle of the input" — which for a
+    /// reporting "whatever landed in the middle of the input", which for a
     /// benchmark is a number that looks plausible and means nothing.
     #[test]
     fn the_order_of_the_samples_does_not_change_any_statistic() {
@@ -102,7 +102,7 @@ mod tests {
     }
 
     /// Both parities, because the even case is the one with an arithmetic step in
-    /// it — and an off-by-one in the index would still return a plausible sample.
+    /// it, and an off-by-one in the index would still return a plausible sample.
     #[test]
     fn the_median_handles_both_parities_and_the_degenerate_sizes() {
         // Odd: the middle sample itself.
@@ -166,8 +166,8 @@ mod tests {
     }
 
     /// An empty series returns 0.0 from every accessor rather than panicking or
-    /// producing `0/0 = NaN`. That is a *sentinel*, not a measurement — "0.0 ms"
-    /// is indistinguishable from a real zero — so the binaries assert non-emptiness
+    /// producing `0/0 = NaN`. That is a *sentinel*, not a measurement ("0.0 ms"
+    /// is indistinguishable from a real zero), so the binaries assert non-emptiness
     /// before they format anything. This test pins the behaviour so the assertion
     /// upstream stays the thing that catches it.
     #[test]
@@ -202,7 +202,7 @@ mod tests {
         let _ = Series::new([1.0, f64::NAN, 2.0]);
     }
 
-    /// Infinities are not NaN, so they sort — and must land at the ends rather
+    /// Infinities are not NaN, so they sort, and must land at the ends rather
     /// than anywhere in the middle. This is not expected to occur; it is here so
     /// that if it ever does, the median stays a real sample.
     #[test]

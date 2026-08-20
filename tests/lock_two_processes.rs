@@ -2,7 +2,7 @@
 //!
 //! `atomic_slot_counter`'s unit tests cover the lock from a second thread, which
 //! is not the property the module claims. The claim is that two *processes*
-//! cannot hand out the same slot for one key — and a same-process test cannot
+//! cannot hand out the same slot for one key, and a same-process test cannot
 //! distinguish a real `flock` from a `static Mutex` that happens to be in the
 //! binary. This one re-executes the test binary and lets the operating system
 //! arbitrate, which is the only way the answer means anything.
@@ -11,8 +11,8 @@
 //! costs. XMSS is stateful: two live holders of one key both issuing slot `s`
 //! means two signatures under `(key, s)`, which leaks the WOTS hash chains and
 //! destroys the key. The counter is the only thing standing between "two nodes
-//! were started from the same state directory" — an ordinary operational mistake,
-//! a copied unit file, a container restarted before the old one died — and that.
+//! were started from the same state directory" (an ordinary operational mistake,
+//! a copied unit file, a container restarted before the old one died) and that.
 //!
 //! ## How the two halves talk
 //!
@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use decentralized_root_of_trust::atomic_slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
+use decentralized_root_of_trust::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 use lean_multisig::{XmssPublicKey, xmss_key_gen_from_seed};
 
 const GENESIS: u32 = 100;
@@ -40,7 +40,7 @@ const BUSY: &str = "PROBE=busy";
 const ACQUIRED: &str = "PROBE=acquired:";
 const DIRECT: &str = "PROBE=invoked-directly";
 
-/// Seeds are `[FILE, ns, member, 0, ..]`, file 4 here — see
+/// Seeds are `[FILE, ns, member, 0, ..]`, file 4 here; see
 /// `tests/snark_path.rs` for why the tag exists. Nothing in this file signs, so
 /// no slot is ever consumed by a key; the seed only has to be *stable* across the
 /// two processes, since the counter's state file is bound to the key's
@@ -86,7 +86,7 @@ fn scratch() -> PathBuf {
 }
 
 /// The child half. Ignored so it is never collected by a normal run; the parent
-/// invokes it explicitly. It reports rather than asserts — deciding what the
+/// invokes it explicitly. It reports rather than asserts: deciding what the
 /// answer *should* be is the parent's job, and a child that panicked would be
 /// indistinguishable from one that could not start.
 #[test]
@@ -124,7 +124,7 @@ fn a_second_process_cannot_hold_one_key_at_the_same_time() {
     assert_eq!(
         probe(&state),
         BUSY,
-        "a second process was allowed to open a counter the first still holds — \
+        "a second process was allowed to open a counter the first still holds: \
          both would issue slot {}, and the key is gone",
         counter.next_slot()
     );
@@ -142,7 +142,7 @@ fn a_second_process_cannot_hold_one_key_at_the_same_time() {
     assert_eq!(
         marker,
         format!("{ACQUIRED}{}", GENESIS + 3),
-        "after the holder exits the lock must be free — and the new process must \
+        "after the holder exits the lock must be free, and the new process must \
          resume from the slot the first one durably burned, not from the start of \
          the window"
     );

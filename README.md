@@ -57,7 +57,7 @@ that tests it:
 |---|---|
 | A quorum of the committee — and nothing else — can authorize an update | five checks in `PQSNARKVerifierModule::verify`, exercised by the forgery corpus |
 | Evidence cannot be lifted from one list, version or slot onto another | `attack-tampered`, `attack-outsider`, `attack-version` must all be rejected |
-| A stale but validly signed record cannot be replayed | the persistent anti-rollback gate in [`src/freshness.rs`](src/freshness.rs) |
+| A stale but validly signed record cannot be replayed | the persistent anti-rollback gate in [`src/state/freshness.rs`](src/state/freshness.rs) |
 | Aggregation is worth its cost above some `t`, and is not below it | [Benchmark](#benchmark), which measures both forms on the same host |
 
 Two properties are treated as safety-critical rather than best-effort, because
@@ -66,7 +66,7 @@ their failure modes are silent and unrecoverable:
 - **XMSS is stateful.** A `(key, slot)` pair that signs twice leaks enough of the
   WOTS hash chains to forge for that slot. Slot allocation therefore goes through
   a durable, crash-safe counter that burns a slot *before* the key touches it
-  ([`src/atomic_slot_counter.rs`](src/atomic_slot_counter.rs)).
+  ([`src/state/slot_counter.rs`](src/state/slot_counter.rs)).
 - **Verification is stateless.** An old record verifies forever, so the
   cryptography alone cannot refuse a rollback. That is a separate, explicitly
   stateful gate.
@@ -378,29 +378,37 @@ removed, and verifies none of them.
 
 ```
 src/
-  status_list.rs        StatusList (raw + bitmap) and SnarkStatusList, versioned Poseidon2 root, wire format
-  committee.rs          Committee anchor: members, threshold, genesis_slot, slot_for, wire encoding
-  atomic_slot_counter.rs durable monotonic slot allocator: reserve, reserve_at, fsync + cross-process lock
-  signer_node.rs        one member: XMSS keypair + its counter; sign (local slot) and sign_at (protocol slot)
-  verifier_node.rs      raw-path relying party: verify (one signature) and verify_status_list (the whole record)
-  freshness.rs          HighWaterMark: persistent, anchor-scoped anti-rollback gate
+  lib.rs                module roots and compatibility re-exports for local scratch binaries
+  protocol/
+    mod.rs
+    committee.rs        Committee anchor: members, threshold, genesis_slot, slot_for, index_of, wire encoding
+    status_list.rs      StatusList (raw + bitmap) and SnarkStatusList, versioned Poseidon2 root, wire format
+  node/
+    mod.rs
+    signer.rs           one member: XMSS keypair + its counter; sign (local slot) and sign_at (protocol slot)
+    raw_verifier.rs     raw-path relying party: verify (one signature) and verify_status_list (the whole record)
+    snark_prover.rs     the prover: make_proof (slot derived from the anchor), aggregate, sign_and_prove
+    snark_verifier.rs   the SNARK relying party: the five checks, is_newer, select_freshest(_above)
+  state/
+    mod.rs
+    slot_counter.rs     durable monotonic slot allocator: reserve, reserve_at, fsync + cross-process lock
+    freshness.rs        HighWaterMark: persistent, anchor-scoped anti-rollback gate
+  bench/
+    mod.rs
+    mem.rs              VmRSS / VmHWM probes
+    stats.rs            descriptive statistics for the benchmark records
   params.rs             demo parameters (SLOT, N_MEMBERS, T, N_UPDATES, KEY_SLOTS, LOG_INV_RATE)
-  mem.rs                VmRSS / VmHWM probes
-  stats.rs              descriptive statistics for the benchmark records
   main.rs               combined demo: setup, N updates, 3 security tests, BENCH record
-  bin/prover.rs         split deployment: signs and aggregates, writes artifacts, never verifies
+  bin/signer.rs         split deployment: ONE member, one signature + one durable slot burn per round
+  bin/prover.rs         split deployment: the aggregator, writes artifacts, never verifies
   bin/verifier.rs       split deployment: verify-only, calls setup_verifier() alone
   bin/raw_agg.rs        the same protocol without a SNARK, through SignerNode / VerifierNode
-  snark_prover_node.rs  the prover: make_proof (slot derived from the anchor), aggregate, sign_and_prove
-  snark_verifier_node.rs the SNARK relying party: the five checks, is_newer, select_freshest(_above)
 tests/
   raw_path_round.rs     end-to-end: rotating quorums over durable counters, then the rollback refusal
   snark_path.rs         the five checks of PQSNARKVerifierModule::verify, each broken in isolation
   snark_modules.rs      the two SNARK node types as the binaries use them (slot derived from the anchor)
   lock_two_processes.rs the cross-process slot lock, checked by re-executing the test binary
   hostile_bytes.rs      the decoders against attacker-written bytes: no panic, no bomb, no forgery
-examples/
-  footprint.rs          RAM cost of setup_prover vs setup_verifier
 docs/
   architecture.svg / .png    the diagram at the top of this file
 benchmark.sh            reproducible multi-run benchmark (env capture, tidy CSV, CI95)
@@ -448,6 +456,7 @@ stack) and `target-cpu=native`.
 ```sh
 cargo run --release --bin decentralized-root-of-trust   # the SNARK demo, one process
 cargo run --release --bin raw_agg                       # the same protocol, no SNARK
+cargo run --release --bin signer                        # one member alone: sign + durable slot burn
 ```
 
 Example output (shape):
@@ -456,7 +465,7 @@ Example output (shape):
 setup...
 committee N=10 t=7; 10 updates rotating the signers
 
-  update  1/10  signers ABCDEFG  slot 43  prove=...ms  verify=...ms  RAM=... MB  OK
+  update  1/10  signers 0..6 (7)  v0  slot 43  prove=...ms  verify=...ms  RAM=... MB  OK
   ...
 --- Security (expected: all REJECTED) ---
 A) tampered list + valid proof : rejected = true
@@ -474,13 +483,8 @@ BENCH setup_verifier_ms=... upd_prove_med_ms=... peak_rss_mb=... sec_ok=1
 
 The prover **setup is paid once per process** (not persisted across restarts);
 subsequent proofs in the same process reuse it. In production, keep the prover
-process alive.
-
-RAM footprint of setup alone:
-
-```sh
-cargo run --release --example footprint -- prover   # or: verifier | none
-```
+process alive. `benchmark.sh` captures the setup-resident and peak RSS figures
+from the actual role binaries.
 
 ---
 
@@ -526,15 +530,16 @@ quantity behind every memory row in this document):
 
 At the **small** committee (`N=10, t=7`), median of 30 runs:
 
-| | prover | verifier | combined demo |
+| | prover | verifier | member (`signer`) |
 |---|---|---|---|
-| resident after setup | 786 MB | **676 MB** | 754 MB |
-| peak RSS | 1082 MB | **694 MB** | 1049 MB |
+| resident after setup / keygen | 786 MB | **676 MB** | ~2 MB |
+| peak RSS | 1082 MB | **694 MB** | **~2 MB** |
 
-**36% less peak RAM** for a node that only verifies. The saving grows with the
-committee, because only the prover's side scales: at the current defaults
-(`N=200, t=128`, see [Reference numbers](#reference-numbers)) the same three
-figures are 2053 / 692 / 2014 MB — a **66%** reduction. The verifier's peak is
+**36% less peak RAM** for a node that only verifies, and three orders of magnitude
+less for one that only signs. The saving grows with the committee, because only
+the prover's side scales: at the current defaults (`N=200, t=128`, see
+[Reference numbers](#reference-numbers)) the first two become 2053 / 692 MB — a
+**66%** reduction — while the member stays at ~2 MB. The verifier's peak is
 essentially constant in `t`; the prover's is not.
 
 The more useful property is the *slope*: the verifier's RSS is flat in the number
@@ -545,7 +550,7 @@ Since the verifier's only input is the anchor plus the published structure, the
 artifact directory can simply be copied to the target device:
 
 ```sh
-scp -r artifacts/ pi@cm4:~/ && ssh pi@cm4 ./verifier ~/artifacts
+scp -r artifacts/ host:~/ && ssh host ./verifier ~/artifacts
 ```
 
 Each `prover` run generates a **fresh random committee**, so artifacts from
@@ -558,20 +563,25 @@ different runs are not interchangeable — start from a clean directory.
 ```sh
 ./benchmark.sh                                    # defaults: RUNS=20, WARMUP=2
 RUNS=30 WARMUP=3 ./benchmark.sh
-TARGETS="prover verifier" RUNS=50 ./benchmark.sh
+TARGETS="signer prover verifier" RUNS=50 ./benchmark.sh
 STRICT_ENV=1 PIN_CPUS=0-7 RUNS=30 ./benchmark.sh  # settings for numbers you publish
-PROJECT_CM4=1 ./benchmark.sh                      # adds an explicitly-labelled ESTIMATE
 ```
 
-It measures four targets independently — `prover`, `verifier`, `combined` (the
-single-process demo) and `raw_agg` (the no-proof baseline: `t` individual
-`xmss_sign`/`xmss_verify` calls, which is what the SNARK has to beat) — and
-writes to `bench-<timestamp>/`:
+It measures **one target per role**, each on the process that would actually run
+it — `signer` (one committee member), `prover` (the aggregator), `verifier` (a
+relying party) — plus `raw_agg`, the no-proof baseline that the SNARK has to beat.
+It writes to `bench-<timestamp>/`:
+
+`combined` (`src/main.rs`, the single-process demo) is **not** in the defaults. It
+measures a process that proves and verifies at once, which is not a role anyone
+deploys, and its numbers duplicate the prover's: same setup, `prove` within 0.5%,
+peak RSS within 2%. Add it with `TARGETS="... combined"` when an independent
+second reading of prove time is what you want — that is what it is good for.
 
 | file | contents |
 |---|---|
 | `env.txt` | CPU, governor, turbo/SMT, THP, ASLR, toolchain, git commit, pinned leanVM rev, parameters — the reproducibility appendix |
-| `samples.csv` | tidy raw data, one row per individual update/verification, for `prover`, `verifier` and `raw_agg` (the `combined` demo reports per-run aggregates only) |
+| `samples.csv` | tidy raw data, one row per individual round/update/verification (the `combined` demo, if enabled, reports per-run aggregates only) |
 | `runs.csv` | one row per process run |
 | `summary.csv` / `.txt` | aggregates: n, min, q1, median, q3, max, mean, sd, CV%, CI95 |
 
@@ -594,8 +604,8 @@ Design points that matter if you quote these numbers:
 - Phases are recorded under **their own names** — `sign_*`, `prove_*`,
   `verify_*` — and a target leaves blank the ones it does not run, so no column
   ever holds two different quantities. Each `<phase>_total_ms` is the sum of that
-  phase alone, not the wall clock of the update loop, which for `combined` also
-  contains the other two phases and the printing.
+  phase alone, not the wall clock of the update loop, which also contains the
+  other phases and the printing.
 - **Fixed costs are three separate rows**, because they are three different
   things: `setup` is the leanVM circuit (the SNARK path's *extra* cost — the raw
   path has no setup row at all), `keygen` is the *N*-key generation that every
@@ -610,11 +620,24 @@ Design points that matter if you quote these numbers:
   do not satisfy `total = n × per-update` unless the phase is symmetric.
   Verification is near-deterministic and does match; signing has stragglers
   several times the median and its total sits visibly above `n × median`.
-- The `sign` rows of `raw_agg` and of `prover`/`combined` are **not
-  like-for-like**: `raw_agg` signs through `SignerNode`, so every signature is
-  preceded by a durable slot burn (write, `fsync`, rename, `fsync` dir), while
-  the SNARK binaries call `xmss_sign` directly and pay none of it. The gap is
-  disk, not cryptography.
+- **Only `signer` reports a `sign` row.** In production nobody produces `t`
+  signatures: each member signs *once* per round on its own machine and
+  broadcasts, and the aggregator receives `t` and produces none. A `sign` figure
+  taken from a process that signs `t` times is the summed work of `t` machines
+  billed to one, and describes no process that exists — which is what the old
+  `sign / update` column did, reading ~1 s at `t=128`. `prover`, `combined` and
+  `raw_agg` still *produce* their `t` signatures, because a record needs them;
+  they simply do not time them. The `signer` target signs through `SignerNode`,
+  so its figure includes the durable slot burn (write, `fsync`, rename, `fsync`
+  dir) that a safe stateful signer cannot skip.
+- **The `signer` row applies to both paths unchanged.** A member's signing cost is
+  identical whichever form is published — same key, same 32-byte message, same
+  slot derived from the anchor — so what separates the raw path from the SNARK
+  path is only how the quorum is evidenced and what a relying party pays to check
+  it.
+- **`signer`'s fixed costs are for one member**: one key, one counter. `prover`
+  and `raw_agg` report the whole committee's `N`. Do not read them as the same
+  quantity.
 - **`n_items`** records how many updates or verifications each run actually
   measured. A run that measured zero would otherwise report `0.000 ms` medians,
   which is indistinguishable from a very fast result; the script aborts on a zero
@@ -632,9 +655,10 @@ Design points that matter if you quote these numbers:
   governor is `performance`, GNU `time` is present and `Cargo.lock` exists —
   otherwise those are warnings.
 
-The CM4 projection is opt-in and is a **linear extrapolation, not a
-measurement**. For real numbers, run `benchmark.sh` natively on the board (an
-aarch64/NEON path exists).
+Everything the script prints is **measured on the host it ran on**, and nothing is
+extrapolated to other hardware. `target-cpu=native` already makes the binaries
+host-specific, so the way to get numbers for another machine is to run
+`benchmark.sh` there.
 
 ### Reference numbers
 
@@ -645,75 +669,99 @@ n=30 runs.
 > re-run on a quiesced host before they can be quoted again. Sizes are current:
 > they are deterministic, and the raw record shrank from ≈189 KB to ≈155 KB when
 > `XmssSignature` became a fixed 1208-byte SSZ object. The proof is unchanged.
+> The `signer` target is newer still and has never been swept, so its timings are
+> marked *re-run pending* rather than filled in with a plausible number.
 
 **Current defaults — `N=200, t=128`, 20 updates:**
 
-Each *update* is one publication of a new status-list version. Three distinct
-phases are timed separately, and "/ update" always means **per published update**,
-never per signature:
+Each *update* is one publication of a new status-list version. Each phase is
+measured on the process that would perform it, and "/ update" always means **per
+published update**, never per signature:
 
-| phase | what it does |
+| phase | who pays it | what it does |
+|---|---|---|
+| `sign` | each quorum member, on its own machine | one XMSS signature per round, preceded by a durable slot burn |
+| `prove` | the aggregator | the `t` collected signatures become one SNARK (SNARK path only) |
+| `verify` | a relying party | checks the evidence for **one** update: decode, committee membership of the signers, message/version binding, quorum ≥ `t`, then the aggregate itself |
+
+**Per member, per round.** A member signs *once* and broadcasts; it never
+produces `t` signatures, so this cost does not scale with the committee. It is
+also **identical on both published forms** — same key, same 32-byte message, same
+slot derived from the anchor — so it factors out of every comparison below:
+
+| metric | signer |
 |---|---|
-| `sign` | the `t` quorum members each produce one XMSS signature |
-| `prove` | those `t` signatures are aggregated into one SNARK (SNARK path only) |
-| `verify` | a relying party checks the evidence for **one** update: decode, committee membership of the `t` signers, message/version binding, quorum ≥ `t`, then the aggregate itself |
+| keygen (1 key × 65 slots, once) | re-run pending |
+| slot state (1 durable counter, once) | re-run pending |
+| sign / round (incl. durable slot burn) | re-run pending |
+| signature on the wire | 1 208 B |
+| peak RSS (VmHWM) | **~2 MB** |
 
-| metric | prover | verifier | combined | raw XMSS (no proof) ‡ |
-|---|---|---|---|---|
-| setup (once/process) | ~5.21 s | ~5.11 s | ~5.09 s | none |
-| sign / update (`t` sigs) | 917 ms | — | 917 ms | 950 ms |
-| **prove / update** | ~718 ms&nbsp;† | — | **718 ms** | — |
-| **verify / update** | — | **31.3 ms** | 31.3 ms | 54.3 ms |
-| bytes / update | 234 208 B | — | 233 846 B | 155 018 B |
-| resident after setup | 792 MB | **676 MB** | 755 MB | 3 MB |
-| peak RSS (VmHWM) | 2053 MB | **692 MB** | 2014 MB | **3 MB** |
+That last row is the one to keep: a member holds one key and one counter, so its
+resident memory is measured in **megabytes** against the aggregator's gigabytes —
+a factor of ~1000, and the reason the two roles do not have to run on the same
+class of machine.
 
-The `sign` row is the one that is easy to misread: **both paths pay it**. The
-SNARK aggregates genuine XMSS signatures, it does not replace them. So the
-marginal cost of proving is +76% on top of a production cost both schemes share
-(950 ms → ~1 670 ms), not "718 ms against zero".
+**Per update, aggregator and relying party:**
+
+| metric | prover | verifier | raw XMSS (no proof) |
+|---|---|---|---|
+| setup (once/process) | ~5.21 s | ~5.11 s | none |
+| **prove / update** | **~718 ms**&nbsp;† | — | — |
+| **verify / update** | — | **31.3 ms** | 54.3 ms |
+| bytes / update | 234 208 B | — | 155 018 B |
+| resident after setup | 792 MB | **676 MB** | 3 MB |
+| peak RSS (VmHWM) | 2053 MB | **692 MB** | **3 MB** |
+
+The two `setup` figures differ by ~150 ms, about 3%. Nearly all of it is the
+aggregation bytecode, which **both** roles need; the arena and the DFT twiddles
+that only `setup_prover()` adds are noise next to it. The prover's extra cost over
+the verifier is not time — it is the gigabyte of RAM in the last row.
+
+Neither path replaces signing: the SNARK aggregates genuine XMSS signatures, and
+the raw form publishes them directly. The `sign` cost is therefore common to both
+and paid by different machines than either column above, which is why it has its
+own table and not a row here.
 
 Committee keygen (200 keys × 65 slots) is a further ~3.65 s, paid once. It is
 **not** part of the `setup` row: `setup` is the leanVM circuit and nothing else,
 while keygen is paid by every path including the raw one, which is why
 `benchmark.sh` gives it a row of its own on every target. The raw path
 additionally pays a `slot state` row (~0.6 s): `N` durable `AtomicSlotCounter`s,
-one `fsync`'d file each.
+one `fsync`'d file each. Both are `N`-wide because those binaries stand in for the
+whole committee — a real member pays one of each, which is the `signer` table.
 
 Raw XMSS needs **no circuit setup at all** — it is pure Poseidon2, with no WHIR
 bytecode to materialise. That absence is itself a result, and it shows up as an
 empty `setup` row.
 
 † The `prover` target's own reading was contaminated by external CPU contention
-in that sweep, so the figure comes from the independent `combined` target
-(718.12 ms, CV 3.6%), which agrees with the clean prover window to 0.1%. Flat
-`setup_ms` across a sweep with a moving prove time is how contention is told
-apart from a regression: the single-threaded setup is unaffected, the
-multi-threaded prove is not.
+in that sweep, so the figure comes from a second, independent process measured in
+the same sweep (718.12 ms, CV 3.6%), which agrees with the clean part of the
+prover window to 0.1%. Flat `setup_ms` across a sweep with a moving prove time is
+how contention is told apart from a regression: the single-threaded setup is
+unaffected, the multi-threaded prove is not. That cross-check is the one thing the
+`combined` target is still good for, and why it remains available.
 
 prove/update is strongly governor-sensitive: on `schedutil` the same measurement
 inflates by ~60% because the CPU underclocks the sustained prover — always pin
 `performance` before quoting prove time. Memory does not depend on the governor.
 
-‡ `raw_agg` signs through `SignerNode`, so each signature is preceded by a
-durable slot burn that `prover.rs` never pays. Compare *verify* and *size* across
-the two paths freely; compare *sign* knowing only one side pays for durability.
-
 **Small committee — `N=10, t=7`:**
 
-| metric | prover | verifier | combined |
-|---|---|---|---|
-| setup (once/process) | ~5.05 s | ~4.96 s | ~5.05 s |
-| **prove / update** | **~170 ms** | — | ~167 ms |
-| verify / update | — | **~28 ms** | ~30 ms |
-| proof size | ~170 KB | — | ~170 KB |
-| resident after setup | 786 MB | **676 MB** | 754 MB |
-| peak RSS (VmHWM) | 1082 MB | **694 MB** | 1049 MB |
+| metric | prover | verifier |
+|---|---|---|
+| setup (once/process) | ~5.05 s | ~4.96 s |
+| **prove / update** | **~170 ms** | — |
+| verify / update | — | **~28 ms** |
+| proof size | ~170 KB | — |
+| resident after setup | 786 MB | **676 MB** |
+| peak RSS (VmHWM) | 1082 MB | **694 MB** |
 
 ### Where the SNARK starts paying off
 
-The `raw_agg` baseline costs **0.424 ms and exactly 1 208 B per signature**, both
-strictly linear in `t` — the byte figure is `SIGNATURE_SSZ_LEN`, a constant of the
+The `raw_agg` baseline costs **0.424 ms to verify and exactly 1 208 B on the wire,
+per signature**, both strictly linear in `t` — the byte figure is `SIGNATURE_SSZ_LEN`, a constant of the
 scheme rather than a measurement. The SNARK's verify cost and proof size grow
 roughly *logarithmically*, and its verifier memory does not grow at all. Across
 the two operating points:
@@ -738,23 +786,26 @@ root and never the members' public keys. The break-even points follow:
   figures are projections off two operating points; the raw side of them is exact
   arithmetic, the proof side is not.
 - **Verifier RAM: never.** 692 MB against 3 MB is a fixed floor the SNARK never
-  recovers, at any `t`. Irrelevant on a server, disqualifying on a small board.
+  recovers, at any `t`. Whether that disqualifies the SNARK verifier depends
+  entirely on where it runs.
 
-Counting production cost too, the SNARK wins on *total system* CPU once the
-number of relying parties `V` exceeds ~30:
+Counted across the whole system, the SNARK wins on total CPU per update once the
+number of relying parties `V` exceeds ~32:
 
 ```
-raw   :  950 + 54.6·V
-SNARK : 1635 + 31.9·V      →  break-even at V ≈ 30
+raw   :         54.6·V
+SNARK : 718  +  31.9·V      →  break-even at V = 718 / 22.7 ≈ 32
 ```
 
-The `t` signatures are common to both sides and largely cancel; what remains is
-that proving is a fixed cost paid **once** by whoever publishes an update, while
-verification is the cost that **multiplies** across every relying party. In a
-decentralised root of trust those number in the thousands, so the break-even is
-not close.
+Signing does not appear on either side, and that is not an omission: a member
+pays exactly one signature per round whichever form is published, on a machine
+that is neither the aggregator nor a relying party. The term is identical on both
+lines and cancels exactly. What remains is the shape of the trade — proving is a
+fixed cost paid **once** by whoever publishes an update, while verification
+**multiplies** across every relying party. In a decentralised root of trust those
+number in the thousands, so the break-even is not close.
 
-Where the memory actually goes — measured with `--example footprint`:
+Where the memory actually goes, measured from separate verifier and prover runs:
 
 | component | RSS |
 |---|---|
@@ -808,23 +859,23 @@ artifact of a small trace, not a property of the scheme. Setup cost,
 resident-after-setup and the *verifier's* RSS remain independent of `t` in both
 regimes.
 
-**Raspberry Pi CM4 (BCM2711, 2 GB)** — linear projection x8..x15 (estimate, from
-the `performance` host figures). RAM does **not** scale with CPU, and it is the
-gate, so the verdict depends on `t`:
+### Memory is the gate, and it is what the split answers
 
-| | `N=10, t=7` | `N=200, t=128` |
+Time scales with the machine; peak RSS does not. It is the one figure that decides
+whether a role can run somewhere at all, and the three roles are three orders of
+magnitude apart:
+
+| role | peak RSS | grows with `t`? |
 |---|---|---|
-| setup (one-time at boot) | ~40–76 s | ~41–78 s |
-| prove / update | ~1.4–2.6 s | ~5.7–10.8 s |
-| verify / update | ~0.22–0.42 s | ~0.25–0.47 s |
-| peak RSS, **prover** | ~1.08 GB — fits 2 GB | **2.05 GB — does not fit** |
-| peak RSS, **verifier** | 0.69 GB — fits | 0.69 GB — fits |
+| **member** (`signer`) | **~2 MB** | no — one key, one counter |
+| **relying party** (`verifier`) | ~692 MB | no (+0.07% from `t=70` to `t=128`) |
+| **aggregator** (`prover`) | 1.08 GB at `t=7` → **2.05 GB** at `t=128` | yes |
 
-At the small-committee point a 2 GB board can run either role (~1 GB left for the
-OS) and a **1 GB board is excluded outright**. At the current `t=128` defaults the
-**proving role no longer fits any CM4**, while the verify-only role still fits
-comfortably and is unchanged — which is the deployment split this repository is
-built around: prove on a server, verify on the board.
+Only the aggregator's footprint moves with committee size, and it is the only role
+that needs `setup_prover()`. That asymmetry is the deployment split this repository
+is built around: **aggregate where there is memory, sign and verify anywhere
+else.** The measurements above are for this host; run `benchmark.sh` natively on
+any machine whose verdict you actually need.
 
 ---
 
@@ -877,7 +928,7 @@ reach:
   against is ordinary — one state directory, two nodes started from it — while its
   cost is a destroyed key. Removing the lock makes it fail with
   `PROBE=acquired:102`, naming the slot both holders would have issued.
-- `src/stats.rs`'s tests are the only guard on the numbers in
+- `src/bench/stats.rs`'s tests are the only guard on the numbers in
   [Benchmark](#benchmark). They pin the median against the mean on skewed samples,
   and the standard deviation as the Bessel-corrected (`n-1`) one that the
   confidence interval is built from.

@@ -1,13 +1,13 @@
 //! A committee member: one XMSS keypair plus the durable slot counter that keeps
 //! its statefulness honest.
 //!
-//! All the crash-safety reasoning lives in [`crate::atomic_slot_counter`]. What
+//! All the crash-safety reasoning lives in [`crate::state::slot_counter`]. What
 //! this module adds is the one place where a slot is actually spent, and the
 //! guarantee that it is spent *forward only*.
 
 use lean_multisig::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSecretKey, XmssSignature, xmss_sign};
 
-use crate::atomic_slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
+use crate::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 
 /// Why a signature could not be produced.
 ///
@@ -69,25 +69,21 @@ impl SignerNode {
 
     /// Signs `message`, returning the slot it was signed at.
     ///
-    /// The two statements below are in the only safe order. `reserve` makes the
-    /// slot durably spent *before* the key ever touches it, so a crash between
-    /// them can lose a signature but can never produce a second one under the same
-    /// slot. Signing first and recording afterwards would leave exactly that
+    /// **Burn before sign.** The two statements below are in the only safe order:
+    /// `reserve` makes the slot durably spent before the key touches it, so a
+    /// crash between them loses a signature but can never produce a second one
+    /// under the same slot. Signing first and recording after leaves exactly that
     /// window open, and a reused XMSS slot means a recoverable secret key.
     ///
-    /// Consequently the slot is gone the moment it is issued. If `xmss_sign`
-    /// fails, if the caller drops the signature, if the aggregate does not verify,
-    /// if the update is never published — the counter has already moved on and
-    /// that slot is never handed out again. There is no rollback path, on purpose:
-    /// every one of those situations costs one slot out of `2^32`, while retrying
-    /// on the same slot costs the key.
+    /// So the slot is gone the moment it is issued, whether `xmss_sign` fails,
+    /// the caller drops the signature, or the update is never published. There is
+    /// no rollback path on purpose: each of those costs one slot out of `2^32`,
+    /// where retrying on the same slot costs the key.
     ///
-    /// leanVM v0.9 derandomized signing, so re-signing the *same* message at a
-    /// spent slot now returns the identical signature and is harmless. That does
-    /// not soften anything here: the counter exists for the case that is still
-    /// fatal — a *different* message at a slot already used — and it cannot tell
-    /// the two apart without keeping the message history the counter deliberately
-    /// does not keep.
+    /// v0.9's derandomized signing makes a repeated *message* at a spent slot
+    /// harmless, and changes nothing here: the counter exists for the case that is
+    /// still fatal (a *different* message at a used slot), and telling the two
+    /// apart would need the message history it deliberately does not keep.
     pub fn sign(
         &mut self,
         message: &[u8; MESSAGE_LEN_BYTES],
@@ -98,12 +94,11 @@ impl SignerNode {
         Ok((slot, signature))
     }
 
-    /// Signs `message` at the slot the *protocol* assigned to this round —
-    /// `Committee::slot_for(version)` — instead of the next slot this member
-    /// happens to be on. The slot is not returned: the caller derived it.
+    /// Signs at the slot the *protocol* assigned to this round
+    /// (`Committee::slot_for(version)`) rather than the next slot this member
+    /// happens to be on. Not returned, because the caller derived it.
     ///
-    /// The ordering guarantee of [`SignerNode::sign`] is unchanged, and so is its
-    /// consequence: reserving burns the slot whatever happens next.
+    /// Same burn-before-sign ordering as [`SignerNode::sign`], same consequence.
     ///
     /// [`AtomicSlotCounterError::AlreadySpent`] is a normal failure here, not a
     /// fault. It means this member is past that round, so it **abstains** rather
@@ -120,12 +115,10 @@ impl SignerNode {
     }
 }
 
-// Test
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status_list::{hash_any, status_list_message};
+    use crate::protocol::status_list::{hash_any, status_list_message};
     use lean_multisig::{xmss_key_gen_from_seed, xmss_verify};
     use std::path::PathBuf;
 
@@ -134,16 +127,10 @@ mod tests {
     /// `START..=END`, as the count leanVM v0.9 takes instead of an inclusive end.
     const WINDOW: u64 = (END - START + 1) as u64;
 
-    /// Same seed discipline as `verifier_node::tests`, where it is documented in
-    /// full: `[FILE, namespace, member, 0…]`, one namespace per test.
-    ///
-    /// All three tests below used to share `[3u8; 32]`, so one key signed slot 100
-    /// in every one of them — three *different* messages under the same
-    /// `(key, slot)` pair, which is the exact XMSS failure this crate is built to
-    /// prevent, and which leanVM v0.9's derandomized signing does not fix: it
-    /// makes a repeated *message* harmless, nothing more. Nothing is at risk here
-    /// (the keys authorize nothing), but the invariant should not be one the tests
-    /// are the first to break.
+    /// Same seed discipline as `verifier_node::tests`, documented in full there:
+    /// `[FILE, namespace, member, 0…]`, one namespace per test. Without it every
+    /// test here would sign slot 100 with one key over a *different* message,
+    /// precisely the XMSS failure this crate exists to prevent.
     const FILE: u8 = 6;
 
     fn seed(ns: u8) -> [u8; 32] {
@@ -188,7 +175,7 @@ mod tests {
 
     /// The property the whole design exists for: a failed signature still burns
     /// its slot. Here the counter is allowed past the key's real window, so
-    /// leanVM rejects the slot — and the counter moves on regardless.
+    /// leanVM rejects the slot, and the counter moves on regardless.
     #[test]
     fn a_failed_signature_still_consumes_its_slot() {
         let path = scratch("burn");
@@ -196,7 +183,7 @@ mod tests {
         let message = status_list_message(&[hash_any(b"vc")], 0);
 
         // Drain the slots the key can actually sign. One message over many slots
-        // is fine — it is one slot over many messages that destroys a key.
+        // is fine; it is one slot over many messages that destroys a key.
         for _ in START..=END {
             signer.sign(&message).expect("in-window sign");
         }

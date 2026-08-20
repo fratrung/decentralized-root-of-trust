@@ -1,15 +1,10 @@
 //! The five checks of [`verify_proof`], each shown to be load-bearing.
 //!
-//! The raw path is covered by unit tests in `committee.rs`; the SNARK path was
-//! not, and it is the one the whole system exists to demonstrate. It is also the
-//! path where a check had already been lost once — `snark_verifier_node` used to
-//! carry its own copy of the predicate, with the slot check missing.
-//!
 //! Every negative case here is a *genuinely valid SNARK*. Corrupting the proof
 //! bytes would prove nothing: that fails at deserialization, before any of the
 //! five checks run, so it cannot tell you whether check 1 or check 4 still exists.
 //! Instead each case aggregates real signatures and breaks exactly one binding,
-//! and asserts that the other four still hold — so a `false` can only have come
+//! and asserts that the other four still hold, so a `false` can only have come
 //! from the check under test. Deleting any one of the five makes exactly one
 //! assertion below fail.
 //!
@@ -18,12 +13,12 @@
 //! Four aggregations plus `setup_prover()`: about 10 s and ~1 GB resident on the
 //! reference host. That is small because the committee is: the deployed
 //! configuration is `N = 200, t = 128` and this is `N = 5, t = 3`. The subject
-//! here is the predicate, not the scale — `benchmark.sh` measures the scale.
+//! here is the predicate, not the scale; `benchmark.sh` measures the scale.
 //!
 //! Everything lives in ONE `#[test]` on purpose. leanVM's arena allocator has a
 //! single shared region per process and `setup_prover`'s contract is "never
 //! generate two proofs concurrently in one process", which a second `#[test]` in
-//! this binary would violate — libtest runs them as threads, not processes.
+//! this binary would violate: libtest runs them as threads, not processes.
 //!
 //! It is deliberately not `#[ignore]`d: a security predicate whose test nobody
 //! runs is the one that drifts. `Cargo.toml` optimizes dependencies in the dev
@@ -32,25 +27,25 @@
 //!
 //! ## Slot discipline
 //!
-//! XMSS is stateful, so every `(key, slot)` pair used here is used at most once —
+//! XMSS is stateful, so every `(key, slot)` pair used here is used at most once,
 //! and "here" has to mean the whole suite, not this file. leanVM derives the
 //! one-time key as `gen_wots_secret_key(seed, slot, gen_public_param(seed))`, so
 //! the slot *window* never enters it: two keys born of the same seed share every
 //! hash chain however they were generated. Seeds are therefore tagged
 //! `[FILE, ns, member, 0, ..]` here, in `tests/raw_path_round.rs` and in
-//! `src/committee.rs`'s unit tests, which is what keeps the three disjoint. The
+//! `src/protocol/committee.rs`'s unit tests, which is what keeps the three disjoint. The
 //! per-slot budget is written out next to the constants below, and cases skip
 //! rounds rather than reuse a slot.
 
-use decentralized_root_of_trust::committee::Committee;
-use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
-use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
-use decentralized_root_of_trust::status_list::{
+use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
+use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
+use decentralized_root_of_trust::protocol::committee::Committee;
+use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, hash_any, status_list_message,
 };
 use lean_multisig::{
-    MESSAGE_LEN_BYTES, SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey, XmssSignature,
-    xmss_key_gen_from_seed, xmss_sign,
+    MESSAGE_LEN_BYTES, SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey,
+    XmssSignature, xmss_key_gen_from_seed, xmss_sign,
 };
 
 const N: usize = 5;
@@ -77,7 +72,7 @@ const ROUND: u32 = 2;
 
 type Keypair = (XmssSecretKey, XmssPublicKey);
 
-/// Distinguishes this file's seeds from `src/committee.rs`'s (1) and
+/// Distinguishes this file's seeds from `src/protocol/committee.rs`'s (1) and
 /// `tests/raw_path_round.rs`'s (2). There is one test here, so `ns` is always 0.
 const FILE: u8 = 3;
 
@@ -178,7 +173,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     );
 
     // The same proof re-labelled as another round. The version is folded into the
-    // signed message *and* fixes the slot, so this breaks checks 2 and 3 at once —
+    // signed message *and* fixes the slot, so this breaks checks 2 and 3 at once,
     // which is the point: there is no way to move a record between rounds.
     assert!(
         !verifier.verify(&record(list.clone(), ROUND - 1, proof.clone())),
@@ -188,7 +183,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // ---------------------------------------------------- check 3: the slot --
     // A quorum that really did sign the round-1 message, but at a slot of its own
     // choosing instead of the one the anchor derives. The signatures are genuine
-    // and internally consistent — the slot is authenticated inside each of them —
+    // and internally consistent (the slot is authenticated inside each of them),
     // so what breaks is the *policy*: one slot per round, the same for everybody.
     let message_1 = status_list_message(&list, 1);
     let chosen_slot = GENESIS;
@@ -243,7 +238,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     );
 
     // ---------------------------------------------- check 1: the membership --
-    // Three signers, so the quorum is met by count — but one of them is not in the
+    // Three signers, so the quorum is met by count, but one of them is not in the
     // anchor. Unlike the raw path, where a signer is named by an index and an
     // outsider is therefore unnameable, the SNARK path carries public keys and has
     // to look them up.
@@ -284,19 +279,15 @@ fn each_of_the_five_checks_rejects_on_its_own() {
 
     // --------------------------------------------------- check 5: the SNARK --
     // The hard case, and the reason the other four are not enough on their own: an
-    // aggregate whose *public inputs* are the honest ones — so checks 1 to 4 pass
-    // by construction — carrying the proof body of a different execution. The four
+    // aggregate whose *public inputs* are the honest ones (so checks 1 to 4 pass
+    // by construction), carrying the proof body of a different execution. The four
     // cheap checks all look at `info`; only verifying the SNARK relates `info` to
     // the computation that is supposed to have produced it.
     let spliced = SingleMessageAggregateSignature {
         info: info_of(&valid).info,
         proof: info_of(&thin).proof,
     };
-    let forged = record(
-        list.clone(),
-        ROUND,
-        spliced.to_bytes(),
-    );
+    let forged = record(list.clone(), ROUND, spliced.to_bytes());
     {
         let agg = info_of(&forged);
         assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
@@ -311,7 +302,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
 
     // ------------------------------------------------ the decoding boundary --
     // Padding a length-prefixed field is free and repeatable, so without this the
-    // same logical update would have unboundedly many wire forms — distinct keys
+    // same logical update would have unboundedly many wire forms: distinct keys
     // in a content-addressed DHT.
     let mut padded = proof.clone();
     padded.push(0);
@@ -327,7 +318,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // ----------------------------------------------------- freshness layer --
     // `select_freshest` orders candidates by their *declared* version, which is
     // attacker-controlled until check 2 has run. A peer that inflates it is tried
-    // first and costs one wasted verification — it cannot win.
+    // first and costs one wasted verification; it cannot win.
     let liar = record(list.clone(), 999, proof).to_bytes();
     let honest = valid.to_bytes();
 
@@ -350,11 +341,11 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     assert!(verifier.select_freshest(&[]).is_none());
 
     // The floor prunes on the declared version *before* verifying anything. It is
-    // not a security check — it can only discard records the caller was already
+    // not a security check: it can only discard records the caller was already
     // committed to refusing as stale. Two cases separate a correct floor from a
     // broken one: strictly below the honest record (must not prune it) and exactly
     // at it (must prune it, because the gate's rule is `>` and not `>=`). A floor
-    // above the record is not a third case — it is indistinguishable from `at`.
+    // above the record is not a third case: it is indistinguishable from `at`.
     let both = vec![honest, liar];
     assert_eq!(
         verifier

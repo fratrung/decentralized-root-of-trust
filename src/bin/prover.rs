@@ -7,22 +7,22 @@
 //!
 //! Artifacts written to `<outdir>`:
 //!   anchor.bin          the committee (N public keys + threshold t)
-//!   update-NN.bin       legitimate updates — the verifier MUST accept these
-//!   attack-*.bin        forgeries — the verifier MUST reject these
+//!   update-NN.bin       legitimate updates: the verifier MUST accept these
+//!   attack-*.bin        forgeries: the verifier MUST reject these
 //!
-//! Usage: cargo run --release --bin prover -- [outdir]     (default ./artifacts)
+//! Usage: `cargo run --release --bin prover -- [outdir]` (default `./artifacts`)
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::Committee;
-use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::params::{
     KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
 };
-use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
-use decentralized_root_of_trust::stats::Series;
-use decentralized_root_of_trust::status_list::{
+use decentralized_root_of_trust::protocol::committee::Committee;
+use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, hash_any, status_list_message,
 };
 use lean_multisig::{XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign};
@@ -44,12 +44,10 @@ fn main() {
     let outdir = Path::new(&outdir);
     std::fs::create_dir_all(outdir).expect("cannot create output directory");
 
-    // Clear artifacts from a previous run rather than writing over them. A shorter
-    // run leaves the tail of a longer one behind, and those files were signed by a
-    // *different* committee — the verifier correctly rejects them and counts
-    // failures, which reads as a security regression rather than as the stale
-    // directory it is. The docs say "start from a clean directory"; this makes it
-    // true instead of asking.
+    // Clear artifacts from a previous run rather than writing over them. Each run
+    // builds a fresh committee, so a shorter run leaving the tail of a longer one
+    // behind produces files the verifier correctly rejects, which then reads as a
+    // security regression rather than as the stale directory it is.
     for entry in std::fs::read_dir(outdir).expect("cannot read output directory") {
         let path = entry.expect("cannot read directory entry").path();
         let stale = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
@@ -68,7 +66,7 @@ fn main() {
     let rss_baseline = rss_now_mb();
     println!("prover: setup...");
     let t_setup = Instant::now();
-    // `init_prover()` *is* the `setup_prover()` call — the module owns the pairing
+    // `init_prover()` *is* the `setup_prover()` call: the module owns the pairing
     // of setup with proving, which is why the bare call is not made here as well.
     let prover = PQSNARKProverModule::init_prover();
     let setup_time = t_setup.elapsed();
@@ -82,7 +80,7 @@ fn main() {
     // are not the same cost. `setup_ms` is the leanVM circuit and is what the SNARK
     // path pays *extra*; keygen is paid by every path, `raw_agg` included. Leaving
     // it unmeasured made the summary table read as "SNARK setup 5.0 s vs raw 4.3 s",
-    // i.e. as if the SNARK were the cheaper of the two — the comparison inverted,
+    // i.e. as if the SNARK were the cheaper of the two: the comparison inverted,
     // because the raw column was keygen and the SNARK column was not.
     //
     // `xmss_key_gen` samples the seed from the RNG itself since leanVM v0.9 and
@@ -100,7 +98,7 @@ fn main() {
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
     // Kept rather than built inline and dropped: every slot below is derived
     // through `slot_for`, so the anchor stays the only place `genesis + version`
-    // is ever computed — signer and verifier cannot drift apart.
+    // is ever computed: signer and verifier cannot drift apart.
     let committee = Committee::new(members, T, SLOT);
     write(outdir, "anchor.bin", &committee.to_bytes());
 
@@ -111,7 +109,6 @@ fn main() {
     // Each update consumes a fresh slot: XMSS is stateful, a (key, slot) pair
     // must never sign twice.
     let mut list: Vec<[u8; 32]> = Vec::new();
-    let mut sign_ms = Vec::new();
     let mut prove_ms = Vec::new();
     let mut proof_bytes = Vec::new();
     let mut rss_updates_max = rss_after_setup;
@@ -127,11 +124,12 @@ fn main() {
         let slot = committee.slot_for(version).expect("slot overflow");
         let message = status_list_message(&list, version);
 
-        // Signing and proving are timed apart: signing is `t` plain XMSS
-        // signatures outside the circuit and scales linearly in `t`, proving is
-        // the SNARK and scales with the padded trace. Conflating them would hide
-        // which one a change actually moved.
-        let t_sign = Instant::now();
+        // Signing happens here because an aggregator needs `t` signatures to have
+        // something to aggregate, but it is deliberately NOT timed: in production
+        // these `t` signatures come from `t` different machines, one each, and no
+        // process ever produces them all. Timing the loop would sum the work of a
+        // whole committee and attribute it to the aggregator. The cost of one
+        // member's round is measured where it belongs, in `src/bin/signer.rs`.
         let mut raws: Vec<(XmssPublicKey, XmssSignature)> = Vec::with_capacity(signers.len());
         for &k in &signers {
             let (sk, pk) = &keypairs[k];
@@ -140,7 +138,6 @@ fn main() {
                 xmss_sign(sk, slot, &message).expect("signing failed"),
             ));
         }
-        let sign_time = t_sign.elapsed();
 
         // The module takes `version`, not `slot`: it derives the slot from the
         // anchor itself and computes the signed message the same way the verifier
@@ -156,12 +153,8 @@ fn main() {
 
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
-        // The signer window as a range rather than one character per member: at
-        // N=200 the old `b'A' + index` mapping ran off the printable range into
-        // Latin-1 and C1 control codes, and past N_UPDATES = 64 it would have
-        // overflowed the u8 outright — a panic in debug, a silent wrap in release.
         println!(
-            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  sign={:>7.1?}  prove={:>8.1?}  {} B  RAM={} MB",
+            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  prove={:>8.1?}  {} B  RAM={} MB",
             i + 1,
             N_UPDATES,
             signers[0],
@@ -169,7 +162,6 @@ fn main() {
             signers.len(),
             version,
             slot,
-            sign_time,
             prove_time,
             bytes.len(),
             rss
@@ -177,17 +169,14 @@ fn main() {
         if emit_samples {
             // Tidy per-sample record: one row per update, consumed by benchmark.sh.
             println!(
-                "SAMPLE target=prover idx={i} sign_ms={:.3} prove_ms={:.3} bytes={} rss_mb={rss}",
-                ms(sign_time),
+                "SAMPLE target=prover idx={i} prove_ms={:.3} bytes={} rss_mb={rss}",
                 ms(prove_time),
                 bytes.len()
             );
         }
-        sign_ms.push(ms(sign_time));
         prove_ms.push(ms(prove_time));
         proof_bytes.push(bytes.len());
     }
-    let sign = Series::new(sign_ms);
     let prove = Series::new(prove_ms);
 
     // ---- Forgeries the verifier must reject. Built here only because this is
@@ -195,7 +184,7 @@ fn main() {
     //
     // These deliberately do NOT go through `PQSNARKProverModule::make_proof`, and
     // that is the method working as intended rather than a gap in it. Forgery C
-    // signs one version's content at a *different* version's slot — `make_proof`
+    // signs one version's content at a *different* version's slot: `make_proof`
     // derives the slot from the anchor, so it structurally cannot express that. An
     // attacker is under no such constraint, so the attacker's code path is
     // `sign_and_prove`, which still takes an explicit slot.
@@ -278,7 +267,6 @@ fn main() {
         .to_bytes(),
     );
 
-    let (sg_min, sg_med, sg_max) = sign.min_med_max();
     let (pv_min, pv_med, pv_max) = prove.min_med_max();
     // Same reasoning as `main.rs::dur_stats`: an empty series means no update was
     // ever produced, and a silent 0 would be reported as a measurement.
@@ -295,7 +283,6 @@ fn main() {
     println!("\n{N_UPDATES} updates + 3 forgeries written");
     println!("setup_prover           : {setup_time:.2?}");
     println!("keygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
-    println!("sign  min/med/max      : {sg_min:.1} / {sg_med:.1} / {sg_max:.1} ms");
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
     println!("proof size (median)    : {proof_med} bytes");
     println!("\nRAM (prover process)");
@@ -306,19 +293,13 @@ fn main() {
 
     // One-line machine-readable record, parsed by benchmark.sh.
     println!(
-        "\nPROVER setup_ms={:.3} keygen_ms={:.3} n_updates={} sign_med_ms={sg_med:.3} \
-         sign_mean_ms={:.3} sign_total_ms={:.3} \
+        "\nPROVER setup_ms={:.3} keygen_ms={:.3} n_updates={} \
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
          prove_max_ms={pv_max:.3} prove_total_ms={:.3} proof_med_bytes={proof_med} \
          rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={}",
         ms(setup_time),
         ms(keygen_time),
         prove.len(),
-        sign.mean(),
-        // Emitted so the harness can carry a sign *total* for this target too. It
-        // used to publish only a median, and 20 x median is not the sum when the
-        // phase is right-skewed — which signing is.
-        sign.sum(),
         prove.mean(),
         prove.stddev(),
         prove.sum(),

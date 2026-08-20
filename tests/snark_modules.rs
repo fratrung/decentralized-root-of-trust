@@ -1,16 +1,11 @@
 //! The two SNARK node modules, exercised the way the binaries use them.
 //!
-//! `PQSNARKProverModule` and `PQSNARKVerifierModule` had no test of their own.
-//! That mattered more than the usual "untested wrapper", because the verifier one
-//! is where a check had already been lost: it used to carry its own copy of the
-//! five-check predicate with the slot check missing, so a quorum could re-sign a
-//! version at slots of its own choosing. There is exactly one copy of each
-//! predicate now and it lives on the module, so these tests are what keep the one
-//! copy honest.
+//! Each predicate exists exactly once, on its module. These tests are what keep
+//! that single copy honest.
 //!
 //! What is asserted here, in order of how much it matters:
 //!
-//!   1. the prover derives the slot from the **anchor**, not from its caller —
+//!   1. the prover derives the slot from the **anchor**, not from its caller,
 //!      checked against the slot recorded inside the finished proof;
 //!   2. the verifier module accepts an honest record and refuses a tampered list
 //!      and a relabelled version, so it is really running the five checks;
@@ -23,7 +18,7 @@
 //! ## Cost
 //!
 //! ONE aggregation plus `setup_prover()`: a few seconds. Everything after the first
-//! record re-uses it, because every negative case here is about a *binding* — the
+//! record re-uses it, because every negative case here is about a *binding*: the
 //! proof stays valid and the thing around it changes.
 //!
 //! One `#[test]`, for the same reason as `tests/snark_path.rs`: leanVM's arena has a
@@ -39,10 +34,10 @@
 //! `verifier_node.rs` (7). Exactly one `(member, slot)` pair is spent per member:
 //! members 0, 1 and 2 sign round 0 at slot 100, once.
 
-use decentralized_root_of_trust::committee::Committee;
-use decentralized_root_of_trust::snark_prover_node::PQSNARKProverModule;
-use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
-use decentralized_root_of_trust::status_list::{
+use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
+use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
+use decentralized_root_of_trust::protocol::committee::Committee;
+use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, hash_any, status_list_message,
 };
 use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign};
@@ -80,7 +75,7 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     let committee = Committee::new(members, T, GENESIS);
 
     // Round 0. The signers sign the message the *verifier* will recompute, at the
-    // slot the anchor assigns — the prover module is handed `version`, never a slot.
+    // slot the anchor assigns: the prover module is handed `version`, never a slot.
     let version = 0u32;
     let list = vec![hash_any(b"row-a"), hash_any(b"row-b")];
     let message = status_list_message(&list, version);
@@ -119,7 +114,7 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     );
 
     // A tampered list carrying the same valid proof: the signed message binds the
-    // list, so this is refused. Re-uses the proof — no second aggregation.
+    // list, so this is refused. Re-uses the proof, no second aggregation.
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION"));
     assert!(
@@ -133,7 +128,7 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     );
 
     // The same proof relabelled with a later version. Two bindings refuse it at
-    // once — the message carries the version, and the slot is derived from it — and
+    // once (the message carries the version, and the slot is derived from it), and
     // that is the point: a record only ever verifies at the version it was signed
     // for, whichever check gets there first.
     assert!(
@@ -148,8 +143,8 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
 
     // (3) The DHT freshness selection is a method on this same module, so it runs
     // the same five checks rather than a second opinion. Handed the honest record
-    // and the relabelled forgery — which *declares* the higher version and is
-    // therefore tried first — it must skip the forgery and return the honest one.
+    // and the relabelled forgery (which *declares* the higher version and is
+    // therefore tried first), it must skip the forgery and return the honest one.
     // A selection that trusted the declared version instead would return version 1.
     let liar = SnarkStatusList::new(
         Algorithms::WotsXmss,
@@ -196,8 +191,8 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
 
     // (5) A version with no slot under this anchor: `genesis + version` overflows
     // `u32`, so there is nothing to sign at. The module panics rather than proving
-    // something no verifier could ever accept. Nothing is aggregated on this path —
-    // the derivation fails first — so catching the unwind costs nothing.
+    // something no verifier could ever accept. Nothing is aggregated on this path
+    // (the derivation fails first), so catching the unwind costs nothing.
     assert_eq!(committee.slot_for(u32::MAX), None);
     let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         prover.make_proof(&committee, Vec::new(), &list, u32::MAX, LOG_INV_RATE)

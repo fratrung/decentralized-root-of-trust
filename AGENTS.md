@@ -27,10 +27,10 @@ diagram; the per-module reasoning lives in the doc comments themselves.
 ```sh
 cargo run --release --bin decentralized-root-of-trust  # combined SNARK demo: setup, N updates, 3 security tests
 cargo run --release --bin raw_agg                      # the same protocol with no SNARK, through SignerNode/VerifierNode
-cargo run --release --bin prover   -- [outdir]         # split: sign + aggregate, writes artifacts (default ./artifacts)
+cargo run --release --bin prover   -- [outdir]         # split: aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
-cargo run --release --example footprint -- prover      # RAM of setup alone; also: verifier | none
-cargo test                                             # 48 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
+cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
+cargo test                                             # 50 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
 tools/mutate.py                                        # mutation testing: 24 checks, each must be caught by a test
 ```
@@ -44,8 +44,8 @@ though it drives a real prover.
 The tests cover the slot counter, the raw quorum path and — since
 `tests/snark_path.rs` — each of the five checks in `PQSNARKVerifierModule::verify`. The binaries
 remain the end-to-end assertion: the combined demo must print `security OK: true`,
-`raw_agg` and `verifier` must exit 0. `benchmark.sh` refuses to print timings if
-any run reports a failure.
+`raw_agg`, `signer` and `verifier` must exit 0. `benchmark.sh` refuses to print
+timings if any run reports a failure.
 
 `.cargo/config.toml` sets `RUST_MIN_STACK=512MiB` (the prover recurses very
 deeply) and `target-cpu=native`. Both are required — don't run the binary in a
@@ -65,7 +65,7 @@ One data flow that forks at the end:
 ```
 
 Library:
-- `src/status_list.rs` — the published objects and their digest. `entry_to_field`
+- `src/protocol/status_list.rs` — the published objects and their digest. `entry_to_field`
   maps each 32-byte entry to `[F;8]`; `status_list_root_fe(list, version)` folds
   the entries into the root and then closes with one more compression that mixes
   in the `version` (16-bit limbs, injective). **The fold is a Merkle–Damgård
@@ -92,20 +92,20 @@ Library:
   size always comes from the anchor. Its length in bits rides in a sentinel bit,
   so bits past member `N-1` cannot exist and an index outside the committee is
   unrepresentable rather than checked for.
-- `src/committee.rs` — the anchor and **nothing else**: members, `t`,
+- `src/protocol/committee.rs` — the anchor and **nothing else**: members, `t`,
   `genesis_slot`, the SSZ wire encoding, and `slot_for` (the **only** place the
   slot is derived). `from_bytes` re-checks `t ∈ 1..=N`, the one invariant a wire
   format cannot know; canonicity it gets from SSZ, which has no varints to pad. The protocol predicates used to live here as free functions taking
   `&Committee`; they are now methods on the node type that owns the anchor, so a
   participant is one value with the operations its role can perform.
-- `src/atomic_slot_counter.rs` — the durable monotonic slot allocator. Burns the
+- `src/state/slot_counter.rs` — the durable monotonic slot allocator. Burns the
   slot on disk **before** handing it out (write tmp → fsync → rename → fsync the
   parent dir), guarded by a lock on a separate file so two processes cannot share
   a key. `reserve` takes the next local slot; `reserve_at` takes a
   protocol-chosen one, jumping forward over missed rounds and refusing the past.
-- `src/signer_node.rs` — one member: keypair + counter. `sign` for the local-slot
+- `src/node/signer.rs` — one member: keypair + counter. `sign` for the local-slot
   path, `sign_at` for the derived-slot one.
-- `src/verifier_node.rs` — one relying party on the **raw** path: `verify` for a
+- `src/node/raw_verifier.rs` — one relying party on the **raw** path: `verify` for a
   single member signature, `verify_status_list` for the whole record (the five
   checks that decide whether an update is authorized). It is a method on the node
   and not a free function because every answer depends on the anchor it holds:
@@ -115,20 +115,20 @@ Library:
 - `src/params.rs` — demo parameters (`SLOT` = the genesis slot, `N_MEMBERS`, `T`,
   `N_UPDATES`, `KEY_SLOTS`, `LOG_INV_RATE`), shared by `main.rs`, `prover` and
   `raw_agg`. The `verifier` deliberately imports none of them.
-- `src/freshness.rs` — `HighWaterMark`, the persistent anti-rollback gate. Strict
+- `src/state/freshness.rs` — `HighWaterMark`, the persistent anti-rollback gate. Strict
   monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
   committee rotation resets it, persisted with a write-then-rename. Lives *outside*
   the verification predicate, which stays pure.
-- `src/mem.rs`, `src/stats.rs` — RSS (resident set size) probes and descriptive
+- `src/bench/mem.rs`, `src/bench/stats.rs` — RSS (resident set size) probes and descriptive
   statistics shared by every binary.
-- `src/snark_prover_node.rs` — the prover. Holding the value *is* the proof that
+- `src/node/snark_prover.rs` — the prover. Holding the value *is* the proof that
   `setup_prover()` ran. `make_proof` derives the slot through `Committee::slot_for`
   and takes a `version`, never a slot; `aggregate` takes an explicit slot and
   exists for the adversarial tests, which have to build what the honest path
   cannot express. `sign_and_prove` refuses a repeated signer **before** signing —
   leanVM dedups the aggregate, so nothing downstream could catch it and the key
   would already be damaged.
-- `src/snark_verifier_node.rs` — the SNARK relying party, paired with
+- `src/node/snark_verifier.rs` — the SNARK relying party, paired with
   `setup_verifier()`. Owns the five checks, `is_newer`, and `select_freshest` (the
   DHT-layer selection: newest declared version first, verify, fall back on
   failure). `select_freshest_above` is the same with a floor — the caller's
@@ -138,19 +138,29 @@ Library:
   here; an earlier second copy had drifted and silently lost the slot check.
 
 Binaries:
-- `src/main.rs` — the combined single-process demo; still the reference for the
-  end-to-end flow and the `BENCH` record.
+- `src/main.rs` — the combined single-process demo: the reference for the
+  end-to-end flow, the three forgery tests and the `BENCH` record. It is a **demo**,
+  not a measurement target — `benchmark.sh` no longer runs it by default. It is
+  also the one binary that does not go through the node types end to end: it calls
+  `setup_prover`/`setup_verifier` directly, to time the two phases apart, and signs
+  with `xmss_sign` rather than through `SignerNode`.
 - `src/bin/prover.rs` — holds the secret keys, writes artifacts, **never verifies**.
 - `src/bin/verifier.rs` — calls **only** `setup_verifier()`; loads `anchor.bin`
   and hardcodes nothing else.
-- `src/bin/raw_agg.rs` — the no-SNARK baseline, and the only binary that spends
-  slots through `SignerNode`/`AtomicSlotCounter`. Its `sign` figure therefore
-  includes one `fsync` pair per signature that `prover.rs` never pays: compare
-  *verify* and *size* across the two paths freely, compare *sign* knowing that.
+- `src/bin/raw_agg.rs` — the no-SNARK baseline. It spends slots through
+  `SignerNode`/`AtomicSlotCounter`, so its `t` signatures are produced the way a
+  real member produces them, but it does **not** time them: what it measures is
+  the relying party's side, verify and size.
+- `src/bin/signer.rs` — one committee **member**, in isolation: one key, one
+  durable counter, one signature per round. The only binary that reports a `sign`
+  figure, because it is the only one whose process shape matches the role. Every
+  round self-verifies as a failure gate; RSS is ~2 MB against the aggregator's
+  ~2 GB, which is the number that separates the two roles.
 
 Every binary goes through the node types, because there is nothing else to call:
 `prover`/`main` through `PQSNARKProverModule`, `verifier`/`main` through
-`PQSNARKVerifierModule`, `raw_agg` through `SignerNode`/`VerifierNode`. The
+`PQSNARKVerifierModule`, `raw_agg` through `SignerNode`/`VerifierNode`, `signer`
+through `SignerNode` alone. The
 predicates are not reachable any other way, which is the point — a free function
 duplicated next to a wrapper is how the verifier module once lost its slot check.
 Local scratch binaries (`src/bin/my_test*.rs`) are gitignored: hand-run
@@ -163,7 +173,7 @@ committee of one, and the raw path with a real `t`-of-`N` quorum. They write slo
 state into the working directory (`next_slot`, `signers/`), which `.gitignore`
 covers.
 
-Tests (`cargo test`, ~15 s warm, 57 in total: 56 run plus one `#[ignore]`d):
+Tests (`cargo test`, ~15 s warm, 58 in total: 57 run plus one `#[ignore]`d):
 - `src/*.rs` unit tests cover each module against its own contract.
   `status_list.rs`'s pin the seam this crate has with leanVM: that
   `status_list_message` is the *canonical* packing of the fold (each limb a field
@@ -262,7 +272,7 @@ via a leanVM fork does not work. Treat the floor as a fixed constraint.
 
 `verify_single_message_aggregate` attests **only** "these listed public keys
 signed this message at this slot". Every link to trust is a cleartext check
-outside the circuit, in `PQSNARKVerifierModule::verify` (`src/snark_verifier_node.rs`):
+outside the circuit, in `PQSNARKVerifierModule::verify` (`src/node/snark_verifier.rs`):
 
 1. every signer ∈ committee — membership against the fixed anchor;
 2. `agg.info.core.message == status_list_message(list, version)` — **the critical
@@ -421,11 +431,12 @@ per-item raw samples when `EMIT_SAMPLES` is set in the environment:
 | binary | summary line | sample lines |
 |---|---|---|
 | `main.rs` | `BENCH k=v ... sec_ok=1` | — |
-| `prover` | `PROVER k=v ...` | `SAMPLE target=prover idx=… sign_ms=… prove_ms=…` |
+| `signer` | `SIGNER k=v ... failures=N` | `SAMPLE target=signer idx=… sign_ms=… bytes=…` |
+| `prover` | `PROVER k=v ...` | `SAMPLE target=prover idx=… prove_ms=… bytes=…` |
 | `verifier` | `VERIFIER k=v ... failures=N` | `SAMPLE target=verifier idx=… verify_ms=…` |
-| `raw_agg` | `RAW_AGG k=v ... tamper_rejected=…` | `SAMPLE target=raw_agg idx=… sign_ms=… verify_ms=… bytes=…` |
+| `raw_agg` | `RAW_AGG k=v ... tamper_rejected=…` | `SAMPLE target=raw_agg idx=… verify_ms=… bytes=…` |
 
-`benchmark.sh` normalises all four in `emit_run_row`; adding or renaming a field
+`benchmark.sh` normalises all five in `emit_run_row`; adding or renaming a field
 means updating that function. The script exits if a summary line is missing, and
 aborts before printing any statistics if any run reports `failures > 0`.
 
@@ -434,17 +445,16 @@ the comparison between the two paths gets inverted:
 
 | field | what it is | who pays it |
 |---|---|---|
-| `setup_ms` | the leanVM circuit (`setup_prover` / `setup_verifier`) | SNARK path only — `raw_agg` leaves it empty |
-| `keygen_ms` | generating the `N` XMSS keys | every path, `raw_agg` included |
-| `slot_state_ms` | creating the `N` durable `AtomicSlotCounter`s | only a real signer (`raw_agg`) |
+| `setup_ms` | the leanVM circuit (`setup_prover` / `setup_verifier`) | SNARK path only — `raw_agg` and `signer` leave it empty |
+| `keygen_ms` | generating XMSS keys | every path; `N` keys, except `signer`, which generates **one** |
+| `slot_state_ms` | creating durable `AtomicSlotCounter`s | only a real signer — `N` for `raw_agg`, **one** for `signer` |
 
 Per-update phases are carried into `runs.csv` under their **own names**
 (`sign_*`, `prove_*`, `verify_*`), never under a positional primary/secondary
-slot: `raw_agg`'s secondary phase is signing while `combined`'s is verification,
-so a shared column put ~1.2 s and ~32 ms under one heading and made `summary.csv`
-unreadable on its own. A target leaves blank the phases it does not run, and
-`col()` drops empty cells, so an absent phase produces no row rather than a
-`0.000 ms` that reads as "instant".
+slot: a shared column put ~1.2 s and ~32 ms under one heading and made
+`summary.csv` unreadable on its own. A target leaves blank the phases it does not
+run, and `col()` drops empty cells, so an absent phase produces no row rather than
+a `0.000 ms` that reads as "instant".
 
 ### Artifact conventions between `prover` and `verifier`
 
@@ -469,5 +479,44 @@ The unit of analysis for per-update metrics is the **per-run median** (n = RUNS)
 not the pooled sample: updates inside one process share allocator and cache state
 and are not independent. Preserve that distinction if you touch the aggregation.
 
-The CM4 projection is opt-in (`PROJECT_CM4=1`) and is a **linear extrapolation,
-not a measurement** — it must stay labelled as such.
+### One target per role
+
+The sweep has three targets that correspond to real processes, plus two contrast
+targets. What each one measures is decided by **which role would run that
+process**, and no target is charged for another role's work:
+
+| target | role | reports |
+|---|---|---|
+| `signer` | one committee member | `sign` per round (incl. its durable slot burn), 1 key, 1 counter |
+| `prover` | the aggregator | `prove` per update, `setup`, `N` keys |
+| `verifier` | a relying party | `verify` per record, `setup` |
+| `raw_agg` | the no-SNARK baseline | `verify` per record + record size |
+
+`combined` (`main.rs`) is **not** in the default `TARGETS`. It measures a process
+that proves and verifies at once — not a role anyone deploys — and its numbers
+duplicate the prover's: same setup, `prove` within 0.5%, peak RSS within 2%. It
+stays available as `TARGETS="... combined"` for one purpose: an independent second
+reading of prove time, which is how CPU contention in a prover window was caught
+once. Do not add it back to the defaults for any other reason.
+
+**Only `signer` reports a `sign` row, and that is deliberate.** In production
+nobody produces `t` signatures: each member signs *once* per round on its own
+machine and broadcasts, and the aggregator receives `t` and produces none. Timing
+a loop that signs `t` times sums the work of `t` machines and bills it to one —
+which is what the `sign / update` column used to do, reading ~1 s at `t=128` for a
+process that does not exist. `prover`, `combined` and `raw_agg` still *produce*
+their `t` signatures, because a record needs them; they just do not time them.
+
+A member's signing cost is identical on both published forms — same key, same
+32-byte message, same derived slot — so the `signer` row applies unchanged to the
+SNARK and the raw path, and what separates the two paths is only how the quorum is
+evidenced and what a relying party pays to check it.
+
+`signer`'s `keygen` and `slot_state` are for **one** key and **one** counter,
+where `prover`/`raw_agg` report the whole committee's `N`. Do not read them as the
+same quantity.
+
+Nothing in the output is extrapolated to other hardware, and nothing should be
+added that is: `target-cpu=native` makes the binaries host-specific, so the only
+honest way to get numbers for another machine is to run `benchmark.sh` there. A
+projection block existed once and was removed — do not reintroduce it.

@@ -2,21 +2,20 @@
 //! questions a verifier can ask without a circuit.
 //!
 //! `verify` asks "is this one signature from some member". `verify_status_list`
-//! asks the question that actually authorizes an update — "did at least `t`
-//! distinct members sign *this* list at *this* version" — and the threshold is
+//! asks the question that actually authorizes an update: "did at least `t`
+//! distinct members sign *this* list at *this* version", and the threshold is
 //! part of it.
 //!
-//! Neither needs `setup_verifier()`, neither needs the aggregation bytecode, and
-//! neither costs a gigabyte of resident state. This is the counterpart of
-//! [`crate::snark_verifier_node::PQSNARKVerifierModule`], and the honest
-//! comparison between the two paths: `t` independent Poseidon2 verifications,
-//! linear in `t` where the SNARK's cost is constant, on a verifier far too small
-//! to hold the circuit.
+//! Neither needs `setup_verifier()`, the aggregation bytecode, or a gigabyte of
+//! resident state. That is the honest comparison against
+//! [`crate::node::snark_verifier::PQSNARKVerifierModule`]: `t` independent
+//! Poseidon2 verifications, linear in `t` where the SNARK is constant, on a
+//! verifier far too small to hold the circuit.
 
 use lean_multisig::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSignature, xmss_verify};
 
-use crate::committee::Committee;
-use crate::status_list::{StatusList, status_list_message};
+use crate::protocol::committee::Committee;
+use crate::protocol::status_list::{StatusList, status_list_message};
 
 #[derive(Debug)]
 pub enum VerifierError {
@@ -58,44 +57,33 @@ impl VerifierNode {
     /// Verifies a [`StatusList`] against this node's anchor: the `t` XMSS
     /// signatures it carries, plus the bitmap naming who produced them.
     ///
-    /// Unlike [`VerifierNode::verify`], which answers "is this one signature from
-    /// some member", this answers "is this update authorized" — the threshold is
-    /// part of the question.
+    /// A method and never a free function: every answer is relative to the anchor
+    /// this node holds. Bitmap width, which key each bit names, the slot the
+    /// version derives to and `t` itself all come from it, so the same bytes
+    /// verify under one committee and not another.
     ///
-    /// It is a method on the node, and never a free function, because *every*
-    /// answer it gives is relative to the committee this node holds: the bitmap
-    /// width, which key each bit names, the slot the version derives to, and `t`
-    /// itself all come from the anchor. The same bytes verify under one committee
-    /// and not under another, so there is no anchor-free way to ask the question.
-    ///
-    /// All five checks are load-bearing; dropping any one of them is exploitable.
+    /// All five checks are load-bearing; dropping any one is exploitable.
     pub fn verify_status_list(&self, status_list: &StatusList) -> bool {
         let members = self.committee.members();
         let n = members.len();
 
         // 0) a degenerate anchor. `Committee::new` and `from_bytes` both reject
-        //    `t = 0`, so this is unreachable through them — but this is the
-        //    predicate whose `true` authorizes an update, and with `t = 0` every
-        //    check below passes vacuously for a record carrying an empty bitmap
-        //    and no signatures at all. One branch is cheap insurance against a
-        //    future construction path.
+        //    `t = 0`, so this is unreachable through them, but a `true` here
+        //    authorizes an update, and at `t = 0` every check below passes
+        //    vacuously for a record with an empty bitmap and no signatures. One
+        //    branch is cheap insurance against a future construction path.
         if self.committee.threshold() == 0 {
             return false;
         }
 
-        // 1) the bitmap must name exactly this committee. It is an SSZ `BitList`,
-        //    so its length is a count of *bits* recovered from the sentinel bit on
-        //    decode, not a byte width rounded up — a record built for a committee
-        //    of 197 does not pass here as one for 200.
+        // 1) the bitmap must name exactly this committee. A `BitList` length is a
+        //    count of *bits*, recovered from the sentinel on decode rather than a
+        //    byte width rounded up, so a record built for 197 members does not
+        //    pass here as one for 200.
         //
         //    This is also what makes indexing `members` below infallible: every
         //    index `signer_indices` yields is `< signer_slots()`, and this line
-        //    ties that to `n`. It used to take two checks — a byte width and a
-        //    sweep for set padding bits — because a byte array leaves the bits
-        //    above member `n - 1` free, so one signer set had several encodings
-        //    and an index past the end of the committee was representable. A
-        //    `BitList` cannot express either, so the encoding enforces what the
-        //    second check used to.
+        //    ties that to `n`.
         if status_list.signer_slots() != n {
             return false;
         }
@@ -108,22 +96,22 @@ impl VerifierNode {
             return false;
         }
 
-        // 3) the slot the protocol assigns to this round — derived from the anchor,
+        // 3) the slot the protocol assigns to this round, derived from the anchor,
         //    so a quorum cannot pick its own. `None` means the version ran past
         //    `u32`.
         let Some(slot) = self.committee.slot_for(status_list.version()) else {
             return false;
         };
 
-        // 4) the message every member must have signed. Binding the version into it
-        //    (Option B) is what makes the cleartext `version` trustworthy
-        //    afterwards, exactly as in the SNARK path.
+        // 4) the message every member must have signed. Binding the version into
+        //    it is what makes the cleartext `version` trustworthy afterwards,
+        //    exactly as in the SNARK path.
         let message = status_list_message(status_list.list(), status_list.version());
 
-        // 5) every signature, against the key its bit names. Committee membership
-        //    needs no separate check here — unlike the SNARK predicate, which
-        //    receives public keys and must look them up. An index *is* a member, so
-        //    a non-member is unnameable rather than merely rejected.
+        // 5) every signature, against the key its bit names. Membership needs no
+        //    check of its own: an index *is* a member, so a non-member is
+        //    unnameable rather than rejected. The SNARK predicate receives public
+        //    keys instead, and has to look them up.
         status_list
             .signer_indices()
             .zip(status_list.signatures())
@@ -138,39 +126,32 @@ impl VerifierNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status_list::{Algorithms, hash_any};
+    use crate::protocol::status_list::{Algorithms, hash_any};
     use lean_multisig::{XmssSecretKey, xmss_key_gen_from_seed, xmss_sign};
 
-    /// Deliberately not a multiple of 8, so the bitmap has padding bits and the
-    /// checks that police them are actually exercised.
+    /// Deliberately not a multiple of 8, so the bitmap's sentinel does not land on
+    /// a byte boundary and the encoding is exercised where it is easiest to break.
     const N: usize = 5;
     const T: usize = 3;
     const GENESIS: u32 = 100;
 
-    /// Nearly every test in this module signs round 0, hence slot `GENESIS`.
-    /// Sharing one set of seeds across them would therefore have one secret key
-    /// sign one slot a dozen times per `cargo test` — and those calls do not all
-    /// carry the same message, which is the case that destroys a key. (leanVM
-    /// v0.9 derandomized signing, so a repeated *message* at a repeated slot is
-    /// now bit-identical and harmless; a repeated slot with two messages is as
-    /// fatal as it ever was.)
+    /// This file's tag in the crate-wide seed namespace `[file, ns, member, 0, ..]`.
     ///
-    /// The namespace has to live in the **seed** and nowhere else. leanVM derives
-    /// the one-time key as `gen_wots_secret_key(seed, slot, gen_public_param(seed))`
-    /// — both arguments are functions of the seed alone, so the *slot window* never
-    /// enters it and two keys born of one seed share every hash chain no matter
-    /// what range they were generated over. Varying the window is not a namespace.
+    /// Nearly every test here signs round 0, so without a namespace one secret key
+    /// would sign slot `GENESIS` a dozen times per `cargo test` over *different*
+    /// messages: the case that destroys an XMSS key. (v0.9 derandomized signing
+    /// makes a repeated slot with the *same* message harmless; two messages are as
+    /// fatal as ever.)
     ///
-    /// The layout is `[file, ns, member, 0, ..]`, which is collision-free by
-    /// construction rather than by arithmetic: `file` separates this module from
-    /// `committee.rs`, `signer_node.rs`, `tests/snark_path.rs` and the rest, `ns`
-    /// separates the tests here from each other, and `member` is unbounded, so an
-    /// outsider key can take an index no committee will ever reach instead of a
-    /// magic constant that has to be checked against every namespace by hand.
+    /// The namespace must live in the **seed**. leanVM derives the one-time key as
+    /// `gen_wots_secret_key(seed, slot, gen_public_param(seed))`: both arguments
+    /// are functions of the seed alone, so two keys born of one seed share every
+    /// hash chain whatever window they were generated over. Varying the window is
+    /// not a namespace.
     ///
-    /// These keys authorize nothing, so nothing is at risk either way. The point
-    /// is that an invariant the whole design rests on should not be one the tests
-    /// are the first to break.
+    /// `file` separates this module from the others, `ns` separates the tests here
+    /// from each other, and `member` is unbounded, so an outsider key takes an
+    /// index no committee reaches instead of a magic constant to check by hand.
     const FILE: u8 = 7;
 
     fn seed(ns: u8, member: u8) -> [u8; 32] {
@@ -289,6 +270,47 @@ mod tests {
         assert!(node.verify_status_list(&back));
     }
 
+    /// A member names itself with `Committee::index_of`, and the index it gets
+    /// back is the one the predicate expects.
+    ///
+    /// This is the seam a gossip layer will sit on: a signer holds a key, not a
+    /// seat number, so the index that goes into the bitmap has to be *derived*
+    /// from the anchor rather than configured alongside it. If the two ever
+    /// disagreed, the record would name the wrong member and the signature would
+    /// be checked against the wrong public key, which is why the test asserts
+    /// both halves: the derived index verifies, and any other index does not.
+    #[test]
+    fn a_member_names_itself_with_index_of_and_the_predicate_agrees() {
+        let (keys, node) = committee_in(16);
+        let c = node.get_committee();
+        let list = vec![hash_any(b"vc-1")];
+        let message = status_list_message(&list, 0);
+        let slot = c.slot_for(0).expect("slot");
+
+        // Each signer looks up its own seat rather than being told one.
+        let mine: Vec<usize> = [0usize, 2, 4]
+            .iter()
+            .map(|&i| c.index_of(&keys[i].1).expect("a member finds itself"))
+            .collect();
+        assert_eq!(mine, vec![0, 2, 4]);
+
+        let sigs: Vec<(usize, XmssSignature)> = mine
+            .iter()
+            .map(|&i| (i, xmss_sign(&keys[i].0, slot, &message).expect("sign")))
+            .collect();
+        assert!(node.verify_status_list(&record(list.clone(), 0, sigs.clone())));
+
+        // The same signatures under any other seat: member 4's signature filed
+        // under seat 3 is checked against member 3's key, and fails.
+        let mut mislabelled = sigs;
+        mislabelled[2].0 = 3;
+        assert!(!node.verify_status_list(&record(list, 0, mislabelled)));
+
+        // An outsider has no seat to claim in the first place.
+        let (_, out_pk) = keypair(16, 200);
+        assert_eq!(c.index_of(&out_pk), None);
+    }
+
     /// The signers are named out of order and get sorted into canonical form, so
     /// the same set always produces the same bytes.
     #[test]
@@ -347,7 +369,7 @@ mod tests {
     }
 
     /// Signatures re-attributed to members who never produced them. Nothing about
-    /// the record is malformed — the bits simply name the wrong keys.
+    /// the record is malformed: the bits simply name the wrong keys.
     #[test]
     fn signatures_cannot_be_re_attributed() {
         let (keys, node) = committee_in(11);
@@ -392,7 +414,7 @@ mod tests {
     /// signed.
     ///
     /// Both constructors reject `t = 0`, so this is unreachable through the public
-    /// API — which is exactly why it went untested: the guard is insurance against
+    /// API, which is exactly why it went untested: the guard is insurance against
     /// a future construction path, and no future construction path exists yet to
     /// write a test against. `Committee::new_unchecked` is that path, test-only.
     #[test]
@@ -417,18 +439,16 @@ mod tests {
         assert!(Committee::from_bytes(&encoded).is_err());
     }
 
-    /// The bitmap must name *this* committee, and since it is an SSZ `BitList`
-    /// its length is a number of bits rather than a byte width rounded up. A
-    /// record built for a committee of 8 therefore no longer passes as one built
-    /// for a committee of 5: under the old byte array both were one byte wide and
-    /// only a sweep for set padding bits could tell them apart.
+    /// A `BitList` length is a number of bits, not a byte width rounded up, so a
+    /// record built for a committee of 8 does not pass as one built for 5, even
+    /// though both fit in a single byte.
     #[test]
     fn a_record_built_for_another_committee_size_is_refused() {
         let (keys, node) = committee_in(15);
         let list = vec![hash_any(b"vc-1")];
         let sigs = quorum(&keys, node.get_committee(), &list, 0, &[1, 2, 3]);
 
-        // Same signatures, same list, same version — only the committee size the
+        // Same signatures, same list, same version; only the committee size the
         // record was sized for differs.
         let honest = record(list.clone(), 0, sigs.clone());
         assert!(node.verify_status_list(&honest));
@@ -474,18 +494,15 @@ mod tests {
     /// The invariant that makes `members[i]` infallible, asserted exhaustively
     /// rather than argued.
     ///
-    /// The predecessor of this test flipped one specific pair of bits, because
-    /// under a byte array a moved padding bit produced a record that decoded
-    /// cleanly and arrived at the quorum check naming member 7 of a committee of
-    /// 5 — a remote panic any peer could trigger with two bit flips and no key of
-    /// its own. A `BitList` cannot represent that: the highest set bit *is* the
-    /// length, so moving a bit upward moves the sentinel and changes the declared
-    /// length rather than smuggling an index past the end.
+    /// The attack this forecloses: a record that decodes cleanly and reaches the
+    /// quorum check naming member 7 of a committee of 5: a remote panic any peer
+    /// could trigger with two bit flips and no key of its own. A `BitList` cannot
+    /// represent it, because the sentinel *is* the length: moving a bit upward
+    /// changes the declared length instead of smuggling an index past the end.
     ///
-    /// With `N = 5` the bitmap is a single byte, so the case worth pinning is not
-    /// one mutation but **all 256 of them**. Each must either fail to decode or
-    /// name only members the record declares room for, and only the honest byte
-    /// may verify.
+    /// At `N = 5` the bitmap is one byte, so this pins **all 256 values**. Each
+    /// must either fail to decode or name only members the record has room for,
+    /// and only the honest byte may verify.
     #[test]
     fn no_bitmap_byte_can_name_a_member_the_committee_does_not_have() {
         let (keys, node) = committee_in(14);
@@ -549,7 +566,7 @@ mod tests {
         let slot = node.get_committee().slot_for(0).expect("slot");
         let outsider = xmss_sign(&out_sk, slot, &message).expect("sign");
         let mut sigs = quorum(&keys, node.get_committee(), &list, 0, &[0, 1]);
-        // The outsider takes member 2's seat — the only way in, and it fails
+        // The outsider takes member 2's seat: the only way in, and it fails
         // because seat 2 is checked against member 2's key.
         sigs.push((2, outsider.clone()));
         assert!(!node.verify_status_list(&record(list.clone(), 0, sigs)));

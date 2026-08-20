@@ -5,18 +5,18 @@
 //! verifying against the anchor, and the freshness gate deciding what the
 //! cryptography deliberately does not.
 //!
-//! It stays on the raw path on purpose — `verify_proof` would pull in
+//! It stays on the raw path on purpose: `verify_proof` would pull in
 //! `setup_prover()`, several seconds and a couple of gigabytes, for a property
 //! this test is not about.
 
-use decentralized_root_of_trust::atomic_slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
-use decentralized_root_of_trust::committee::Committee;
-use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
-use decentralized_root_of_trust::signer_node::{SignerNode, SignerNodeError};
-use decentralized_root_of_trust::status_list::{
+use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
+use decentralized_root_of_trust::node::signer::{SignerNode, SignerNodeError};
+use decentralized_root_of_trust::protocol::committee::Committee;
+use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, StatusList, hash_any, status_list_message,
 };
-use decentralized_root_of_trust::verifier_node::VerifierNode;
+use decentralized_root_of_trust::state::freshness::{Decision, HighWaterMark};
+use decentralized_root_of_trust::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 use lean_multisig::xmss_key_gen_from_seed;
 
 const N: usize = 5;
@@ -29,13 +29,13 @@ const SLOT_COUNT: u64 = WINDOW as u64 + 1;
 
 /// Seeds are `[FILE, ns, member, 0, ..]`. Each test gets its own `ns` because
 /// each also gets its own scratch dir, so the durable slot counters do *not*
-/// deduplicate across tests — without this, node 0 would sign slot `GENESIS` once
+/// deduplicate across tests: without this, node 0 would sign slot `GENESIS` once
 /// per test with one key, over messages that differ from test to test, which is
 /// the repeat leanVM v0.9's derandomized signing does *not* make harmless. The window is not a namespace: leanVM derives the
 /// one-time key from the seed alone (`gen_wots_secret_key(seed, slot,
 /// gen_public_param(seed))`), so two keys with the same seed share every chain
 /// however they were generated. `FILE` keeps this file disjoint from
-/// `src/committee.rs`'s tests and `tests/snark_path.rs`.
+/// `src/protocol/committee.rs`'s tests and `tests/snark_path.rs`.
 const FILE: u8 = 2;
 
 fn seed(ns: u8, member: u8) -> [u8; 32] {
@@ -53,7 +53,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// The committee, plus one signer node per member with its own durable counter —
+/// The committee, plus one signer node per member with its own durable counter:
 /// the deployment the protocol actually describes, where no member can reach
 /// another's state.
 fn bring_up(dir: &std::path::Path, ns: u8) -> (VerifierNode, Vec<SignerNode>) {
@@ -166,7 +166,7 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
     assert!(nodes[0].sign_at(&round0, slot0).is_ok());
 
     // A second *message* under the same (key, slot) is what leaks an XMSS secret
-    // key — and it is exactly the case leanVM v0.9's derandomized signing leaves
+    // key, and it is exactly the case leanVM v0.9's derandomized signing leaves
     // fatal, since the derivation includes the message. The counter refuses before
     // the key is ever touched, and refusing is a normal outcome: the member
     // abstains and the quorum proceeds without it.

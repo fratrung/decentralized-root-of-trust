@@ -13,20 +13,20 @@
 //! Persisting after signing is the natural-looking order and it is wrong: a crash
 //! between the signature and the write leaves the slot looking free, so the next
 //! boot signs a *different* message under it. Burning first means a crash can only
-//! ever waste slots, never reuse them — and wasting is free, since a key covers
+//! ever waste slots, never reuse them, and wasting is free, since a key covers
 //! `2^32` of them.
 //!
 //! The caller's policy then follows for nothing: a slot is consumed at reservation
-//! time, so whatever happens downstream — aggregation fails, the proof does not
-//! verify, the publish is refused — the slot is *not* reused. There is no
+//! time, so whatever happens downstream (aggregation fails, the proof does not
+//! verify, the publish is refused), the slot is *not* reused. There is no
 //! `release`, by design. The counter only ever moves forward.
 //!
-//! Contrast with [`crate::freshness`]: that gate is deliberately fail-**open** (a
+//! Contrast with [`crate::state::freshness`]: that gate is deliberately fail-**open** (a
 //! missing mark just means "nothing accepted yet"; worst case one stale record is
 //! accepted once). This counter is fail-**closed**: a missing or unreadable state
 //! file aborts signing, because the alternative is to restart from the first slot
 //! and silently reuse every slot the key has already spent. That is also why
-//! [`AtomicSlotCounter::create`] and [`AtomicSlotCounter::open`] are separate —
+//! [`AtomicSlotCounter::create`] and [`AtomicSlotCounter::open`] are separate:
 //! initialising state is an explicit first-install act, never a fallback.
 
 use std::fs::{self, File};
@@ -37,32 +37,17 @@ use lean_multisig::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 use ssz::Encode as _;
 
-/// Writes `next_free` so that it survives a power cut, then returns.
-///
-/// The four steps are all load-bearing:
-///   1. write the replacement to a temporary file;
-///   2. `fsync` it, so its *contents* reach the medium;
-///   3. `rename` over the target — atomic on POSIX, so a reader or a crash sees
-///      either the whole old record or the whole new one, never a mix;
-///   4. `fsync` the *directory*, so the rename itself is durable.
-///
-/// Step 4 is the one usually missing. Without it the contents are safe but the
-/// directory entry may still point at the old inode after a crash, which for this
-/// counter means resurrecting spent slots.
-/// `<path>.<suffix>`, by **appending** to the file name rather than replacing its
+/// `<path>.<suffix>`, **appending** to the file name rather than replacing its
 /// extension.
 ///
-/// `Path::with_extension` replaces the last dotted component, so it silently maps
+/// `Path::with_extension` replaces the last dotted component, silently mapping
 /// distinct keys onto one sibling file: `node-1.2` and `node-1.3` both yield
-/// `node-1.lock` and `node-1.tmp`. Two different keys would then contend on one
-/// lock — one of them refused as `Busy` for no reason — and, worse, share the
-/// temporary file that `persist` renames over the state, so one key's counter can
-/// land on the other's path. The fingerprint check catches that afterwards, but
-/// only after the state on disk is already wrong.
+/// `node-1.lock` and `node-1.tmp`. Two keys would then contend on one lock (one
+/// refused as `Busy` for no reason) and share the temporary file that `persist`
+/// renames over the state, so one key's counter can land on the other's path. The
+/// fingerprint check catches that only after the state on disk is already wrong.
 ///
-/// Key names are caller-supplied (`raw_agg` uses `member-0000`, but a real
-/// deployment might use a version, an address or a domain), so dots are not
-/// hypothetical.
+/// Key names are caller-supplied, so dots are not hypothetical.
 pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".");
@@ -70,6 +55,16 @@ pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Writes `next_free` so that it survives a power cut.
+///
+/// All four steps are load-bearing: write to a temporary file, `fsync` it so its
+/// *contents* reach the medium, `rename` over the target (atomic on POSIX, so a
+/// crash sees the whole old record or the whole new one), then `fsync` the
+/// *directory* so the rename itself is durable.
+///
+/// The last is the one usually missing. Without it the contents are safe but the
+/// directory entry may still point at the old inode after a crash, which for
+/// this counter means resurrecting spent slots.
 fn persist(path: &Path, key_tag: &str, next_free: u32) -> Result<(), AtomicSlotCounterError> {
     let tmp = sibling(path, "tmp");
 
@@ -196,9 +191,9 @@ pub struct AtomicSlotCounter {
     batch: u32,
     /// Set once the window's last slot has been handed out.
     ///
-    /// `next` cannot represent "one past `u32::MAX`", so with `end == u32::MAX` —
-    /// legal, since `xmss_key_gen` only rejects `slot_end >= 2^LOG_LIFETIME` and
-    /// `LOG_LIFETIME` is 32 — incrementing it wraps to 0. The guard is `next >
+    /// `next` cannot represent "one past `u32::MAX`", so with `end == u32::MAX`
+    /// (legal, since `xmss_key_gen` only rejects `slot_end >= 2^LOG_LIFETIME` and
+    /// `LOG_LIFETIME` is 32), incrementing it wraps to 0. The guard is `next >
     /// end`, which `0` sails straight through, so the counter would quietly start
     /// the window over and reissue slots it had already spent. This flag is the
     /// bit that `next` has no room for.
@@ -209,14 +204,14 @@ pub struct AtomicSlotCounter {
 
 impl AtomicSlotCounter {
     /// Initialises the counter for a brand-new key. Fails if the state file
-    /// already exists — overwriting it would reset a counter that is very likely
+    /// already exists: overwriting it would reset a counter that is very likely
     /// still live, which is precisely the accident this module exists to prevent.
     ///
     /// The existence check runs **while holding the lock**, and the order matters.
     /// Checking first and locking second leaves a window in which the refusal is
     /// decided against stale information: two processes both observe "no state
     /// file", the first wins the lock, creates the counter, spends slots and exits
-    /// releasing the lock — at which point the second acquires it and, still acting
+    /// releasing the lock, at which point the second acquires it and, still acting
     /// on its pre-lock observation, rewrites `next_free` back to `slot_start`. The
     /// key's own fingerprint check cannot catch that, because it is the same key.
     /// Every slot the first process spent is handed out a second time.
@@ -250,7 +245,7 @@ impl AtomicSlotCounter {
 
     /// Resumes an existing counter. `slot_end` must be the same bound the key was
     /// generated for. It is passed rather than read back because a counter is
-    /// keyed to the *public* key — that is what the anchor names a member by — and
+    /// keyed to the *public* key (that is what the anchor names a member by), and
     /// a public key carries no slot window: it is a Merkle root, identical in
     /// shape whatever range it covers. (The secret key does know, via
     /// `XmssSecretKey::activation_slots()`, but the holder of a secret key is the
@@ -291,7 +286,7 @@ impl AtomicSlotCounter {
     /// of an embedded controller, so paying one per signature can dominate
     /// signing. Reserving a window amortises it; the cost is that an unclean
     /// shutdown discards the unused remainder of that window. That is the harmless
-    /// direction — slots are skipped, never reused — so the only real budget is
+    /// direction (slots are skipped, never reused), so the only real budget is
     /// how much of the `2^32` window you are willing to waste per crash.
     ///
     /// `batch = 1` (the default) wastes nothing and fsyncs every signature.
@@ -316,7 +311,7 @@ impl AtomicSlotCounter {
     /// Reserves the next slot, making it durably spent **before** returning it.
     ///
     /// Once this returns `Ok(slot)`, that slot must be considered consumed
-    /// whatever the caller does with it — including doing nothing at all.
+    /// whatever the caller does with it, including doing nothing at all.
     pub fn reserve(&mut self) -> Result<u32, AtomicSlotCounterError> {
         if self.exhausted || self.next > self.end {
             return Err(AtomicSlotCounterError::Exhausted {
@@ -350,7 +345,7 @@ impl AtomicSlotCounter {
     /// Per-member counters stop working once `t < N`: the members that sit out a
     /// round do not advance, so by the next one they disagree about the slot, and
     /// an aggregate over one shared slot becomes impossible. Deriving the slot
-    /// from shared state — `slot = genesis + version` — removes the disagreement
+    /// from shared state (`slot = genesis + version`) removes the disagreement
     /// instead of reconciling it.
     ///
     /// Above `next`, every slot up to `requested` is burned in one durable write:
@@ -360,7 +355,7 @@ impl AtomicSlotCounter {
     /// Below `next` the answer is [`AtomicSlotCounterError::AlreadySpent`], which
     /// doubles as the anti-double-sign guard: a version this member already signed
     /// maps to a spent slot and is unreachable, with no extra state to keep. Being
-    /// refused is a normal outcome — the member abstains and the quorum proceeds
+    /// refused is a normal outcome: the member abstains and the quorum proceeds
     /// without it, which is what `t < N` is for.
     pub fn reserve_at(&mut self, requested: u32) -> Result<u32, AtomicSlotCounterError> {
         if self.exhausted || requested > self.end {
@@ -410,7 +405,7 @@ mod tests {
         p
     }
 
-    /// Slots 100..=140 — 41 of them. leanVM v0.9 takes an activation slot and a
+    /// Slots 100..=140, 41 of them. leanVM v0.9 takes an activation slot and a
     /// count where the old API took an inclusive pair, so the `+ 1` is explicit
     /// here rather than hidden in the callee.
     fn key(seed: u8) -> (XmssSecretKey, XmssPublicKey) {
@@ -436,7 +431,7 @@ mod tests {
     /// `create` must decide whether to refuse *while holding the lock*. Deciding
     /// first and locking second lets a second process act on an observation taken
     /// before the counter existed: it waits for the lock, gets it once the first
-    /// process exits, and rewinds `next_free` to `slot_start` — reissuing every
+    /// process exits, and rewinds `next_free` to `slot_start`, reissuing every
     /// slot already spent, with the key fingerprint matching because it is the
     /// same key.
     ///
@@ -469,7 +464,7 @@ mod tests {
 
     /// `next` cannot hold "one past `u32::MAX`", and the guard is `next > end`,
     /// which `0` passes. Without the exhaustion flag the counter wraps and hands
-    /// out the bottom of the window a second time — silently, and without even an
+    /// out the bottom of the window a second time, silently, and without even an
     /// fsync, since `durable` is still at the top.
     ///
     /// The key is irrelevant here; only the counter's arithmetic is under test.
@@ -557,7 +552,7 @@ mod tests {
         assert_eq!(c.reserve_at(105).unwrap(), 105);
         assert_eq!(c.next_slot(), 106);
 
-        // A round already behind us is refused — including the one just signed,
+        // A round already behind us is refused, including the one just signed,
         // which is the anti-double-sign guard.
         assert!(matches!(
             c.reserve_at(103),

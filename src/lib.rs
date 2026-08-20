@@ -1,11 +1,27 @@
-pub mod atomic_slot_counter;
-pub mod committee;
-pub mod freshness;
-pub mod mem;
+pub mod bench;
+pub mod node;
 pub mod params;
-pub mod signer_node;
-pub mod snark_prover_node;
-pub mod snark_verifier_node;
-pub mod stats;
-pub mod status_list;
-pub mod verifier_node;
+pub mod protocol;
+pub mod state;
+
+// Compatibility for local scratch binaries that are intentionally left in place.
+#[doc(hidden)]
+pub use bench::mem;
+#[doc(hidden)]
+pub use bench::stats;
+#[doc(hidden)]
+pub use node::raw_verifier as verifier_node;
+#[doc(hidden)]
+pub use node::signer as signer_node;
+#[doc(hidden)]
+pub use node::snark_prover as snark_prover_node;
+#[doc(hidden)]
+pub use node::snark_verifier as snark_verifier_node;
+#[doc(hidden)]
+pub use protocol::committee;
+#[doc(hidden)]
+pub use protocol::status_list;
+#[doc(hidden)]
+pub use state::freshness;
+#[doc(hidden)]
+pub use state::slot_counter as atomic_slot_counter;

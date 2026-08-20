@@ -42,7 +42,6 @@ fn vc_entry(vc: &Value) -> [u8; 32] {
     hash_any(canonical)
 }
 
-
 fn get_signers(n: u32) -> Vec<SignerNode> {
     let mut signers = Vec::with_capacity(n as usize);
     let mut rng = rand::rng();
@@ -121,7 +120,7 @@ fn main() {
         if signatures.len() >= committee.threshold() {
             break;
         }
- 
+
         if i % 2 != 1 {
             continue;
         }

@@ -1,4 +1,4 @@
-//! Verifier side of the split deployment — the constrained one.
+//! Verifier side of the split deployment, the constrained one.
 //!
 //! Calls **only** `setup_verifier()`. It never touches `setup_prover()`, so it
 //! avoids both the arena + DFT-twiddle allocations and, more importantly,
@@ -6,7 +6,7 @@
 //! freed memory to the OS, a prover process never does.
 //!
 //! Note what this file does *not* import: `params`. A verifier hardcodes nothing
-//! but its anchor — `N`, `t` and the member keys all come from `anchor.bin`.
+//! but its anchor: `N`, `t` and the member keys all come from `anchor.bin`.
 //! That is the whole point of the trust model.
 //!
 //! Files named `update-*` must verify; files named `attack-*` must be rejected.
@@ -15,20 +15,20 @@
 //! It then runs the DHT freshness layer: `select_freshest` picks the newest valid
 //! record, and a persistent high-water mark (`verifier-highwater.state`, keyed to
 //! the anchor; override with `VERIFIER_STATE`) refuses any replay of an older but
-//! still-valid record. That mark is local verifier state — never publish it.
+//! still-valid record. That mark is local verifier state; never publish it.
 //!
-//! Usage: cargo run --release --bin verifier -- [dir]      (default ./artifacts)
+//! Usage: `cargo run --release --bin verifier -- [dir]` (default `./artifacts`)
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::committee::Committee;
-use decentralized_root_of_trust::freshness::{Decision, HighWaterMark};
-use decentralized_root_of_trust::mem::{peak_rss_mb, rss_now_mb};
-use decentralized_root_of_trust::snark_verifier_node::PQSNARKVerifierModule;
-use decentralized_root_of_trust::stats::Series;
-use decentralized_root_of_trust::status_list::SnarkStatusList;
+use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
+use decentralized_root_of_trust::protocol::committee::Committee;
+use decentralized_root_of_trust::protocol::status_list::SnarkStatusList;
+use decentralized_root_of_trust::state::freshness::{Decision, HighWaterMark};
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -59,12 +59,9 @@ fn main() -> ExitCode {
 
     let rss_baseline = rss_now_mb();
 
-    // The anchor is read *before* setup because the verifier module is built around
-    // it: `PQSNARKVerifierModule::new` owns both the anchor and the `setup_verifier()`
-    // the aggregation bytecode needs. Reading ~6 kB from disk costs nothing that the
-    // RSS sample below can see, and the trust model is unchanged — a production
-    // verifier embeds this at compile time, and either way what matters is only that
-    // the anchor is authentic.
+    // Read before setup because `PQSNARKVerifierModule::new` owns both the anchor
+    // and the `setup_verifier()` call. A production verifier embeds the anchor at
+    // compile time; either way all that matters is that it is authentic.
     let anchor =
         std::fs::read(dir.join("anchor.bin")).unwrap_or_else(|e| panic!("cannot read anchor: {e}"));
     let committee = Committee::from_bytes(&anchor).expect("malformed anchor");
@@ -79,13 +76,9 @@ fn main() -> ExitCode {
 
     println!("verifier: setup...");
     let t_setup = Instant::now();
-    // `new` performs the one-time `setup_verifier()`, so this is the same
-    // measurement as before plus one clone of a 200-key anchor.
-    //
-    // The second argument feeds `PQSNARKVerifierModule::is_newer`, a *stateless*
-    // convenience this binary does not use: freshness here is the durable
-    // `HighWaterMark` below, which survives restarts and is what actually stops a
-    // rollback. `unwrap_or(0)` on a fresh state is therefore not load-bearing.
+    // The second argument feeds `is_newer`, a stateless convenience this binary
+    // does not use: freshness here is the durable `HighWaterMark` below, which
+    // survives restarts. `unwrap_or(0)` is therefore not load-bearing.
     let verifier = PQSNARKVerifierModule::new(committee, hwm.current().unwrap_or(0));
     let setup_time = t_setup.elapsed();
     let rss_after_setup = rss_now_mb();
@@ -107,7 +100,7 @@ fn main() -> ExitCode {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let bytes = std::fs::read(&path).expect("cannot read update");
         // Decoding is timed with verification: on an untrusted transport it is
-        // part of the cost an attacker can force, and it is not free — leanVM
+        // part of the cost an attacker can force, and it is not free: leanVM
         // recomputes the bytecode claim while deserializing.
         let t = Instant::now();
         let ok = match SnarkStatusList::from_bytes(&bytes) {
@@ -141,7 +134,7 @@ fn main() -> ExitCode {
     }
 
     // Forgeries: every one must be rejected. A decode failure counts as a
-    // rejection — refusing to parse is a valid way to refuse.
+    // rejection: refusing to parse is a valid way to refuse.
     println!("\nForgeries (expected: all REJECTED)");
     for path in artifacts(dir, "attack-") {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -186,10 +179,10 @@ fn main() -> ExitCode {
     }
     // The mark is passed *into* the selection, not merely consulted after it. A
     // record at or below the mark would verify and then be refused as stale, so
-    // paying for its proof first buys nothing — and the stale case is the common
+    // paying for its proof first buys nothing, and the stale case is the common
     // one, since a node polling an unchanged list hits it every round.
     let floor = hwm.current();
-    // How many candidates the floor removes, counted by *decoding* only — no proof
+    // How many candidates the floor removes, counted by *decoding* only: no proof
     // is verified to produce this number. That is the point: the diagnostic below
     // must not undo the saving it is reporting on.
     let pruned = match floor {
@@ -221,19 +214,16 @@ fn main() -> ExitCode {
                 failures += 1;
             }
         },
-        // Nothing came back, and the two reasons are not the same thing: the floor
-        // may have removed everything worth verifying (a re-run over an unchanged
-        // corpus — correct, and the case the floor exists for), or nothing verified
-        // at all with no floor in play (a bug). `pruned` tells them apart without
-        // verifying anything, which is the whole point — re-running the selection
-        // unfloored to produce a nicer message would undo the saving being reported.
+        // Nothing came back, and the two reasons differ: the floor removed
+        // everything worth verifying (a re-run over an unchanged corpus: correct,
+        // and what the floor is for), or nothing verified at all (a bug). `pruned`
+        // separates them without verifying anything, which is the point: re-running
+        // the selection unfloored for a nicer message would undo the saving.
         //
-        // The condition is `pruned > 0`, not "everything was pruned": the planted
-        // forgery declares a version *above* the mark, so it always survives the
-        // floor and always fails to verify. That is the artifact doing its job, not
-        // a bug. And this branch is not where a broken update would be caught
-        // anyway — every update is verified individually in the loop above, which
-        // prints `REJECTED <- BUG` and counts a failure for each one.
+        // `pruned > 0` rather than "everything was pruned": the planted forgery
+        // declares a version above the mark, so it always survives the floor and
+        // always fails to verify. A broken update is caught in the loop above, not
+        // here.
         None if pruned > 0 => println!(
             "  nothing newer than high-water {}: {pruned} of {} candidates pruned before verifying any proof",
             floor.expect("a non-zero prune count requires a floor"),
@@ -251,10 +241,8 @@ fn main() -> ExitCode {
     // Rollback attack: a hostile peer replays an old but validly signed record. It
     // passes verification (stateless) yet must be refused as stale by the mark.
     //
-    // Every way of *not* running this test is itself a failure. The chain used to
-    // be one `if let` sequence, so a missing artifact — the corpus regenerated with
-    // a single update, a renamed file — skipped the whole check with no output and
-    // nothing added to `failures`. A security test that silently declines to run is
+    // Every way of *not* running this test is itself a failure. A missing artifact
+    // must not skip the check silently: a security test that declines to run is
     // worse than one that fails, because the summary still reads clean.
     let replayed = artifacts(dir, "update-")
         .into_iter()

@@ -8,8 +8,8 @@
 //!
 //! Three properties, in increasing order of how much they matter:
 //!
-//! 1. **No panic.** `from_bytes` returns `Result`, so any panic — an index out of
-//!    range, an `unwrap`, a capacity overflow — is a bug regardless of what the
+//! 1. **No panic.** `from_bytes` returns `Result`, so any panic (an index out of
+//!    range, an `unwrap`, a capacity overflow) is a bug regardless of what the
 //!    bytes were.
 //! 2. **No allocation bomb.** SSZ offsets and lengths must describe regions that
 //!    actually exist in the input; a malformed offset must be rejected rather
@@ -25,7 +25,7 @@
 //! `verify_proof` costs ~30 ms and `setup_verifier` a further several seconds, so
 //! a run large enough to be interesting would take hours. Property 3 therefore
 //! covers `verify_status_list` only; the SNARK predicate is covered case-by-case
-//! in `tests/snark_path.rs`, which is the better tool for it anyway — a fuzzer is
+//! in `tests/snark_path.rs`, which is the better tool for it anyway: a fuzzer is
 //! very unlikely to stumble onto a valid aggregate.
 //!
 //! The seed is fixed, so a failure is reproducible and the suite does not become
@@ -33,11 +33,11 @@
 //! reliably and novel bugs only by luck. Raising `ITERATIONS` locally is the way
 //! to go looking for the latter.
 
-use decentralized_root_of_trust::committee::Committee;
-use decentralized_root_of_trust::status_list::{
+use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
+use decentralized_root_of_trust::protocol::committee::Committee;
+use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, StatusList, hash_any, status_list_message,
 };
-use decentralized_root_of_trust::verifier_node::VerifierNode;
 use lean_multisig::{xmss_key_gen_from_seed, xmss_sign};
 use rand::{RngExt, SeedableRng};
 
@@ -51,7 +51,7 @@ const VERSION: u32 = 0;
 const ITERATIONS: u32 = 60_000;
 
 /// Seeds are `[FILE, ns, member, 0, ..]`; file 5 here. See `tests/snark_path.rs`
-/// for why the tag exists — one `(key, slot)` pair must never be shared across
+/// for why the tag exists: one `(key, slot)` pair must never be shared across
 /// test files, and the slot window is not a namespace.
 fn seed(member: u8) -> [u8; 32] {
     let mut s = [0u8; 32];
@@ -94,7 +94,7 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
 
     // The wire codec is canonical: decoding then encoding an accepted record
     // yields exactly the original bytes. A trailing byte is not an alternative
-    // spelling of the same record under SSZ — and since leanVM v0.9 the same
+    // spelling of the same record under SSZ, and since leanVM v0.9 the same
     // holds *inside* each signature, which is a fixed 1208-byte SSZ object whose
     // field elements are refused at or above the modulus.
     assert_eq!(
@@ -172,8 +172,8 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
             decoded += 1;
             if verifier.verify_status_list(&sl) {
                 verified += 1;
-                // The one that would be a break. A mutant may legitimately verify
-                // — the mutation can be a no-op. What it may never do is verify
+                // The one that would be a break. A mutant may legitimately verify:
+                // the mutation can be a no-op. What it may never do is verify
                 // while meaning something else.
                 assert_eq!(sl.version(), VERSION, "forged version");
                 assert_eq!(sl.list(), entries().as_slice(), "forged list");
@@ -188,7 +188,7 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
         let _ = Committee::from_bytes(&bytes);
     }
 
-    // Not an assertion about a threshold — it is a guard against the whole loop
+    // Not an assertion about a threshold: it is a guard against the whole loop
     // quietly becoming a no-op, e.g. if a future change made every mutant fail to
     // decode. A run that decodes nothing is testing nothing.
     assert!(
