@@ -1039,7 +1039,6 @@ a byte value.
 
 ## Provenance
 
-This repository was written with AI assistance — Fable 5, Opus 5 and GPT-5.6 —
-across the design, the implementation and the prose. None of it was taken on
+This code was written with AI assistance Fable 5, Opus 5 and GPT-5.6. None of it was taken on
 trust: everything here was built, run and tested, the code was reviewed line by
 line before it landed, and the author takes responsibility for every commit.
