@@ -1,4 +1,4 @@
-//! The four messages the demo network exchanges, and their framing.
+//! The messages the demo network exchanges, and their framing.
 //!
 //! SSZ again, for the same reason the protocol objects use it: one encoding per
 //! value, decoders that refuse everything else, and no length varint whose
@@ -23,6 +23,16 @@ pub const MSG_PROPOSAL: u8 = 2;
 pub const MSG_SIGNATURE: u8 = 3;
 pub const MSG_VC_ISSUED: u8 = 4;
 pub const MSG_FAILURE: u8 = 5;
+
+/// The driver asking the resident node A to run one round. Carries a
+/// [`VcRequest`]; an empty subject means "verify what is already published"
+/// rather than "get me a credential".
+pub const MSG_ROUND_REQUEST: u8 = 6;
+
+/// The round finished and the record verified. Carries a [`Failure`]-shaped
+/// one-line verdict, because the report itself belongs in the log of the node
+/// that did the checking, not in the trigger's.
+pub const MSG_ROUND_RESULT: u8 = 7;
 
 /// Frames larger than this are refused before a single byte is allocated. The
 /// biggest legitimate message is a proposal carrying the whole status list, so

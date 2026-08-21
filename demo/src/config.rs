@@ -40,6 +40,17 @@ pub const MEMBER_IPS: [&str; N_MEMBERS] = [
 /// The port every member listens on, for both proposals and credential requests.
 pub const MEMBER_PORT: u16 = 9000;
 
+/// Node A's address, fixed for the same reason the members' are: the driver has
+/// to reach the relying party without discovering anything.
+///
+/// It is a *resident* address because the SNARK verifier's `setup_verifier()` is
+/// a per-process cost. A relying party that exits after every check pays it
+/// every time, which measures process startup rather than verification.
+pub const HOLDER_IP: &str = "172.28.0.30";
+
+/// The port node A takes triggers on.
+pub const HOLDER_PORT: u16 = 9100;
+
 /// Which form the aggregator publishes, and therefore which verifier the holder
 /// runs. The one difference between the two demos.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,6 +99,13 @@ pub fn member_addr(index: usize) -> SocketAddr {
     format!("{}:{}", MEMBER_IPS[index], MEMBER_PORT)
         .parse()
         .expect("member address table is malformed")
+}
+
+/// Where node A listens for round triggers.
+pub fn holder_addr() -> SocketAddr {
+    format!("{HOLDER_IP}:{HOLDER_PORT}")
+        .parse()
+        .expect("holder address is malformed")
 }
 
 /// How long the aggregator waits for signatures before giving up on the round.

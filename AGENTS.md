@@ -30,11 +30,12 @@ cargo run --release --bin raw_agg                      # the same protocol with 
 cargo run --release --bin prover   -- [outdir]         # split: aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
-cargo test                                             # 50 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
+cargo test                                             # 54 unit + 9 integration tests, ~30 s (incl. three real SNARKs)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
 tools/mutate.py                                        # mutation testing: 24 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
 ./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
+./demo/docker/demo.sh {raw|snark} verify               # node A re-checks what is published (expect a stale refusal)
 ./demo/docker/demo.sh {raw|snark} crash                # SIGKILL a member mid-protocol; it must refuse to re-sign
 ./demo/docker/demo.sh {raw|snark} down                 # stop and delete that demo's volumes
 ```
@@ -109,13 +110,21 @@ Library:
   protocol-chosen one, jumping forward over missed rounds and refusing the past.
 - `src/node/signer.rs` — one member: keypair + counter. `sign` for the local-slot
   path, `sign_at` for the derived-slot one.
-- `src/node/raw_verifier.rs` — one relying party on the **raw** path: `verify` for a
+- `src/node/raw_verifier.rs` — the **raw** path's predicate: `verify` for a
   single member signature, `verify_status_list` for the whole record (the five
   checks that decide whether an update is authorized). It is a method on the node
   and not a free function because every answer depends on the anchor it holds:
   the same bytes verify under one committee and not under another. Needs no
   `setup_verifier()` and no circuit, which is what makes it the honest comparison
   against the SNARK path.
+- `src/node/raw_node.rs` — the raw-path **relying party**: a `VerifierNode` and a
+  `HighWaterMark` in one type. `accept` decodes, verifies, and only then offers the
+  version to the gate; `accept_best` takes what several peers returned, drops
+  everything at or below the mark, and tries the rest newest-first. The ordering is
+  the reason the type exists: a mark that advanced on an unauthenticated record
+  could be pushed to `u32::MAX` by any peer, locking the node out of every genuine
+  update. No I/O beyond the mark's own file — transport lives above it, which is
+  what keeps the unit tests to byte strings.
 - `src/params.rs` — demo parameters (`SLOT` = the genesis slot, `N_MEMBERS`, `T`,
   `N_UPDATES`, `KEY_SLOTS`, `LOG_INV_RATE`), shared by `main.rs`, `prover` and
   `raw_agg`. The `verifier` deliberately imports none of them.
@@ -132,7 +141,7 @@ Library:
   cannot express. `sign_and_prove` refuses a repeated signer **before** signing —
   leanVM dedups the aggregate, so nothing downstream could catch it and the key
   would already be damaged.
-- `src/node/snark_verifier.rs` — the SNARK relying party, paired with
+- `src/node/snark_verifier.rs` — the SNARK path's predicate, paired with
   `setup_verifier()`. Owns the five checks, `is_newer`, and `select_freshest` (the
   DHT-layer selection: newest declared version first, verify, fall back on
   failure). `select_freshest_above` is the same with a floor — the caller's
@@ -140,6 +149,17 @@ Library:
   not a check: the floor can only drop records the caller was already going to
   refuse as stale. There is exactly **one** copy of each predicate and it lives
   here; an earlier second copy had drifted and silently lost the slot check.
+
+- `src/node/snark_node.rs` — the same composition over the aggregated form, and
+  the only thing the two paths differ in once a form is chosen. Owns a
+  `PQSNARKVerifierModule`, so holding one also means `setup_verifier()` has run;
+  `accept_best` delegates selection to `select_freshest_above` with the mark as the
+  floor. `tests/snark_node.rs` is the seam test: a genuine proof carrying a lying
+  version must not move the gate.
+- `src/node/mod.rs` — `Outcome` (`Accepted` / `Stale` / `Refused`) and
+  `Outcome::advance`, the single place a mark is moved. `Refused` deliberately does
+  not carry the version the record claimed: an unverified version is a peer's
+  assertion, not a fact, and handing it back invites a caller to order by it.
 
 Binaries:
 - `src/main.rs` — the combined single-process demo: the reference for the
@@ -215,6 +235,15 @@ Tests (`cargo test`, ~15 s warm, 58 in total: 57 run plus one `#[ignore]`d):
   merely *declares* a higher version, that `is_newer` is strict, and that a version
   with no slot under the anchor panics instead of proving something unverifiable.
   One aggregation, so a few seconds; one `#[test]`, for the arena reason above.
+- `tests/snark_node.rs` covers the *seam* the other two do not: that `SnarkNode`
+  never lets a record which failed the predicate reach the gate. A genuine proof
+  relabelled to version 9 is refused and leaves the mark untouched, which is the
+  case that matters — a mark an unauthenticated peer can advance locks the node
+  out of every honest update below it. Then the honest record is accepted, the
+  same bytes replayed are `Stale`, and a selection whose candidates are all at or
+  below the mark verifies nothing. One aggregation; one `#[test]`, for the arena
+  reason above. The raw half of the same seam is unit-tested in
+  `src/node/raw_node.rs`, where it costs nothing.
 - `tests/lock_two_processes.rs` checks the cross-process lock with two **real**
   processes: it re-execs the test binary (`child_probe`, `#[ignore]`d, driven with
   `--ignored --exact`) and reads a marker line back. The unit tests only ever
@@ -286,6 +315,15 @@ order, then exits), `signer` (a member, and the aggregator for one round when a
 holder dials it), `holder` (node A) and `probe` (asks one member to sign
 directly, exit `0` signed / `3` abstained, which is what lets the crash scenario
 assert instead of grep).
+
+`holder` is **resident**, and `round`/`verify` only send it a trigger (the same
+binary with `HOLDER_TRIGGER` set, run as the throwaway `trigger` service).
+`setup_verifier()` is a per-process cost, so a node A that exited after every
+check would pay 5 s and ~700 MB per record and the demo would be measuring
+process startup. Keep it that way: the one-shot shape still exists (neither
+`HOLDER_SERVE` nor `HOLDER_TRIGGER`) and is the honest cold-start measurement.
+Node A holds a `RawNode` or a `SnarkNode`, so the anti-rollback mark is inside
+the node and survives a container restart on its `holder-state` volume.
 
 Three things about it are load-bearing and easy to break by "simplifying":
 

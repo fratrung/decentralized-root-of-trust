@@ -9,3 +9,7 @@ signers/
 .claude/
 .agents/
 tools/__pycache__/
+
+# Prose is not compiled, and shipping it into the context means every edit to a
+# README invalidates the layer that took four minutes to build.
+*.md

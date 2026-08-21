@@ -12,8 +12,9 @@ party. The difference shows up in exactly two places, the aggregator's
 publication step and node A's verification step, and the demo prints both.
 
 ```
-./demo.sh raw   up        # build, start 1 bootstrap + 10 members
+./demo.sh raw   up        # build, start 1 bootstrap + 10 members + node A
 ./demo.sh raw   round     # node A asks for a credential, then verifies it
+./demo.sh raw   verify    # re-check what is published, without a new round
 ./demo.sh raw   crash     # kill a member mid-protocol, watch it re-align
 ./demo.sh raw   down      # stop and delete the volumes
 
@@ -30,7 +31,8 @@ The two demos share the `172.28.0.0/24` subnet, so only one runs at a time.
 |---|---|---|
 | `bootstrap` | 172.28.0.5 | assembles the anchor, then exits |
 | `signer-0` … `signer-9` | 172.28.0.11 … .20 | committee members, `N = 10`, `t = 7` |
-| `holder` | assigned | node A, the relying party; run on demand |
+| `holder` | 172.28.0.30 | node A, the relying party; resident, verifies on demand |
+| `trigger` | assigned | asks node A for one round; run on demand |
 | `probe` | assigned | double-sign probe; run on demand |
 
 Three volumes, and the split between them is the design:
@@ -64,9 +66,10 @@ Three volumes, and the split between them is the design:
    publishes it atomically to the shared volume, and only then hands over the
    credential. A credential whose fingerprint is not yet in a published record
    is one the holder could prove nothing about.
-6. Node A fetches the freshest record from the volume, verifies it against the
-   anchor, checks its own fingerprint is in the signed list, and advances its
-   anti-rollback mark.
+6. Node A fetches the freshest record from the volume and hands the bytes to a
+   `RawNode` or a `SnarkNode`, which decodes, verifies against the anchor, and
+   only then lets the version move its anti-rollback mark. Node A then checks
+   that its own fingerprint is in the list the committee signed.
 
 ## What the output is for
 
@@ -81,6 +84,26 @@ asserted.
 `xmss_verify` `t` times. The SNARK verifier must make the aggregation bytecode
 resident before it can so much as deserialise a proof. Both demos print RSS
 before and after that step, and the peak.
+
+## Node A is resident
+
+`up` starts node A along with the members, and it stays up. That is not a
+convenience: `setup_verifier()` is a **per-process** cost, so a relying party
+that exits after every check pays five seconds and several hundred megabytes for
+every record it looks at, and what you would be measuring is process startup.
+Resident, it pays once — the figures appear in `up`, not in front of every
+verification — and from then on a round costs only the proof.
+
+`round` and `verify` therefore do not build a verifier. They send node A a
+trigger, and it answers with a one-line verdict; the report belongs in the log of
+the node that did the checking, so `demo.sh` prints that log rather than moving
+the text across the wire. The one-shot shape is still there (`HOLDER_SERVE`
+unset), because it is the honest measurement of what a cold verifier costs.
+
+Staying up is also what makes the anti-rollback mark mean anything: node A
+carries a high-water version across rounds, so `verify` twice in a row shows the
+second answer refused as stale, which is exactly what a replayed record looks
+like.
 
 ## The crash scenario
 

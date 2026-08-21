@@ -337,6 +337,17 @@ it survives a restart. It is keyed to a fingerprint of the anchor, so a committe
 rotation legitimately resets the counter instead of rejecting the new generation.
 This is local verifier state and must never be published.
 
+Outside the predicate, but not outside a type. `RawNode` and `SnarkNode`
+(`src/node/raw_node.rs`, `src/node/snark_node.rs`) hold an anchor and a mark
+together and expose one entry point — `accept(bytes) -> Outcome` — which decodes,
+verifies, and only then offers the version to the gate. The ordering is not
+advice. A mark that advanced on a record which had not been authenticated could
+be pushed to `u32::MAX` by any peer that can spell a version number, after which
+every genuine update is refused as stale: a denial of service for the price of a
+forged integer. Owning both halves is what makes that sequence the only one
+expressible, the same way `SignerNode` owns its slot counter instead of trusting
+callers to burn a slot first.
+
 The mark also feeds *back into* selection. `select_freshest_above` takes it as a
 floor and drops every candidate not strictly above it before verifying anything —
 `select_freshest` is that function with no floor. This removes work, not attacks:
@@ -384,11 +395,13 @@ src/
     committee.rs        Committee anchor: members, threshold, genesis_slot, slot_for, index_of, wire encoding
     status_list.rs      StatusList (raw + bitmap) and SnarkStatusList, versioned Poseidon2 root, wire format
   node/
-    mod.rs
+    mod.rs              Outcome: what a relying party did with a record (accepted, stale, refused)
     signer.rs           one member: XMSS keypair + its counter; sign (local slot) and sign_at (protocol slot)
-    raw_verifier.rs     raw-path relying party: verify (one signature) and verify_status_list (the whole record)
+    raw_verifier.rs     the raw-path predicate: verify (one signature) and verify_status_list (the whole record)
+    raw_node.rs         the raw-path relying party: anchor + high-water mark, accept and accept_best
     snark_prover.rs     the prover: make_proof (slot derived from the anchor), aggregate, sign_and_prove
-    snark_verifier.rs   the SNARK relying party: the five checks, is_newer, select_freshest(_above)
+    snark_verifier.rs   the SNARK predicate: the five checks, is_newer, select_freshest(_above)
+    snark_node.rs       the SNARK relying party: the same composition over the aggregated form
   state/
     mod.rs
     slot_counter.rs     durable monotonic slot allocator: reserve, reserve_at, fsync + cross-process lock
@@ -569,8 +582,9 @@ holding one key each, a shared volume standing in for the DHT, and a relying
 party that starts out knowing nothing but the anchor.
 
 ```sh
-./demo/docker/demo.sh raw   up      # build the image, start 1 bootstrap + 10 members
+./demo/docker/demo.sh raw   up      # build the image, start 1 bootstrap + 10 members + node A
 ./demo/docker/demo.sh raw   round   # node A asks for a credential, then verifies it
+./demo/docker/demo.sh raw   verify  # re-check what is published, without a new round
 ./demo/docker/demo.sh raw   crash   # kill a member mid-protocol, watch it re-align
 ./demo/docker/demo.sh snark up      # the same network, publishing one proof instead
 ./demo/docker/demo.sh raw   down
@@ -584,13 +598,23 @@ already have: it proposes a *version*, and every member derives the XMSS slot
 from the anchor itself.
 
 What a run prints is what the sections above argue in the abstract. At `t = 7`
-the raw record is 8507 B, of which 8456 are the seven signatures, and its
-verifier peaks at 3 MB having run no setup at all. The SNARK record over the same
-list is 167 816 B and its verifier peaks at 694 MB after a 5.2 s
-`setup_verifier()`. That is the wrong side of the crossover described in
+the raw record is about 8.5 KB, of which 8456 B are the seven signatures, and
+node A checks it in ~7 ms having run no setup at all and never passing 3 MB
+resident. The SNARK record over the same list is about 169 KB, all but a hundred
+bytes of it proof, and node A checks it in ~41 ms after a 5.4 s
+`setup_verifier()` that leaves ~700 MB resident. That is the wrong side of the
+crossover described in
 [Where the SNARK starts paying off](#where-the-snark-starts-paying-off), which is
 the point: at a committee this small the aggregation costs more than it saves,
 and the demo shows it rather than asserting it.
+
+Node A is a **resident** container rather than a one-shot, because
+`setup_verifier()` is a per-process cost: a relying party that exited after every
+check would pay those 5.4 s and 700 MB per record, and the figure being measured
+would be process startup. It pays once, at `up`. Staying up is also what makes
+its `HighWaterMark` visible — `verify` twice in a row shows the second answer
+refused as stale, and a node A that is restarted announces the version below
+which it will accept nothing again.
 
 `crash` is the scenario the unit tests cannot reach. A member signs a version,
 is killed with `SIGKILL`, restarts, and is asked to sign a **different list at
@@ -1010,3 +1034,12 @@ been re-run. Its findings so far: three checks that no test reached at all
 (`verify_status_list`'s padding bits, the bitmap width, and `t == 0`), plus a
 padding test that had been locating the bitmap by searching a signature blob for
 a byte value.
+
+---
+
+## Provenance
+
+This repository was written with AI assistance — Fable 5, Opus 5 and GPT-5.6 —
+across the design, the implementation and the prose. None of it was taken on
+trust: everything here was built, run and tested, the code was reviewed line by
+line before it landed, and the author takes responsibility for every commit.

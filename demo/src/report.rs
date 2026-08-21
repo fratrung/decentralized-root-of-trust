@@ -64,6 +64,17 @@ pub fn memory(stage: &str, before: u64, after: u64) {
     println!("  peak (VmHWM)          : {:>5} MB", peak_rss_mb());
 }
 
+/// Where memory stands now, for a verifier whose setup is already behind it.
+///
+/// The peak is the number that matters on the SNARK path: it is set during
+/// `setup_verifier()` and never approached again, which is precisely the claim
+/// that a resident verifier is cheap and a cold one is not.
+pub fn memory_now() {
+    rule("verifier memory");
+    println!("  RSS now               : {:>5} MB", rss_now_mb());
+    println!("  peak (VmHWM)          : {:>5} MB", peak_rss_mb());
+}
+
 fn percent(part: usize, whole: usize) -> f64 {
     if whole == 0 {
         return 0.0;

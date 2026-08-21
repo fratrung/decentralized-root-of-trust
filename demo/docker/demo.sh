@@ -2,7 +2,7 @@
 #
 # Driver for the two container demos.
 #
-#   ./demo.sh raw   up        build the image and start the ten-member network
+#   ./demo.sh raw   up        build the image and start the network + node A
 #   ./demo.sh raw   round     node A asks for a credential, then verifies it
 #   ./demo.sh raw   verify    verify whatever is published, without a new round
 #   ./demo.sh raw   crash     kill a member mid-protocol and watch it re-align
@@ -12,6 +12,10 @@
 # `snark` in place of `raw` runs the same network publishing one aggregated
 # proof instead of the signatures. The two share a subnet, so `up` tears the
 # other one down first.
+#
+# Node A is resident: `up` starts it, it does its one-time setup there, and
+# `round` and `verify` only send it a trigger. That is why the SNARK setup cost
+# appears once, in `up`, instead of in front of every verification.
 
 set -euo pipefail
 
@@ -53,6 +57,37 @@ published_count() {
 # A member's own log, which is where its side of the protocol is visible.
 victim_log() { docker logs "drot-$MODE-signer-$VICTIM" 2>&1; }
 
+# Node A's log, where the report of every round it ran is printed.
+holder_log() { docker logs "drot-$MODE-holder" 2>&1; }
+
+# `grep -c` and not `grep -q`: under `pipefail` a `-q` that matches early kills
+# `docker logs` with SIGPIPE, and the pipeline then reports the failure of the
+# write rather than the success of the match.
+wait_for_holder() {
+  local deadline=$((SECONDS + 600))
+  until [ "$(holder_log | grep -c 'resident on' || true)" -gt 0 ]; do
+    [ "$SECONDS" -lt "$deadline" ] || bad "node A never finished its setup; try: $0 $MODE logs"
+    sleep 1
+  done
+}
+
+# Triggers one round on the resident node A and shows what it printed.
+#
+# The report is fetched from node A's log rather than sent back over the wire:
+# it is the relying party's own account of what it checked, and moving it would
+# only make it look like something the trigger was told.
+fire() {
+  local before status=0
+  wait_for_holder
+  before="$(holder_log | wc -l)"
+  # stdout of the trigger is dropped, stderr kept: its verdict is the last line
+  # of the log we are about to print anyway, but a trigger that cannot reach
+  # node A at all has to stay visible.
+  "${COMPOSE[@]}" run --rm --no-deps -e "HOLDER_TRIGGER=$1" trigger >/dev/null || status=$?
+  holder_log | tail -n +$((before + 1))
+  return "$status"
+}
+
 wait_until_ready() {
   local before="$1" deadline=$((SECONDS + 120))
   while [ "$(victim_log | grep -c 'ready on' || true)" -le "$before" ]; do
@@ -72,16 +107,19 @@ case "$CMD" in
     say "starting the $MODE network: 1 bootstrap + 10 members, threshold $THRESHOLD"
     "${COMPOSE[@]}" up -d --build
     wait_for_anchor
-    say "the committee is assembled and every member is listening"
+    say "waiting for node A to finish its one-time verifier setup"
+    wait_for_holder
+    holder_log | tail -n +2
+    say "the committee is assembled, every member is listening, node A is ready"
     "${COMPOSE[@]}" ps
     ;;
 
   round)
-    "${COMPOSE[@]}" run --rm holder
+    fire round
     ;;
 
   verify)
-    "${COMPOSE[@]}" run --rm -e VERIFY_ONLY=1 holder
+    fire verify
     ;;
 
   logs)
@@ -106,13 +144,21 @@ case "$CMD" in
 
     if [ "$(published_count)" -eq 0 ]; then
       say "step 0: nothing is published yet, running one normal round"
-      "${COMPOSE[@]}" run --rm holder >/dev/null
+      fire round >/dev/null
     fi
 
     say "step 1: member $VICTIM signs the next version (nobody publishes it)"
-    "${COMPOSE[@]}" run --rm --no-deps probe --member "$VICTIM" --entry pre-crash \
-      && ok "signed, so the slot for that version is now spent on disk" \
-      || bad "the member should have signed here"
+    # A run that ended between step 1 and step 5 leaves the victim holding a
+    # burned slot for a version nobody published, and it is right to refuse it a
+    # second time. Publishing one version moves the target forward, which is the
+    # same recovery step 6 relies on.
+    if ! "${COMPOSE[@]}" run --rm --no-deps probe --member "$VICTIM" --entry pre-crash; then
+      say "that version was spent by an earlier run; publishing one round and retrying"
+      fire round >/dev/null
+      "${COMPOSE[@]}" run --rm --no-deps probe --member "$VICTIM" --entry pre-crash \
+        || bad "the member should have signed here"
+    fi
+    ok "signed, so the slot for that version is now spent on disk"
 
     say "step 2: SIGKILL, no shutdown hook, no chance to flush anything"
     docker kill -s KILL "drot-$MODE-signer-$VICTIM" >/dev/null
@@ -134,14 +180,14 @@ case "$CMD" in
       || bad "expected an abstention (exit 3), got exit $status"
 
     say "step 5: a normal round. The committee does not need this member"
-    "${COMPOSE[@]}" run --rm holder >/dev/null \
+    fire round >/dev/null \
       && ok "quorum reached without member $VICTIM, which is what t < N is for" \
       || bad "the round should still have succeeded"
     victim_log | grep 'abstains' | tail -1
 
     say "step 6: the next round, at a version the member has not signed"
     signed_before="$(victim_log | grep -c 'signed v' || true)"
-    "${COMPOSE[@]}" run --rm holder >/dev/null
+    fire round >/dev/null
     if [ "$(victim_log | grep -c 'signed v' || true)" -gt "$signed_before" ]; then
       ok "member $VICTIM is signing again, re-aligned by deriving the slot from the anchor"
       victim_log | grep 'signed v' | tail -1
@@ -153,6 +199,6 @@ case "$CMD" in
     ;;
 
   *)
-    sed -n '3,14p' "$0"
+    sed -n '3,18p' "$0"
     ;;
 esac

@@ -212,17 +212,38 @@ services:
       drot:
         ipv4_address: 172.28.0.20
 
-  # Node A, the relying party. Started on demand, never as part of the network:
-  # `docker compose run --rm holder`.
+  # Node A, the relying party, and the only node holding no key. It is part of
+  # the network rather than a one-shot container because its setup is a
+  # per-process cost: on the SNARK path `setup_verifier()` takes seconds and
+  # hundreds of megabytes, and a verifier that exits after every check pays it
+  # every check. Resident, it pays once at startup and then only verifies.
   holder:
     <<: *node
     container_name: drot-snark-holder
     command: ["holder"]
-    profiles: ["tools"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      HOLDER_SERVE: "1"
     volumes:
       - committee:/shared/committee
       - storage:/shared/storage
       - holder-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.30
+
+  # Asks node A for one round and prints its verdict. A separate service only
+  # because `docker compose run` would otherwise try to claim node A's address.
+  trigger:
+    <<: *node
+    container_name: drot-snark-trigger
+    command: ["holder"]
+    profiles: ["tools"]
+    environment:
+      <<: *env
+      HOLDER_TRIGGER: "round"
     networks:
       - drot
 
