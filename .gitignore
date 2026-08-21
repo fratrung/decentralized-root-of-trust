@@ -13,3 +13,6 @@ src/bin/my_test_3.rs
 signers/
 next
 next_lock
+
+# The demo crate builds into its own target directory.
+demo/target

@@ -1,0 +1,11 @@
+# The build context is the repository root, so keep the heavy, regenerable and
+# host-specific directories out of it.
+target/
+demo/target/
+.git/
+bench-*/
+artifacts/
+signers/
+.claude/
+.agents/
+tools/__pycache__/

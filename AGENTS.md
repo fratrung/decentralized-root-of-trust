@@ -33,6 +33,10 @@ cargo run --release --bin signer                       # split: ONE member, one 
 cargo test                                             # 50 unit + 8 integration tests, ~25 s (incl. two real SNARKs)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
 tools/mutate.py                                        # mutation testing: 24 checks, each must be caught by a test
+./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
+./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
+./demo/docker/demo.sh {raw|snark} crash                # SIGKILL a member mid-protocol; it must refuse to re-sign
+./demo/docker/demo.sh {raw|snark} down                 # stop and delete that demo's volumes
 ```
 
 **Always `--release`** for anything touching the prover; it is unusable in a debug
@@ -267,6 +271,43 @@ The ~678 MB floor is `Bytecode.instructions_multilinear` in leanVM (the unrolled
 aggregation program's multilinear encoding). It is **not** driven by
 `MAX_XMSS_AGGREGATED` — that constant only appears in asserts — so shrinking it
 via a leanVM fork does not work. Treat the floor as a fixed constraint.
+
+### The container demos (`demo/`)
+
+A **separate crate**, with its own `[workspace]` and its own lockfile. That is
+the whole rule: the library and the four benchmark binaries are the artifact this
+project measures, and the demo adds networking, orchestration and a credential
+format, none of which belong in that surface. Nothing in `demo/` may be reachable
+from a `benchmark.sh` build, and the parent `Cargo.toml` must stay unaware of it.
+
+Ten containers run one image and differ only by environment. `demo/src/bin/`
+holds `bootstrap` (assembles the anchor from ten published public keys, in index
+order, then exits), `signer` (a member, and the aggregator for one round when a
+holder dials it), `holder` (node A) and `probe` (asks one member to sign
+directly, exit `0` signed / `3` abstained, which is what lets the crash scenario
+assert instead of grep).
+
+Three things about it are load-bearing and easy to break by "simplifying":
+
+1. **The aggregator never names the slot.** It proposes a version; every member
+   derives the slot through `Committee::slot_for`. An aggregator that could name
+   it could have two versions signed at one XMSS slot.
+2. **The address map decides where to look, never whether a signature is good.**
+   `config::MEMBER_IPS` turns a peer into a committee index; every signature is
+   then verified against `members[index]` from the anchor before it is counted.
+   A wrong entry must cost a rejected contribution, not a forged record.
+3. **Member keys are derived** from a per-container secret plus the shared run
+   identifier, so a restarted container comes back as the *same* member and its
+   counter file still belongs to its key. A new run rotates the identifier, and
+   therefore all ten keys, which is what stops a re-run from signing new content
+   at slots the previous run already spent.
+
+The `crash` scenario is the only test in the repository that kills a real process
+mid-protocol. The unit tests around `AtomicSlotCounter` restart it *cleanly*
+(`drop` then `open`, with the lock released and the file fully written), so the
+tmp/fsync/rename/fsync-dir chain is argued but not exercised there. Treat the
+scenario as coverage, not decoration: if it starts passing for the wrong reason
+(a member that never signed in step 1, say), it stops proving anything.
 
 ### The security boundary (most important thing to understand)
 

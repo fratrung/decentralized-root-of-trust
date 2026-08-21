@@ -411,6 +411,9 @@ tests/
   hostile_bytes.rs      the decoders against attacker-written bytes: no panic, no bomb, no forgery
 docs/
   architecture.svg / .png    the diagram at the top of this file
+demo/                   the container demos: ten members over a network, a shared volume
+                        for the published records, and node A. A separate crate with its
+                        own workspace, so it cannot change what benchmark.sh measures
 benchmark.sh            reproducible multi-run benchmark (env capture, tidy CSV, CI95)
 ```
 
@@ -555,6 +558,52 @@ scp -r artifacts/ host:~/ && ssh host ./verifier ~/artifacts
 
 Each `prover` run generates a **fresh random committee**, so artifacts from
 different runs are not interchangeable — start from a clean directory.
+
+---
+
+## Container demos
+
+The split deployment above is two processes on one machine, exchanging files. The
+demos in [`demo/`](demo/) run the same protocol as a network: ten containers
+holding one key each, a shared volume standing in for the DHT, and a relying
+party that starts out knowing nothing but the anchor.
+
+```sh
+./demo/docker/demo.sh raw   up      # build the image, start 1 bootstrap + 10 members
+./demo/docker/demo.sh raw   round   # node A asks for a credential, then verifies it
+./demo/docker/demo.sh raw   crash   # kill a member mid-protocol, watch it re-align
+./demo/docker/demo.sh snark up      # the same network, publishing one proof instead
+./demo/docker/demo.sh raw   down
+```
+
+Both demos run one committee (`N = 10`, `t = 7`) and differ in a single function:
+what the aggregator publishes once it has a quorum. There is no privileged
+coordinator. The aggregator is whichever member node A happened to dial, it holds
+the role for exactly one round, and it is given no power a member does not
+already have: it proposes a *version*, and every member derives the XMSS slot
+from the anchor itself.
+
+What a run prints is what the sections above argue in the abstract. At `t = 7`
+the raw record is 8507 B, of which 8456 are the seven signatures, and its
+verifier peaks at 3 MB having run no setup at all. The SNARK record over the same
+list is 167 816 B and its verifier peaks at 694 MB after a 5.2 s
+`setup_verifier()`. That is the wrong side of the crossover described in
+[Where the SNARK starts paying off](#where-the-snark-starts-paying-off), which is
+the point: at a committee this small the aggregation costs more than it saves,
+and the demo shows it rather than asserting it.
+
+`crash` is the scenario the unit tests cannot reach. A member signs a version,
+is killed with `SIGKILL`, restarts, and is asked to sign a **different list at
+the same version**, which is the one thing that would cost it its key. It
+refuses, because the slot was burned on disk before the key ever touched it. The
+committee then reaches quorum without it, which is what `t < N` is for, and one
+round later it is signing again, having derived its slot from the anchor rather
+than being told where it was.
+
+The demo is a separate crate with its own workspace and its own lockfile, so
+nothing in it can change what `benchmark.sh` measures. See
+[`demo/README.md`](demo/README.md) for the topology, the volume layout, and the
+deliberate simplifications.
 
 ---
 

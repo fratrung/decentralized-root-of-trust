@@ -1,0 +1,259 @@
+# RAW demo: ten committee members, threshold 7, one shared storage volume.
+#
+# Generated layout, deliberately explicit: every member's address, index and
+# state volume are visible in one place, because the address map is what the
+# aggregator turns into a bitmap position and a mismatch would be invisible
+# anywhere else.
+#
+# The two demos share the 172.28.0.0/24 subnet, so run one at a time.
+# `demo.sh` tears the other one down before bringing this one up.
+
+name: drot-raw
+
+x-node: &node
+  image: drot-demo:latest
+  build:
+    context: ../..
+    dockerfile: demo/docker/Dockerfile
+  restart: "no"
+  environment: &env
+    DEMO_MODE: raw
+    RUST_LOG: info
+  volumes:
+    - committee:/shared/committee
+    - storage:/shared/storage
+
+services:
+  bootstrap:
+    <<: *node
+    container_name: drot-raw-bootstrap
+    command: ["bootstrap"]
+    networks:
+      drot:
+        ipv4_address: 172.28.0.5
+
+  signer-0:
+    <<: *node
+    container_name: drot-raw-signer-0
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "0"
+      MEMBER_SECRET: "sky-anvil-quartz"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-0-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.11
+
+  signer-1:
+    <<: *node
+    container_name: drot-raw-signer-1
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "1"
+      MEMBER_SECRET: "north-ember-lattice"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-1-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.12
+
+  signer-2:
+    <<: *node
+    container_name: drot-raw-signer-2
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "2"
+      MEMBER_SECRET: "violet-tide-hammer"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-2-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.13
+
+  signer-3:
+    <<: *node
+    container_name: drot-raw-signer-3
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "3"
+      MEMBER_SECRET: "salt-cinder-rook"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-3-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.14
+
+  signer-4:
+    <<: *node
+    container_name: drot-raw-signer-4
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "4"
+      MEMBER_SECRET: "green-moss-pillar"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-4-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.15
+
+  signer-5:
+    <<: *node
+    container_name: drot-raw-signer-5
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "5"
+      MEMBER_SECRET: "amber-storm-relay"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-5-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.16
+
+  signer-6:
+    <<: *node
+    container_name: drot-raw-signer-6
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "6"
+      MEMBER_SECRET: "iron-willow-crest"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-6-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.17
+
+  signer-7:
+    <<: *node
+    container_name: drot-raw-signer-7
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "7"
+      MEMBER_SECRET: "slate-harbor-vane"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-7-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.18
+
+  signer-8:
+    <<: *node
+    container_name: drot-raw-signer-8
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "8"
+      MEMBER_SECRET: "copper-drift-nine"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-8-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.19
+
+  signer-9:
+    <<: *node
+    container_name: drot-raw-signer-9
+    command: ["signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "9"
+      MEMBER_SECRET: "umber-flint-sable"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - signer-9-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.20
+
+  # Node A, the relying party. Started on demand, never as part of the network:
+  # `docker compose run --rm holder`.
+  holder:
+    <<: *node
+    container_name: drot-raw-holder
+    command: ["holder"]
+    profiles: ["tools"]
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - holder-state:/state
+    networks:
+      - drot
+
+  # The double-sign probe. Same on-demand treatment.
+  probe:
+    <<: *node
+    container_name: drot-raw-probe
+    entrypoint: ["probe"]
+    command: []
+    profiles: ["tools"]
+    networks:
+      - drot
+
+networks:
+  drot:
+    name: drot-demo-net
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  committee:
+  storage:
+  holder-state:
+  signer-0-state:
+  signer-1-state:
+  signer-2-state:
+  signer-3-state:
+  signer-4-state:
+  signer-5-state:
+  signer-6-state:
+  signer-7-state:
+  signer-8-state:
+  signer-9-state:

@@ -1,0 +1,37 @@
+# Standalone crate, deliberately outside the measured one.
+#
+# The library and the four benchmark binaries are the artifact this project
+# publishes and measures; the demo adds networking, container orchestration and
+# a credential format, none of which belong in that surface. Keeping it a
+# separate package means the demo cannot change what the benchmark builds.
+#
+# The empty `[workspace]` table makes that explicit: this crate is its own
+# workspace root, so it is never pulled into a build of the parent.
+[package]
+name = "drot-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+decentralized-root-of-trust = { path = ".." }
+
+lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
+
+# Same wire discipline as the protocol objects: every message on the network has
+# exactly one encoding, and a decoder that refuses everything else.
+ssz = { package = "ethereum_ssz", version = "0.10.4" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.10.1" }
+
+# The credential itself. JCS canonicalisation is what makes its fingerprint
+# reproducible: the holder must hash the exact bytes the committee signed over.
+serde_json = "1.0"
+serde_jcs  = "0.2"
+
+sha3 = "0.10.8"
+rand = "0.10"
+
+[profile.release]
+debug = false
