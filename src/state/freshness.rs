@@ -1,19 +1,8 @@
-//! Persistent anti-rollback for the DHT layer.
+//! Persistent anti-rollback state for a status-list verifier.
 //!
-//! `verify_proof` is stateless: an old but validly signed `(list, version)` pair
-//! verifies forever, so the cryptographic checks alone cannot stop a peer from
-//! replaying a stale record. For an authorization list that is a real attack: an
-//! old status list re-grants access to a node that has since been revoked. This
-//! gate is the missing memory: it records the highest version accepted so far and
-//! refuses anything that is not strictly newer.
-//!
-//! The rule is strict (`version > mark`), not a window: accepting an older version
-//! would reopen exactly the rollback it is meant to close.
-//!
-//! The mark is scoped to a trust domain. It stores a fingerprint of the anchor it
-//! was built against and resets when that anchor changes (a committee rotation),
-//! because a version counter only totally-orders records under one committee. This
-//! is *local verifier state* and must never be published.
+//! The gate accepts only versions strictly above its mark. It is scoped to an
+//! anchor fingerprint, so an anchor change begins a new trust domain. This state
+//! is local and must not be published.
 
 use std::fs::File;
 use std::io::Write;
@@ -75,24 +64,11 @@ impl HighWaterMark {
         Decision::Accepted
     }
 
-    /// The same four durable steps as [`crate::state::slot_counter`]: write a
-    /// temporary file, `fsync` its *contents*, `rename` over the target (atomic on
-    /// POSIX, so no reader ever sees a half-written mark), then `fsync` the
-    /// *directory* so the rename itself survives.
-    ///
-    /// The last step is the one usually left out, and without it the claim made by
-    /// [`HighWaterMark::try_advance`] would be false: the contents would be safe
-    /// while the directory entry still pointed at the old mark, re-opening exactly
-    /// the rollback window this gate exists to close.
-    ///
-    /// It stays infallible: the gate is fail-**open** by design, and losing the
-    /// mark costs at most one stale record accepted once, but a failure is
-    /// reported rather than swallowed, because a mark that silently stops
-    /// persisting is indistinguishable from one that works.
+    /// Persists with write + fsync, atomic rename, and a directory fsync.
+    /// Persistence is fail-open, but a failure is reported to stderr.
     fn persist(&self) {
         let line = format!("{} {}\n", self.fingerprint, self.current);
-        // Appended, not `with_extension`: see `atomic_slot_counter::sibling` for why
-        // replacing the extension aliases distinct names onto one temporary file.
+        // Appending avoids colliding dotted state-file names.
         let tmp = crate::state::slot_counter::sibling(&self.path, "tmp");
 
         let durable = || -> std::io::Result<()> {
@@ -123,9 +99,7 @@ fn fingerprint(anchor: &[u8]) -> String {
     s
 }
 
-/// Parses `"<fingerprint> <version>"`, returning the version only if the
-/// fingerprint matches this domain: a different anchor means an unrelated
-/// counter, so we treat it as no mark at all.
+/// Parses a mark only when it belongs to this anchor fingerprint.
 fn parse(s: &str, fingerprint: &str) -> Option<(u32, bool)> {
     let mut it = s.split_whitespace();
     let fp = it.next()?;

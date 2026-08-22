@@ -1,18 +1,8 @@
-//! The prover: the one participant that turns `t` raw XMSS signatures into a
-//! single SNARK.
+//! SNARK aggregation for quorum XMSS signatures.
 //!
-//! `setup_prover()` is paired with the proving calls by construction: holding a
-//! `PQSNARKProverModule` *is* the proof that the aggregation bytecode was
-//! initialised, so no caller has to remember to do it.
-//!
-//! The slot is **derived from the anchor**, never accepted from the caller:
-//! `Committee::slot_for` is the only place `genesis + version` is computed, and a
-//! quorum free to pick its own slot for a version is what check 3 of
-//! [`crate::node::snark_verifier::PQSNARKVerifierModule::verify`] forbids.
-//!
-//! [`PQSNARKProverModule::aggregate`] is the deliberate exception: it takes an
-//! explicit slot, because the negative tests must build records the honest path
-//! structurally cannot express.
+//! Constructing [`PQSNARKProverModule`] performs leanVM setup. The honest API
+//! derives slots from the anchor; [`PQSNARKProverModule::aggregate`] accepts one
+//! explicitly only for adversarial tests.
 
 use lean_multisig::{
     MESSAGE_LEN_BYTES, XmssPublicKey, XmssSecretKey, XmssSignature,
@@ -30,16 +20,11 @@ impl PQSNARKProverModule {
         PQSNARKProverModule {}
     }
 
-    /// Aggregates `raws` (signatures over `(status_list_elem, version)`) into one
-    /// proof, at the slot `committee` assigns to `version`.
-    ///
-    /// The honest path: everything a publisher needs, with no way to name a slot
-    /// the anchor did not derive.
+    /// Aggregates signatures for `(status_list_elem, version)` at the anchor-derived slot.
     ///
     /// # Panics
     ///
-    /// If `version` has no slot under this anchor (`genesis + version` overflows
-    /// `u32`), which means the committee's key window ran out long ago.
+    /// Panics if `version` has no slot under this anchor.
     pub fn make_proof(
         &self,
         committee: &Committee,
@@ -55,13 +40,8 @@ impl PQSNARKProverModule {
         self.aggregate(raws, message, slot, log_inv_rate)
     }
 
-    /// Aggregates already-produced signatures at an **explicit** slot, returning
-    /// the bytes to store in `SnarkStatusList.zk_proof`. `message` is the packed
-    /// Poseidon2 root of the status list, what the issuers actually signed.
-    ///
-    /// Prefer [`PQSNARKProverModule::make_proof`], which derives both from the
-    /// anchor. This exists for the adversarial tests, which must produce the
-    /// mismatches the derived path makes unrepresentable.
+    /// Aggregates at an explicit slot for adversarial tests. Production callers
+    /// should use [`Self::make_proof`].
     pub fn aggregate(
         &self,
         raws: Vec<(XmssPublicKey, XmssSignature)>,
@@ -105,23 +85,8 @@ impl PQSNARKProverModule {
     }
 }
 
-/// Panics if one member appears twice in the quorum.
-///
-/// This guards a **silent quorum shortfall**, not key material.
-/// `aggregate_single_message_signatures` sorts and dedups its input, so `t`
-/// indices containing a repeat aggregate `t - 1` distinct keys. The proof is
-/// valid and honestly says `t - 1`, which the verifier's check 4 then refuses,
-/// after seconds and gigabytes have been spent on it. Failing here turns a wasted
-/// proof into a loud caller bug.
-///
-/// It does not cover one key signing *two different messages* at one slot, which
-/// is still fatal. That is unreachable from here (every signer in one call signs
-/// one message) and belongs to [`crate::state::slot_counter`], which is why that
-/// is a durable counter and not a check.
-///
-/// A panic, because the quorum is chosen by the protocol and a repeated index is
-/// a bug in that choice, not a recoverable condition. A free function, so the test
-/// can reach it without paying for `setup_prover()`.
+/// Panics on a repeated signer before aggregation silently deduplicates it into a
+/// below-threshold quorum. XMSS slot reuse remains the slot counter's concern.
 fn reject_repeated_signers(signers: &[usize], slot: u32) {
     let mut seen = signers.to_vec();
     seen.sort_unstable();

@@ -1,33 +1,8 @@
-//! Durable, monotonic slot allocator for one XMSS key.
+//! Durable, monotonic slot allocation for one XMSS key.
 //!
-//! XMSS is a **stateful** signature scheme. Each `(key, slot)` pair may sign
-//! exactly once; signing two different messages under one slot reveals enough of
-//! the WOTS hash chains to forge signatures for that slot, and the key is gone.
-//! Unlike a rollback on the verifier side this is not recoverable, so every
-//! choice in this module is made in the pessimistic direction.
-//!
-//! Everything rests on one ordering rule:
-//!
-//! > **The slot is burned on disk, durably, *before* it is handed to the signer.**
-//!
-//! Persisting after signing is the natural-looking order and it is wrong: a crash
-//! between the signature and the write leaves the slot looking free, so the next
-//! boot signs a *different* message under it. Burning first means a crash can only
-//! ever waste slots, never reuse them, and wasting is free, since a key covers
-//! `2^32` of them.
-//!
-//! The caller's policy then follows for nothing: a slot is consumed at reservation
-//! time, so whatever happens downstream (aggregation fails, the proof does not
-//! verify, the publish is refused), the slot is *not* reused. There is no
-//! `release`, by design. The counter only ever moves forward.
-//!
-//! Contrast with [`crate::state::freshness`]: that gate is deliberately fail-**open** (a
-//! missing mark just means "nothing accepted yet"; worst case one stale record is
-//! accepted once). This counter is fail-**closed**: a missing or unreadable state
-//! file aborts signing, because the alternative is to restart from the first slot
-//! and silently reuse every slot the key has already spent. That is also why
-//! [`AtomicSlotCounter::create`] and [`AtomicSlotCounter::open`] are separate:
-//! initialising state is an explicit first-install act, never a fallback.
+//! A slot is fsync'd as spent before it is returned. A crash may waste slots but
+//! cannot reuse one, which would compromise stateful XMSS. Missing or invalid state
+//! therefore refuses signing; initialization is explicit through [`AtomicSlotCounter::create`].
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -37,17 +12,9 @@ use lean_multisig::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 use ssz::Encode as _;
 
-/// `<path>.<suffix>`, **appending** to the file name rather than replacing its
-/// extension.
+/// Returns `<path>.<suffix>` without replacing an existing extension.
 ///
-/// `Path::with_extension` replaces the last dotted component, silently mapping
-/// distinct keys onto one sibling file: `node-1.2` and `node-1.3` both yield
-/// `node-1.lock` and `node-1.tmp`. Two keys would then contend on one lock (one
-/// refused as `Busy` for no reason) and share the temporary file that `persist`
-/// renames over the state, so one key's counter can land on the other's path. The
-/// fingerprint check catches that only after the state on disk is already wrong.
-///
-/// Key names are caller-supplied, so dots are not hypothetical.
+/// Separate dotted key names must not share a lock or temporary state file.
 pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".");
@@ -55,21 +22,13 @@ pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Writes `next_free` so that it survives a power cut.
-///
-/// All four steps are load-bearing: write to a temporary file, `fsync` it so its
-/// *contents* reach the medium, `rename` over the target (atomic on POSIX, so a
-/// crash sees the whole old record or the whole new one), then `fsync` the
-/// *directory* so the rename itself is durable.
-///
-/// The last is the one usually missing. Without it the contents are safe but the
-/// directory entry may still point at the old inode after a crash, which for
-/// this counter means resurrecting spent slots.
-fn persist(path: &Path, key_tag: &str, next_free: u32) -> Result<(), AtomicSlotCounterError> {
+/// Persists `next_free` through power loss: write + fsync, rename, then fsync the
+/// parent directory. Skipping the final sync could resurrect spent slots.
+fn persist(path: &Path, key_tag: &str, next_free: u64) -> Result<(), AtomicSlotCounterError> {
     let tmp = sibling(path, "tmp");
 
     let mut f = File::create(&tmp)?;
-    f.write_all(format!("{key_tag} {next_free}\n").as_bytes())?;
+    f.write_all(format!("v2 {key_tag} {next_free}\n").as_bytes())?;
     f.sync_all()?;
     drop(f);
 
@@ -80,10 +39,8 @@ fn persist(path: &Path, key_tag: &str, next_free: u32) -> Result<(), AtomicSlotC
     Ok(())
 }
 
-/// Advisory lock guarding one key's counter, so two processes cannot hand out the
-/// same slot. It lives on a *separate* file: locking the state file we replace by
-/// rename would leave the lock attached to the old, now orphaned inode, and two
-/// processes would each believe they hold it.
+/// Locks a separate sibling file so replacing the state file cannot discard the
+/// cross-process lock.
 fn acquire_lock(state_path: &Path) -> Result<File, AtomicSlotCounterError> {
     let lock_path = sibling(state_path, "lock");
     let file = File::options()
@@ -95,10 +52,7 @@ fn acquire_lock(state_path: &Path) -> Result<File, AtomicSlotCounterError> {
     Ok(file)
 }
 
-/// Ties a state file to one key. Over the public key's canonical SSZ bytes (32,
-/// fixed) rather than a self-describing encoding: the tag must be stable for a
-/// given key and distinct for every other, and a format with alternative
-/// spellings of the same value cannot promise the first half of that.
+/// Binds state to the public key's canonical SSZ representation.
 fn key_fingerprint(pk: &XmssPublicKey) -> String {
     let bytes = pk.as_ssz_bytes();
     Sha3_256::digest(&bytes)
@@ -107,9 +61,12 @@ fn key_fingerprint(pk: &XmssPublicKey) -> String {
         .collect()
 }
 
-/// Parses `"<fingerprint> <next_free>"`. Every failure mode is an error, never a
-/// default: a counter we cannot read is a counter we must not guess.
-fn parse(s: &str, key_tag: &str) -> Result<u32, AtomicSlotCounterError> {
+/// Parses the versioned state record, while recognizing ordinary legacy files.
+fn parse(s: &str, key_tag: &str) -> Result<(u64, bool), AtomicSlotCounterError> {
+    let (s, legacy) = match s.strip_prefix("v2 ") {
+        Some(versioned) => (versioned, false),
+        None => (s, true),
+    };
     let mut it = s.split_whitespace();
     let fp = it
         .next()
@@ -122,22 +79,21 @@ fn parse(s: &str, key_tag: &str) -> Result<u32, AtomicSlotCounterError> {
             "state file belongs to a different key".into(),
         ));
     }
-    next.parse::<u32>()
-        .map_err(|e| AtomicSlotCounterError::State(format!("unparseable slot counter: {e}")))
+    let next = next
+        .parse::<u64>()
+        .map_err(|e| AtomicSlotCounterError::State(format!("unparseable slot counter: {e}")))?;
+    Ok((next, legacy))
 }
 
-/// Everything that can stop the counter from issuing a slot.
-///
-/// Every variant is a refusal. There is deliberately no variant meaning
-/// "carry on with a guessed slot".
+/// Refusals from slot allocation. None permit guessing a slot.
 #[derive(Debug)]
 pub enum AtomicSlotCounterError {
     /// The key's slot window is used up. Only a re-key fixes this.
-    Exhausted { next: u32, end: u32 },
+    Exhausted { next: u64, end: u32 },
     /// A protocol-chosen slot lies in this member's past. Returned only by
     /// [`AtomicSlotCounter::reserve_at`], and the one variant here that is not a
     /// malfunction: the member simply sits this round out.
-    AlreadySpent { requested: u32, next: u32 },
+    AlreadySpent { requested: u32, next: u64 },
     /// The state file is missing, malformed, or belongs to a different key.
     /// Refusing here is the whole point: see the module docs.
     State(String),
@@ -173,31 +129,20 @@ impl From<std::io::Error> for AtomicSlotCounterError {
     }
 }
 
-/// The on-disk record is a single line, `"<key fingerprint> <next_free>"`, where
-/// every slot below `next_free` is considered spent. The fingerprint ties the
-/// counter to one key: a state file written for a different key is rejected
-/// outright rather than reset, because it says nothing about *this* key's history.
+/// On-disk state is `"v2 <key fingerprint> <next_free-u64>"`; every lower slot is spent.
+/// A foreign state file is refused rather than reset.
 pub struct AtomicSlotCounter {
     path: PathBuf,
     key_tag: String,
     /// Next slot to hand out (in memory). Invariant: `next <= durable`.
-    next: u32,
+    next: u64,
     /// Highest `next_free` written to disk. Slots in `next..durable` are already
     /// burned on disk and can be handed out without another fsync.
-    durable: u32,
+    durable: u64,
     /// Last usable slot, inclusive (as passed to `xmss_key_gen`).
     end: u32,
     /// How many slots to burn per fsync. See [`AtomicSlotCounter::with_batch`].
-    batch: u32,
-    /// Set once the window's last slot has been handed out.
-    ///
-    /// `next` cannot represent "one past `u32::MAX`", so with `end == u32::MAX`
-    /// (legal, since `xmss_key_gen` only rejects `slot_end >= 2^LOG_LIFETIME` and
-    /// `LOG_LIFETIME` is 32), incrementing it wraps to 0. The guard is `next >
-    /// end`, which `0` sails straight through, so the counter would quietly start
-    /// the window over and reissue slots it had already spent. This flag is the
-    /// bit that `next` has no room for.
-    exhausted: bool,
+    batch: u64,
     /// Held for the counter's whole lifetime: cross-process mutual exclusion.
     _lock: File,
 }
@@ -230,15 +175,14 @@ impl AtomicSlotCounter {
                 path.display()
             )));
         }
-        persist(&path, &key_tag, slot_start)?;
+        persist(&path, &key_tag, u64::from(slot_start))?;
         Ok(Self {
             path,
             key_tag,
-            next: slot_start,
-            durable: slot_start,
+            next: u64::from(slot_start),
+            durable: u64::from(slot_start),
             end: slot_end,
             batch: 1,
-            exhausted: false,
             _lock: lock,
         })
     }
@@ -264,7 +208,21 @@ impl AtomicSlotCounter {
         let raw = fs::read_to_string(&path).map_err(|e| {
             AtomicSlotCounterError::State(format!("cannot read {}: {e}", path.display()))
         })?;
-        let next = parse(&raw, &key_tag)?;
+        let (next, legacy) = parse(&raw, &key_tag)?;
+        let one_past_end = u64::from(slot_end) + 1;
+        if next > one_past_end {
+            return Err(AtomicSlotCounterError::State(format!(
+                "persisted next slot {next} is outside this key's window ending at {slot_end}"
+            )));
+        }
+        if legacy && slot_end == u32::MAX && next == u64::from(u32::MAX) {
+            return Err(AtomicSlotCounterError::State(
+                "legacy state at u32::MAX is ambiguous; refusing to risk slot reuse".into(),
+            ));
+        }
+        if legacy {
+            persist(&path, &key_tag, next)?;
+        }
         // Everything below the persisted `next_free` is treated as spent. This is
         // what makes a crash mid-window safe: the unused tail of the previous
         // reservation is skipped, never replayed.
@@ -275,7 +233,6 @@ impl AtomicSlotCounter {
             durable: next,
             end: slot_end,
             batch: 1,
-            exhausted: false,
             _lock: lock,
         })
     }
@@ -291,21 +248,18 @@ impl AtomicSlotCounter {
     ///
     /// `batch = 1` (the default) wastes nothing and fsyncs every signature.
     pub fn with_batch(mut self, batch: u32) -> Self {
-        self.batch = batch.max(1);
+        self.batch = u64::from(batch.max(1));
         self
     }
 
     /// The next slot that would be handed out.
-    pub fn next_slot(&self) -> u32 {
+    pub fn next_slot(&self) -> u64 {
         self.next
     }
 
     /// Slots left in the window.
     pub fn remaining(&self) -> u64 {
-        if self.exhausted {
-            return 0;
-        }
-        (u64::from(self.end) + 1).saturating_sub(u64::from(self.next))
+        (u64::from(self.end) + 1).saturating_sub(self.next)
     }
 
     /// Reserves the next slot, making it durably spent **before** returning it.
@@ -313,7 +267,7 @@ impl AtomicSlotCounter {
     /// Once this returns `Ok(slot)`, that slot must be considered consumed
     /// whatever the caller does with it, including doing nothing at all.
     pub fn reserve(&mut self) -> Result<u32, AtomicSlotCounterError> {
-        if self.exhausted || self.next > self.end {
+        if self.next > u64::from(self.end) {
             return Err(AtomicSlotCounterError::Exhausted {
                 next: self.next,
                 end: self.end,
@@ -322,21 +276,12 @@ impl AtomicSlotCounter {
         if self.next >= self.durable {
             // Extend the durable window. Saturating at `end + 1` keeps the record
             // inside the key's range even with a large batch.
-            let target = self
-                .next
-                .saturating_add(self.batch)
-                .min(self.end.saturating_add(1));
+            let target = (self.next + self.batch).min(u64::from(self.end) + 1);
             persist(&self.path, &self.key_tag, target)?;
             self.durable = target;
         }
-        let slot = self.next;
-        match self.next.checked_add(1) {
-            Some(n) => self.next = n,
-            // `slot` was `u32::MAX`, the last slot the type can name. Leave `next`
-            // pointing at it and record the exhaustion out of band rather than
-            // wrapping to 0.
-            None => self.exhausted = true,
-        }
+        let slot = u32::try_from(self.next).expect("next is within the u32 slot window");
+        self.next += 1;
         Ok(slot)
     }
 
@@ -358,32 +303,27 @@ impl AtomicSlotCounter {
     /// refused is a normal outcome: the member abstains and the quorum proceeds
     /// without it, which is what `t < N` is for.
     pub fn reserve_at(&mut self, requested: u32) -> Result<u32, AtomicSlotCounterError> {
-        if self.exhausted || requested > self.end {
+        let requested_u64 = u64::from(requested);
+        if self.next > u64::from(self.end) || requested > self.end {
             return Err(AtomicSlotCounterError::Exhausted {
-                next: requested,
+                next: self.next.max(requested_u64),
                 end: self.end,
             });
         }
-        if requested < self.next {
+        if requested_u64 < self.next {
             return Err(AtomicSlotCounterError::AlreadySpent {
                 requested,
                 next: self.next,
             });
         }
-        if requested >= self.durable {
+        if requested_u64 >= self.durable {
             // Same batching rule as `reserve`, clamped so the record never claims
             // slots outside the key's window.
-            let target = requested
-                .saturating_add(self.batch)
-                .min(self.end.saturating_add(1));
+            let target = (requested_u64 + self.batch).min(u64::from(self.end) + 1);
             persist(&self.path, &self.key_tag, target)?;
             self.durable = target;
         }
-        // Same wraparound reasoning as `reserve`.
-        match requested.checked_add(1) {
-            Some(n) => self.next = n,
-            None => self.exhausted = true,
-        }
+        self.next = requested_u64 + 1;
         Ok(requested)
     }
 }
@@ -462,10 +402,9 @@ mod tests {
         assert_eq!(reopened.reserve().unwrap(), 102);
     }
 
-    /// `next` cannot hold "one past `u32::MAX`", and the guard is `next > end`,
-    /// which `0` passes. Without the exhaustion flag the counter wraps and hands
-    /// out the bottom of the window a second time, silently, and without even an
-    /// fsync, since `durable` is still at the top.
+    /// The persisted `u64` value must retain "one past `u32::MAX`" across a
+    /// restart. Otherwise the last slot remains recorded as the next free slot
+    /// and is issued again when the process comes back.
     ///
     /// The key is irrelevant here; only the counter's arithmetic is under test.
     #[test]
@@ -484,6 +423,31 @@ mod tests {
         assert!(matches!(
             c.reserve_at(u32::MAX),
             Err(AtomicSlotCounterError::Exhausted { .. })
+        ));
+        drop(c);
+
+        let mut reopened = AtomicSlotCounter::open(&path, &pk, u32::MAX).unwrap();
+        assert_eq!(reopened.next_slot(), u64::from(u32::MAX) + 1);
+        assert!(matches!(
+            reopened.reserve(),
+            Err(AtomicSlotCounterError::Exhausted { .. })
+        ));
+        assert!(matches!(
+            reopened.reserve_at(u32::MAX),
+            Err(AtomicSlotCounterError::Exhausted { .. })
+        ));
+    }
+
+    #[test]
+    fn ambiguous_legacy_state_at_u32_max_is_refused() {
+        let path = scratch("legacy-max");
+        let (_, pk) = key(7);
+        fs::write(&path, format!("{} {}\n", key_fingerprint(&pk), u32::MAX)).unwrap();
+
+        assert!(matches!(
+            AtomicSlotCounter::open(&path, &pk, u32::MAX),
+            Err(AtomicSlotCounterError::State(message))
+                if message.contains("ambiguous")
         ));
     }
 

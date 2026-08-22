@@ -1,24 +1,7 @@
-//! The relying party for the raw form: an anchor, a durable mark, and the order
-//! between them.
+//! Raw-path relying party: anchor verification plus a durable freshness gate.
 //!
-//! [`VerifierNode`] answers *did `t` members of this committee sign this
-//! record*, and that answer is timeless: a record that was valid last year still
-//! verifies. [`HighWaterMark`] answers the other half, *have I already seen
-//! something at least this new*, and is the only part that can refuse a replay.
-//!
-//! Neither is enough alone, and the order between them is not a matter of taste.
-//! A mark that advances on a record which has not been authenticated is a mark an
-//! unauthenticated peer can push to `u32::MAX`, after which every genuine update
-//! is refused as stale: a denial of service that costs the attacker one forged
-//! version number. So the mark may only move after the anchor has spoken, and
-//! this type owns both halves so that there is no way to reach the second
-//! without the first — the same reason [`crate::node::signer::SignerNode`] owns
-//! its slot counter instead of trusting callers to burn a slot before signing.
-//!
-//! There is no I/O here beyond the mark's own file. The node is handed bytes and
-//! returns a verdict; who to ask, how long to wait and how many peers to poll
-//! belong to a transport above it. That is what keeps this testable with a byte
-//! string instead of a socket.
+//! Records are verified before their version can advance the mark, preventing an
+//! unauthenticated peer from pinning the node to a forged high version.
 
 use crate::node::Outcome;
 use crate::node::raw_verifier::VerifierNode;
@@ -32,11 +15,7 @@ pub struct RawNode {
 }
 
 impl RawNode {
-    /// The anchor this node trusts and the mark it has already reached.
-    ///
-    /// The mark is injected rather than opened here: it is file-backed and scoped
-    /// to a trust domain, and a node that built its own would decide where a
-    /// deployment keeps its state. See [`HighWaterMark::load`].
+    /// Builds a node from its anchor and an externally managed, anchor-scoped mark.
     pub fn new(committee: Committee, mark: HighWaterMark) -> Self {
         Self {
             verifier: VerifierNode::new(committee),
@@ -48,14 +27,12 @@ impl RawNode {
         self.verifier.get_committee()
     }
 
-    /// The predicate on its own, for a caller that wants to check a record
-    /// without offering it to the gate.
+    /// Returns the underlying stateless verification predicate.
     pub fn verifier(&self) -> &VerifierNode {
         &self.verifier
     }
 
-    /// The highest version accepted so far, or `None` if this node has accepted
-    /// nothing under this anchor.
+    /// Returns the highest accepted version, if any.
     pub fn high_water(&self) -> Option<u32> {
         self.mark.current()
     }
@@ -68,19 +45,10 @@ impl RawNode {
         self.accept_record(&record)
     }
 
-    /// The freshest candidate that verifies, out of what several peers returned.
+    /// Tries candidates newest first and accepts the first valid record above the
+    /// current mark.
     ///
-    /// A lookup yields many versions of one object: some stale, some hostile.
-    /// Candidates are tried newest-declared-version first, and anything at or
-    /// below the mark is dropped *before* a signature is checked — the same shape
-    /// as
-    /// [`crate::node::snark_verifier::PQSNARKVerifierModule::select_freshest_above`],
-    /// and sound for the same reason: a peer controls only its own declared
-    /// version, so understating one forfeits a record that was going to be
-    /// refused as stale anyway.
-    ///
-    /// `Refused` when nothing above the mark verified, which includes the case
-    /// where every candidate was simply old.
+    /// Versions at or below the mark are skipped before signature verification.
     pub fn accept_best(&mut self, candidates: &[Vec<u8>]) -> Outcome {
         let floor = self.mark.current();
         let mut decoded: Vec<StatusList> = candidates

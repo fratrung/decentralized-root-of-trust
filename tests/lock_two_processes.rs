@@ -117,7 +117,7 @@ fn a_second_process_cannot_hold_one_key_at_the_same_time() {
     // checked against later rather than merely "it opened".
     assert_eq!(counter.reserve().expect("slot"), GENESIS);
     assert_eq!(counter.reserve().expect("slot"), GENESIS + 1);
-    assert_eq!(counter.next_slot(), GENESIS + 2);
+    assert_eq!(counter.next_slot(), u64::from(GENESIS + 2));
 
     // --- the property ---
     // A second process, same key, same state file, while the first still holds it.

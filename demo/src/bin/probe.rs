@@ -19,7 +19,9 @@
 
 use std::time::Duration;
 
-use decentralized_root_of_trust::protocol::status_list::{SnarkStatusList, StatusList, hash_any};
+use decentralized_root_of_trust::protocol::status_list::{
+    SnarkStatusList, StatusList, hash_any, status_list_message,
+};
 use drot_demo::config::{self, MEMBER_IPS, Mode};
 use drot_demo::storage;
 use drot_demo::wire::{self, Failure, Proposal, SignatureReply};
@@ -53,6 +55,7 @@ fn main() {
         None => panic!("nothing is published yet; run a normal round first"),
     };
     let version = version.unwrap_or(published + 1);
+    let predecessor = status_list_message(&list, published);
     let entry = hash_any(label.as_bytes());
     list.push(entry);
 
@@ -65,7 +68,12 @@ fn main() {
         "probe: asking member {member} ({}) to sign v{version} (slot {slot}) with entry `{label}`",
         MEMBER_IPS[member]
     );
-    let payload = Proposal { version, list }.as_ssz_bytes();
+    let payload = Proposal {
+        predecessor,
+        version,
+        list,
+    }
+    .as_ssz_bytes();
     let answer = wire::request(
         config::member_addr(member),
         config::request_timeout(),

@@ -58,7 +58,7 @@ impl SignerNode {
     }
 
     /// The slot the next signature would use.
-    pub fn next_slot(&self) -> u32 {
+    pub fn next_slot(&self) -> u64 {
         self.a_slot_counter.next_slot()
     }
 
@@ -170,7 +170,7 @@ mod tests {
             assert_eq!(slot, expected);
             assert!(xmss_verify(signer.public_key(), slot, &message, &sig).is_ok());
         }
-        assert_eq!(signer.next_slot(), START + 3);
+        assert_eq!(signer.next_slot(), u64::from(START + 3));
     }
 
     /// The property the whole design exists for: a failed signature still burns
@@ -187,7 +187,7 @@ mod tests {
         for _ in START..=END {
             signer.sign(&message).expect("in-window sign");
         }
-        assert_eq!(signer.next_slot(), END + 1);
+        assert_eq!(signer.next_slot(), u64::from(END + 1));
 
         // Now leanVM refuses: the slot is outside the key's range.
         assert!(matches!(
@@ -195,11 +195,11 @@ mod tests {
             Err(SignerNodeError::Sign(_))
         ));
         // ...and the slot was spent anyway. This is the point.
-        assert_eq!(signer.next_slot(), END + 2);
+        assert_eq!(signer.next_slot(), u64::from(END + 2));
 
         // A second failure burns another one rather than retrying END + 1.
         assert!(signer.sign(&message).is_err());
-        assert_eq!(signer.next_slot(), END + 3);
+        assert_eq!(signer.next_slot(), u64::from(END + 3));
     }
 
     #[test]

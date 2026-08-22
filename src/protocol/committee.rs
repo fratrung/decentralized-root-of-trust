@@ -36,21 +36,33 @@ pub struct Committee {
     genesis_slot: u32,
 }
 
+fn has_duplicate_members(members: &[XmssPublicKey]) -> bool {
+    members
+        .iter()
+        .enumerate()
+        .any(|(i, member)| members[i + 1..].contains(member))
+}
+
 impl Committee {
     /// Builds the committee from its members' public keys, the threshold `t`, and
     /// the XMSS slot round 0 is signed at.
     ///
     /// # Panics
     ///
-    /// If `t` is not in `1..=members.len()`. Both bounds are load-bearing: `t = 0`
-    /// lets a record with *no* signatures reach quorum, `t > N` is unsatisfiable.
-    /// An anchor is built once by its owner, so this asserts rather than returning
-    /// a `Result`.
+    /// If `t` is not in `1..=members.len()` or a public key occurs more than once.
+    /// Both threshold bounds are load-bearing: `t = 0` lets a record with *no*
+    /// signatures reach quorum, while `t > N` is unsatisfiable. Duplicate keys
+    /// would let one key occupy several committee identities. An anchor is built
+    /// once by its owner, so this asserts rather than returning a `Result`.
     pub fn new(members: Vec<XmssPublicKey>, t: usize, genesis_slot: u32) -> Self {
         assert!(
             (1..=members.len()).contains(&t),
             "threshold {t} outside 1..={} for this committee",
             members.len()
+        );
+        assert!(
+            !has_duplicate_members(&members),
+            "committee members must have distinct public keys"
         );
         Committee {
             members,
@@ -143,8 +155,9 @@ impl Committee {
     /// decoder refuses a field element at or above the modulus. Canonicity is
     /// structural rather than checked.
     ///
-    /// What SSZ cannot know is the protocol invariant, so `t` outside `1..=N` is
-    /// refused here too: deserialization bypasses [`Committee::new`].
+    /// What SSZ cannot know are the protocol invariants, so `t` outside `1..=N`
+    /// and duplicate public keys are refused here too: deserialization bypasses
+    /// [`Committee::new`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let value = CommitteeWire::from_ssz_bytes(bytes)
             .map_err(|e| format!("committee is not valid SSZ: {e:?}"))?;
@@ -155,6 +168,9 @@ impl Committee {
                 "anchor threshold {t} outside 1..={}",
                 value.members.len()
             ));
+        }
+        if has_duplicate_members(&value.members) {
+            return Err("anchor contains duplicate member public keys".into());
         }
         Ok(Committee {
             members: value.members,
@@ -223,6 +239,29 @@ mod tests {
         assert_eq!(decoded.members().len(), N);
         assert_eq!(decoded.threshold(), T);
         assert_eq!(decoded.genesis_slot(), GENESIS);
+    }
+
+    #[test]
+    #[should_panic(expected = "committee members must have distinct public keys")]
+    fn constructor_refuses_duplicate_member_keys() {
+        let pk = committee_in(4).members()[0].clone();
+        let _ = Committee::new(vec![pk.clone(), pk], 2, GENESIS);
+    }
+
+    #[test]
+    fn decoder_refuses_duplicate_member_keys() {
+        let pk = committee_in(5).members()[0].clone();
+        let bytes = CommitteeWire {
+            members: vec![pk.clone(), pk],
+            t: 2,
+            genesis_slot: GENESIS,
+        }
+        .as_ssz_bytes();
+
+        let err = Committee::from_bytes(&bytes)
+            .err()
+            .expect("duplicate keys must be refused");
+        assert!(err.contains("duplicate member public keys"));
     }
 
     /// Two byte-different encodings of one committee would read as two trust

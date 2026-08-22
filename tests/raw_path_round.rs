@@ -136,8 +136,8 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
 
     // Members 3 and 4 sat out round 0. Reaching round 1's slot burned round 0's
     // rather than reclaiming it: skipping is free, reuse costs the key.
-    assert_eq!(nodes[3].next_slot(), GENESIS + 2);
-    assert_eq!(nodes[4].next_slot(), GENESIS + 2);
+    assert_eq!(nodes[3].next_slot(), u64::from(GENESIS + 2));
+    assert_eq!(nodes[4].next_slot(), u64::from(GENESIS + 2));
 
     // --- the rollback. The record is genuinely signed and still verifies: the
     // cryptography is stateless and cannot tell "old" from "current". Only the
@@ -176,7 +176,7 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
         Err(SignerNodeError::Slot(AtomicSlotCounterError::AlreadySpent {
             requested,
             next
-        })) if requested == slot0 && next == slot0 + 1
+        })) if requested == slot0 && next == u64::from(slot0 + 1)
     ));
 
     // The other four are untouched by member 0's refusal, so the round still
@@ -202,7 +202,7 @@ fn a_restart_does_not_replay_spent_slots() {
         AtomicSlotCounter::open(dir.join("member-0"), &pk, GENESIS + WINDOW).expect("reopen");
     assert_eq!(
         counter.next_slot(),
-        GENESIS + 1,
+        u64::from(GENESIS + 1),
         "slot {GENESIS} was spent before the restart"
     );
 }

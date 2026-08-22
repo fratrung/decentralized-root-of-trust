@@ -54,6 +54,9 @@ pub struct VcRequest {
 /// a reused XMSS slot is a recovered secret key.
 #[derive(SszEncode, SszDecode)]
 pub struct Proposal {
+    /// Poseidon2/KoalaBear message of the status-list version being extended.
+    /// The genesis proposal uses the all-zero predecessor constant.
+    pub predecessor: [u8; 32],
     pub version: u32,
     pub list: Vec<[u8; 32]>,
 }

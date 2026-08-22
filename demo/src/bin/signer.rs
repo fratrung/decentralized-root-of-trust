@@ -36,6 +36,7 @@ use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, StatusList, status_list_message,
 };
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
+use decentralized_root_of_trust::state::status_list_head::{GENESIS_PREDECESSOR, SignedHead};
 use drot_demo::config::{self, MEMBER_IPS, MEMBER_PORT, Mode, N_MEMBERS, THRESHOLD};
 use drot_demo::storage;
 use drot_demo::vc;
@@ -54,6 +55,9 @@ struct Node {
     /// their own threads, and two concurrent signatures would race the counter
     /// that exists precisely to keep them apart.
     signer: Mutex<SignerNode>,
+    /// Exact state this member last signed. Storage is consulted only to recover
+    /// it after a restart, never to authorize another transition while running.
+    signed_head: Mutex<Option<SignedHead>>,
     /// Serialises the rounds *this* node coordinates. Two holders arriving at
     /// once would otherwise propose the same version twice, and the second round
     /// would collect nothing but abstentions.
@@ -132,11 +136,14 @@ fn main() {
         "the anchor does not name this key at index {index}"
     );
 
+    let signed_head = recover_signed_head(mode).expect("published record is unreadable");
+
     let node = Arc::new(Node {
         index,
         mode,
         committee,
         signer: Mutex::new(SignerNode::new(pk, sk, counter)),
+        signed_head: Mutex::new(signed_head),
         round: Mutex::new(()),
         prover: OnceLock::new(),
         rounds_served: AtomicUsize::new(0),
@@ -162,6 +169,25 @@ fn main() {
             Err(e) => eprintln!("member {index}: accept failed: {e}"),
         }
     }
+}
+
+/// Re-establishes the in-memory head after a process restart. In production the
+/// bytes come from the authenticated DHT recovery policy; during a process
+/// lifetime they are never consulted again to authorize a transition.
+fn recover_signed_head(mode: Mode) -> Result<Option<SignedHead>, String> {
+    storage::latest_record()
+        .map(|(_, bytes)| {
+            let (version, list) = match mode {
+                Mode::Raw => {
+                    StatusList::from_bytes(&bytes).map(|r| (r.version(), r.list_cloned()))?
+                }
+                Mode::Snark => {
+                    SnarkStatusList::from_bytes(&bytes).map(|r| (r.version(), r.list_cloned()))?
+                }
+            };
+            Ok(SignedHead::from_authenticated(version, &list))
+        })
+        .transpose()
 }
 
 impl Node {
@@ -207,13 +233,22 @@ impl Node {
             }
         };
 
-        if let Err(why) = self.extends_published(&proposal) {
-            println!(
-                "member {}: v{} from {peer} refused, {why}",
-                self.index, proposal.version
-            );
-            return (wire::MSG_SIGNATURE, abstain(&why));
-        }
+        let mut signed_head = self.signed_head.lock().expect("signed head poisoned");
+        let next_head = match SignedHead::successor(
+            signed_head.as_ref(),
+            &proposal.predecessor,
+            proposal.version,
+            &proposal.list,
+        ) {
+            Ok(head) => head,
+            Err(why) => {
+                println!(
+                    "member {}: v{} from {peer} refused, {why}",
+                    self.index, proposal.version
+                );
+                return (wire::MSG_SIGNATURE, abstain(&why));
+            }
+        };
 
         // Derived, never taken from the proposal. An aggregator that could pick
         // the slot could have one version signed at the slot of another.
@@ -233,6 +268,7 @@ impl Node {
             .sign_at(&message, slot);
         match signed {
             Ok(signature) => {
+                *signed_head = Some(next_head);
                 println!(
                     "member {}: signed v{} at slot {slot} in {:.1?} ({} entries, asked by {peer})",
                     self.index,
@@ -259,47 +295,6 @@ impl Node {
                 (wire::MSG_SIGNATURE, abstain(format!("{e}")))
             }
         }
-    }
-
-    /// A proposal must append exactly one entry to the record already published.
-    ///
-    /// Without this a member signs whatever it is handed, and an aggregator could
-    /// have the committee attest a list with entries removed. The check is
-    /// structural rather than cryptographic on purpose: the published record's
-    /// own signatures are what a relying party checks, and asking every member to
-    /// verify a SNARK before it may sign would put the aggregator's cost on all
-    /// ten nodes.
-    fn extends_published(&self, proposal: &Proposal) -> Result<(), String> {
-        let published = storage::latest_record()
-            .map(|(_, bytes)| self.decode_list(&bytes))
-            .transpose()?;
-
-        match published {
-            None => {
-                if proposal.version != 0 || proposal.list.len() != 1 {
-                    return Err(format!(
-                        "nothing is published yet, so only v0 with one entry is valid, got v{} with {}",
-                        proposal.version,
-                        proposal.list.len()
-                    ));
-                }
-            }
-            Some((version, list)) => {
-                if proposal.version != version + 1 {
-                    return Err(format!(
-                        "v{} does not follow the published v{version}",
-                        proposal.version
-                    ));
-                }
-                if proposal.list.len() != list.len() + 1 || !proposal.list.starts_with(&list) {
-                    return Err(format!(
-                        "v{} is not the published list plus one entry",
-                        proposal.version
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The `(version, list)` carried by a published record, in whichever form
@@ -337,9 +332,12 @@ impl Node {
         // Extend the published list. The version is derived from what is on the
         // storage volume, not chosen: it is what every member will independently
         // turn into an XMSS slot.
-        let (version, mut list) = match storage::latest_record() {
+        let (version, predecessor, mut list) = match storage::latest_record() {
             Some((_, bytes)) => match self.decode_list(&bytes) {
-                Ok((v, list)) => (v + 1, list),
+                Ok((v, list)) => {
+                    let predecessor = status_list_message(&list, v);
+                    (v + 1, predecessor, list)
+                }
                 Err(e) => {
                     return (
                         wire::MSG_FAILURE,
@@ -347,7 +345,7 @@ impl Node {
                     );
                 }
             },
-            None => (0, Vec::new()),
+            None => (0, GENESIS_PREDECESSOR, Vec::new()),
         };
 
         let credential = vc::issue(&subject, version, self.index);
@@ -360,6 +358,7 @@ impl Node {
         );
 
         let proposal = Proposal {
+            predecessor,
             version,
             list: list.clone(),
         };
