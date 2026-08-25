@@ -81,12 +81,73 @@ pub fn entry_to_field(entry: &[u8; 32]) -> [KoalaBear; 8] {
     poseidon16_compress_pair(&poseidon16_compress(lo), &poseidon16_compress(hi))
 }
 
-/// Folds the entries and version into a Poseidon2 root.
+/// Generation of the signed-message construction.
+///
+/// It is **not** the wire schema's version — the SSZ containers are unchanged by
+/// it. It is the epoch of what a signature *means*. Bumping it makes every
+/// previously signed message stop verifying, which is the intended effect when
+/// the construction below changes shape.
+const MESSAGE_FORMAT: u32 = 1;
+
+/// The trust domain a signed message belongs to.
+///
+/// Without this the message was `(list, version)` and nothing else, which made a
+/// signature say only "some key signed these entries at this number". Two status
+/// lists governed by one committee then had *interchangeable* records: a record
+/// published for one verified, in full, as a record of the other — same quorum,
+/// same version, same derived slot, all five checks green. One anchor could
+/// therefore govern exactly one list, and nothing in the code said so.
+///
+/// The domain closes that by starting the fold from a committee-specific IV
+/// instead of `[0; 8]`. It binds three things:
+///
+/// - the **anchor**, through a fingerprint of its canonical encoding, so every
+///   member key, `t` and the genesis slot are all covered. A different committee
+///   is a different domain, and — deliberately — a *rotated* committee is too,
+///   which is the same trust-domain notion [`crate::state::freshness::HighWaterMark`]
+///   already uses to decide when to reset its mark;
+/// - the **algorithm**, so a record cannot be relabelled from one signature
+///   scheme to another while keeping evidence produced under the first. Today
+///   only one tag decodes, so this is latent; it stops being latent the moment a
+///   second one exists, and by then the format would be frozen;
+/// - the **construction generation** ([`MESSAGE_FORMAT`]).
+///
+/// Prefixed, not appended, and that is the part worth keeping: a Merkle–Damgård
+/// chain that starts from a shared IV lets every domain share its intermediate
+/// states, so one internal collision found against attacker-chosen entries would
+/// be reusable across all of them. Starting from a domain-specific IV means two
+/// domains have no common prefix to attack.
+///
+/// It is unforgeable by construction rather than checked: there is no way to
+/// compute a message without naming a domain, because [`status_list_message`]
+/// takes one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Domain([KoalaBear; 8]);
+
+impl Domain {
+    /// Builds the domain from a fingerprint of the anchor's canonical encoding.
+    ///
+    /// Callers should go through [`crate::protocol::committee::Committee::domain`]
+    /// rather than here: the anchor is what owns its own fingerprint, exactly as
+    /// it owns `slot_for`, and a second place to compute either is a second place
+    /// to drift.
+    pub fn new(anchor_fingerprint: &[u8; 32], alg: Algorithms) -> Self {
+        let mut tag = [KoalaBear::ZERO; 8];
+        tag[0] = KoalaBear::from_u32(MESSAGE_FORMAT);
+        tag[1] = KoalaBear::from_u32(u32::from(algorithm_tag(alg)));
+        Domain(poseidon16_compress_pair(
+            &entry_to_field(anchor_fingerprint),
+            &tag,
+        ))
+    }
+}
+
+/// Folds the entries and version into a Poseidon2 root, under `domain`.
 ///
 /// The version is split into 16-bit limbs to avoid field aliasing, binding the
 /// cleartext version to the signed list.
-pub fn status_list_root_fe(list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
-    let mut acc = [KoalaBear::ZERO; 8];
+pub fn status_list_root_fe(domain: &Domain, list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
+    let mut acc = domain.0;
     for e in list {
         acc = poseidon16_compress_pair(&acc, &entry_to_field(e));
     }
@@ -99,11 +160,11 @@ pub fn status_list_root_fe(list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
 /// Canonically packs the root into the 32-byte message signed by XMSS.
 ///
 /// Each limb is its canonical little-endian `u32`, making the packing injective.
-pub fn status_list_message(list: &[[u8; 32]], version: u32) -> [u8; 32] {
+pub fn status_list_message(domain: &Domain, list: &[[u8; 32]], version: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (chunk, fe) in out
         .chunks_exact_mut(4)
-        .zip(status_list_root_fe(list, version))
+        .zip(status_list_root_fe(domain, list, version))
     {
         chunk.copy_from_slice(&fe.as_canonical_u32().to_le_bytes());
     }
@@ -399,6 +460,12 @@ mod tests {
         vec![hash_any(b"vc-1"), hash_any(b"vc-2")]
     }
 
+    /// One fixed domain for the tests that are about the fold rather than about
+    /// the domain. `domain_separation_is_a_prefix` is the one that varies it.
+    fn dom() -> Domain {
+        Domain::new(&[0x5A; 32], Algorithms::WotsXmss)
+    }
+
     /// The packing is the new seam between this crate's Poseidon2 fold and
     /// leanVM's byte-oriented XMSS API, and every binding argument in the protocol
     /// rests on it being injective. It cannot be tested exhaustively, so what is
@@ -408,8 +475,8 @@ mod tests {
     #[test]
     fn the_message_is_the_canonical_packing_of_the_root() {
         let list = entries();
-        let root = status_list_root_fe(&list, 3);
-        let message = status_list_message(&list, 3);
+        let root = status_list_root_fe(&dom(), &list, 3);
+        let message = status_list_message(&dom(), &list, 3);
 
         for (i, (chunk, fe)) in message.chunks_exact(4).zip(root).enumerate() {
             let value = u32::from_le_bytes(chunk.try_into().expect("4 bytes"));
@@ -421,7 +488,7 @@ mod tests {
         }
         assert_eq!(
             message,
-            status_list_message(&list, 3),
+            status_list_message(&dom(), &list, 3),
             "the message must be a function of (list, version) alone"
         );
     }
@@ -433,12 +500,16 @@ mod tests {
     #[test]
     fn the_message_moves_with_both_the_list_and_the_version() {
         let list = entries();
-        let base = status_list_message(&list, 0);
+        let base = status_list_message(&dom(), &list, 0);
 
-        assert_ne!(base, status_list_message(&list, 1), "version not bound");
         assert_ne!(
             base,
-            status_list_message(&[list[0]], 0),
+            status_list_message(&dom(), &list, 1),
+            "version not bound"
+        );
+        assert_ne!(
+            base,
+            status_list_message(&dom(), &[list[0]], 0),
             "a removed entry left the message unchanged"
         );
 
@@ -446,16 +517,58 @@ mod tests {
         appended.push(hash_any(b"FAKE-REVOCATION"));
         assert_ne!(
             base,
-            status_list_message(&appended, 0),
+            status_list_message(&dom(), &appended, 0),
             "an appended entry left the message unchanged"
         );
 
         // The version is folded in as 16-bit limbs, so the high half has to reach
         // the message too: a `u32 & 0xFFFF` truncation would alias these two.
         assert_ne!(
-            status_list_message(&list, 1),
-            status_list_message(&list, 1 + (1 << 16)),
+            status_list_message(&dom(), &list, 1),
+            status_list_message(&dom(), &list, 1 + (1 << 16)),
             "versions differing only above bit 16 must not alias"
+        );
+    }
+
+    /// The property the domain exists for, and the one a "simplification" back to
+    /// a `[0; 8]` IV would silently undo.
+    ///
+    /// Before the domain, a signed message was `(list, version)` and nothing more.
+    /// Two status lists under one committee therefore had interchangeable records:
+    /// the evidence published for one authorized the other, because there was
+    /// nothing in the signed bytes to tell them apart. What pins the fix is not
+    /// that the messages differ by luck but that **every** input to the domain
+    /// moves them: a different anchor, a different algorithm, or a different
+    /// construction generation must each produce a different message for the same
+    /// `(list, version)`.
+    #[test]
+    fn one_list_and_version_signs_differently_under_different_domains() {
+        let list = entries();
+
+        let a = Domain::new(&[0xAA; 32], Algorithms::WotsXmss);
+        let b = Domain::new(&[0xBB; 32], Algorithms::WotsXmss);
+        assert_ne!(
+            status_list_message(&a, &list, 7),
+            status_list_message(&b, &list, 7),
+            "two committees must not sign the same bytes for one (list, version)"
+        );
+
+        // A single-bit change in the anchor fingerprint is still a different
+        // committee, so it must still be a different domain.
+        let mut nearly = [0xAA; 32];
+        nearly[31] ^= 1;
+        assert_ne!(
+            status_list_message(&a, &list, 7),
+            status_list_message(&Domain::new(&nearly, Algorithms::WotsXmss), &list, 7),
+            "the domain must depend on the whole fingerprint, not a prefix of it"
+        );
+
+        // And the domain really is the *start* of the chain, not something folded
+        // in at the end: the fold over an empty list already differs.
+        assert_ne!(
+            status_list_message(&a, &[], 0),
+            status_list_message(&b, &[], 0),
+            "the domain must seed the fold, not close it"
         );
     }
 
@@ -468,8 +581,8 @@ mod tests {
         let list = entries();
         let reversed = vec![list[1], list[0]];
         assert_ne!(
-            status_list_message(&list, 0),
-            status_list_message(&reversed, 0)
+            status_list_message(&dom(), &list, 0),
+            status_list_message(&dom(), &reversed, 0)
         );
     }
 }

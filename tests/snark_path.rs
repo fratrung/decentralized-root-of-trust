@@ -40,9 +40,7 @@
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_message,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
 use lean_multisig::{
     MESSAGE_LEN_BYTES, SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey,
     XmssSignature, xmss_key_gen_from_seed, xmss_sign,
@@ -129,7 +127,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // Three of five members, at the slot the anchor derives for this round.
     let slot = c.slot_for(ROUND).expect("slot");
     assert_eq!(slot, GENESIS + ROUND);
-    let message = status_list_message(&list, ROUND);
+    let message = c.message_for(Algorithms::WotsXmss, &list, ROUND);
     let proof = prover.aggregate(
         sign_at(&[&keys[0], &keys[1], &keys[2]], message, slot),
         message,
@@ -162,7 +160,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         assert!(agg.info.pubkeys.len() >= T);
         assert_ne!(
             agg.info.core.message,
-            status_list_message(tampered.list(), tampered.version()),
+            c.message_for(Algorithms::WotsXmss, tampered.list(), tampered.version()),
             "the tampered list must actually change the message, or this case is \
              vacuous"
         );
@@ -185,7 +183,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // choosing instead of the one the anchor derives. The signatures are genuine
     // and internally consistent (the slot is authenticated inside each of them),
     // so what breaks is the *policy*: one slot per round, the same for everybody.
-    let message_1 = status_list_message(&list, 1);
+    let message_1 = c.message_for(Algorithms::WotsXmss, &list, 1);
     let chosen_slot = GENESIS;
     assert_ne!(c.slot_for(1), Some(chosen_slot));
     let wrong_slot = record(
@@ -214,7 +212,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // -------------------------------------------------- check 4: the quorum --
     // Two members against a threshold of three. A perfectly valid aggregate.
     let slot_3 = c.slot_for(3).expect("slot");
-    let message_3 = status_list_message(&list, 3);
+    let message_3 = c.message_for(Algorithms::WotsXmss, &list, 3);
     let thin = record(
         list.clone(),
         3,
@@ -246,7 +244,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     // some future test claims for a real member.
     let outsider: Keypair = keypair(200);
     let slot_4 = c.slot_for(4).expect("slot");
-    let message_4 = status_list_message(&list, 4);
+    let message_4 = c.message_for(Algorithms::WotsXmss, &list, 4);
     let intruded = record(
         list.clone(),
         4,

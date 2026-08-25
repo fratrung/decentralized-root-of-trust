@@ -33,7 +33,7 @@ use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::params::{KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, SLOT};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, StatusList, status_list_message,
+    Algorithms, SnarkStatusList, StatusList,
 };
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
 use decentralized_root_of_trust::state::status_list_head::{GENESIS_PREDECESSOR, SignedHead};
@@ -136,7 +136,8 @@ fn main() {
         "the anchor does not name this key at index {index}"
     );
 
-    let signed_head = recover_signed_head(mode).expect("published record is unreadable");
+    let signed_head =
+        recover_signed_head(mode, &committee).expect("published record is unreadable");
 
     let node = Arc::new(Node {
         index,
@@ -174,7 +175,7 @@ fn main() {
 /// Re-establishes the in-memory head after a process restart. In production the
 /// bytes come from the authenticated DHT recovery policy; during a process
 /// lifetime they are never consulted again to authorize a transition.
-fn recover_signed_head(mode: Mode) -> Result<Option<SignedHead>, String> {
+fn recover_signed_head(mode: Mode, committee: &Committee) -> Result<Option<SignedHead>, String> {
     storage::latest_record()
         .map(|(_, bytes)| {
             let (version, list) = match mode {
@@ -185,7 +186,11 @@ fn recover_signed_head(mode: Mode) -> Result<Option<SignedHead>, String> {
                     SnarkStatusList::from_bytes(&bytes).map(|r| (r.version(), r.list_cloned()))?
                 }
             };
-            Ok(SignedHead::from_authenticated(version, &list))
+            Ok(SignedHead::from_authenticated(
+                &committee.domain(Algorithms::WotsXmss),
+                version,
+                &list,
+            ))
         })
         .transpose()
 }
@@ -235,6 +240,7 @@ impl Node {
 
         let mut signed_head = self.signed_head.lock().expect("signed head poisoned");
         let next_head = match SignedHead::successor(
+            &self.committee.domain(Algorithms::WotsXmss),
             signed_head.as_ref(),
             &proposal.predecessor,
             proposal.version,
@@ -258,7 +264,9 @@ impl Node {
                 abstain("version has no slot under this anchor"),
             );
         };
-        let message = status_list_message(&proposal.list, proposal.version);
+        let message = self
+            .committee
+            .message_for(Algorithms::WotsXmss, &proposal.list, proposal.version);
 
         let started = Instant::now();
         let signed = self
@@ -335,7 +343,7 @@ impl Node {
         let (version, predecessor, mut list) = match storage::latest_record() {
             Some((_, bytes)) => match self.decode_list(&bytes) {
                 Ok((v, list)) => {
-                    let predecessor = status_list_message(&list, v);
+                    let predecessor = self.committee.message_for(Algorithms::WotsXmss, &list, v);
                     (v + 1, predecessor, list)
                 }
                 Err(e) => {
@@ -414,7 +422,9 @@ impl Node {
     /// one for everybody.
     fn collect_signatures(self: &Arc<Self>, proposal: &Proposal) -> Vec<(usize, XmssSignature)> {
         let bytes = Arc::new(proposal.as_ssz_bytes());
-        let message = status_list_message(&proposal.list, proposal.version);
+        let message = self
+            .committee
+            .message_for(Algorithms::WotsXmss, &proposal.list, proposal.version);
         let slot = self
             .committee
             .slot_for(proposal.version)
@@ -537,7 +547,7 @@ impl Node {
                 let setup = started.elapsed();
 
                 let proving = Instant::now();
-                let proof = prover.make_proof(&self.committee, raws, list, version, LOG_INV_RATE);
+                let proof = prover.make_proof(&self.committee, Algorithms::WotsXmss, raws, list, version, LOG_INV_RATE);
                 println!(
                     "    SNARK form: {signers} signatures aggregated into {} B",
                     proof.len()

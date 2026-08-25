@@ -118,9 +118,16 @@ impl SignerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::status_list::{hash_any, status_list_message};
+    use crate::protocol::status_list::{Algorithms, Domain, hash_any, status_list_message};
     use lean_multisig::{xmss_key_gen_from_seed, xmss_verify};
     use std::path::PathBuf;
+
+    /// A `SignerNode` holds no anchor — it signs the 32 bytes it is handed — so
+    /// these tests only need *a* domain to build a plausible message with. Which
+    /// one is irrelevant here; that it must exist at all is the point.
+    fn dom() -> Domain {
+        Domain::new(&[0x51; 32], Algorithms::WotsXmss)
+    }
 
     const START: u32 = 100;
     const END: u32 = 110;
@@ -165,7 +172,7 @@ mod tests {
         let list = vec![hash_any(b"vc-1")];
 
         for expected in START..START + 3 {
-            let message = status_list_message(&list, expected);
+            let message = status_list_message(&dom(), &list, expected);
             let (slot, sig) = signer.sign(&message).expect("sign");
             assert_eq!(slot, expected);
             assert!(xmss_verify(signer.public_key(), slot, &message, &sig).is_ok());
@@ -180,7 +187,7 @@ mod tests {
     fn a_failed_signature_still_consumes_its_slot() {
         let path = scratch("burn");
         let mut signer = node(&path, END + 5, 2); // counter outlives the key window
-        let message = status_list_message(&[hash_any(b"vc")], 0);
+        let message = status_list_message(&dom(), &[hash_any(b"vc")], 0);
 
         // Drain the slots the key can actually sign. One message over many slots
         // is fine; it is one slot over many messages that destroys a key.
@@ -206,7 +213,7 @@ mod tests {
     fn exhaustion_is_reported_not_wrapped_around() {
         let path = scratch("exhaust");
         let mut signer = node(&path, START + 1, 3);
-        let message = status_list_message(&[hash_any(b"vc")], 0);
+        let message = status_list_message(&dom(), &[hash_any(b"vc")], 0);
 
         signer.sign(&message).expect("first");
         signer.sign(&message).expect("second");

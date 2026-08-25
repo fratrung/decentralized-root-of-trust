@@ -9,7 +9,7 @@ use decentralized_root_of_trust::{
     atomic_slot_counter::AtomicSlotCounter,
     committee::Committee,
     signer_node::SignerNode,
-    status_list::{Algorithms, StatusList, hash_any, status_list_message},
+    status_list::{Algorithms, StatusList, hash_any},
     verifier_node::VerifierNode,
 };
 use lean_multisig::{XmssSignature, xmss_key_gen};
@@ -111,7 +111,8 @@ fn main() {
         }
     };
 
-    let status_list_poseidon2_digest = status_list_message(&status_list, version);
+    let status_list_poseidon2_digest =
+        committee.message_for(Algorithms::WotsXmss, &status_list, version);
 
     // The first `t` members sign. The rest abstain, which is the point of a
     // threshold: the record still verifies without them.

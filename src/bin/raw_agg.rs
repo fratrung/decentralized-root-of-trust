@@ -35,9 +35,7 @@ use decentralized_root_of_trust::params::{
     KEY_SLOT_COUNT, KEY_SLOTS, N_MEMBERS, N_UPDATES, SLOT, T,
 };
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, StatusList, hash_any, status_list_message,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, StatusList, hash_any};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
 use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen};
 use rand::RngExt;
@@ -124,7 +122,7 @@ fn main() {
         // that sat out earlier rounds rejoin without the committee losing
         // agreement on the slot.
         let slot = committee.slot_for(version).expect("slot overflow");
-        let message = status_list_message(&list, version);
+        let message = committee.message_for(Algorithms::WotsXmss, &list, version);
 
         // t plain XMSS signatures, each preceded by its signer's durable slot
         // burn. Untimed on purpose: see the note at the top of the file.
@@ -182,7 +180,7 @@ fn main() {
     // under test and nothing else.
     let version = N_UPDATES as u32;
     let slot = committee.slot_for(version).expect("slot overflow");
-    let message = status_list_message(&list, version);
+    let message = committee.message_for(Algorithms::WotsXmss, &list, version);
     let honest: Vec<(usize, XmssSignature)> = (0..T)
         .map(|k| {
             (

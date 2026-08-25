@@ -76,9 +76,63 @@ MUTANTS = {
         {
             return false;
         }""", "        if false { return false; }"),
-    "snark-2-message": ("src/node/snark_verifier.rs", """        if agg.info.core.message != status_list_message(status_list.list(), status_list.version()) {
+    "snark-2-message": ("src/node/snark_verifier.rs", """        if agg.info.core.message
+            != status_list_message(&domain, status_list.list(), status_list.version())
+        {
             return false;
         }""", "        if false { return false; }"),
+
+    # --- domain separation ------------------------------------------------
+    #
+    # The message binding above only says "the proof matches the message this
+    # verifier computed". What decides *which* message that is, is the domain.
+    # Seeding the fold from `[0; 8]` instead makes every committee sign the same
+    # bytes for one `(list, version)`, and evidence becomes transferable between
+    # anchors — with all five checks still green, which is exactly why it needs a
+    # mutant rather than a comment.
+    "domain-seed": (
+        "src/protocol/status_list.rs",
+        "    let mut acc = domain.0;",
+        "    let mut acc = { let _ = domain; [KoalaBear::ZERO; 8] };",
+    ),
+    # The domain must depend on the anchor. Dropping the fingerprint leaves a
+    # domain that separates algorithms but not committees.
+    "domain-anchor": (
+        "src/protocol/status_list.rs",
+        """        Domain(poseidon16_compress_pair(
+            &entry_to_field(anchor_fingerprint),
+            &tag,
+        ))""",
+        """        Domain({ let _ = anchor_fingerprint; poseidon16_compress_pair(&[KoalaBear::ZERO; 8], &tag) })""",
+    ),
+    # There is deliberately no `domain-alg` mutant for the third input, the
+    # record's own algorithm. `Algorithms` has one variant, so `algorithm_tag`
+    # returns one value, so zeroing the tag changes no message this crate can
+    # build and no test could ever fail. A mutant that survives by construction
+    # is worse than no mutant: it makes a SURVIVED line something to scroll past.
+    #
+    # What guards that input instead is the compiler. `algorithm_tag` matches
+    # exhaustively, so adding a variant fails to build until the new tag is
+    # spelled out, and the tag reaches the domain through the same expression the
+    # two mutants above already cover. Add the mutant together with the second
+    # algorithm, not before it.
+
+    # --- resource budget on selection -------------------------------------
+    #
+    # Not a correctness check: removing these still verifies every record
+    # correctly. What it removes is the *bound* on how many verifications an
+    # unauthenticated peer can buy, which no assertion about a verdict would
+    # notice.
+    "budget-snark": (
+        "src/node/snark_verifier.rs",
+        "            .take(Self::MAX_VERIFICATIONS_PER_SELECTION)\n",
+        "",
+    ),
+    "budget-raw": (
+        "src/node/raw_node.rs",
+        "        for record in decoded.iter().take(Self::MAX_VERIFICATIONS_PER_SELECTION) {",
+        "        for record in decoded.iter() {",
+    ),
     "snark-3-slot": ("src/node/snark_verifier.rs", """        if self.committee.slot_for(status_list.version()) != Some(agg.info.core.slot) {
             return false;
         }""", "        if false { return false; }"),
@@ -153,8 +207,8 @@ MUTANTS = {
     # peer lies hardest.
     "freshness-select-unverified": (
         "src/node/snark_verifier.rs",
-        "        decoded.into_iter().find(|sl| self.verify(sl))",
-        "        decoded.into_iter().next()",
+        "            .find(|sl| self.verify(sl))",
+        "            .next()",
     ),
     "hwm-strict": (
         "src/state/freshness.rs",

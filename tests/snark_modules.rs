@@ -37,9 +37,7 @@
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_message,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
 use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign};
 
 const N: usize = 5;
@@ -78,7 +76,7 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     // slot the anchor assigns: the prover module is handed `version`, never a slot.
     let version = 0u32;
     let list = vec![hash_any(b"row-a"), hash_any(b"row-b")];
-    let message = status_list_message(&list, version);
+    let message = committee.message_for(Algorithms::WotsXmss, &list, version);
     let slot = committee.slot_for(version).expect("slot in window");
     let raws: Vec<(XmssPublicKey, XmssSignature)> = (0..T)
         .map(|i| {
@@ -89,7 +87,14 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
         })
         .collect();
 
-    let proof = prover.make_proof(&committee, raws, &list, version, LOG_INV_RATE);
+    let proof = prover.make_proof(
+        &committee,
+        Algorithms::WotsXmss,
+        raws,
+        &list,
+        version,
+        LOG_INV_RATE,
+    );
     let honest = SnarkStatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
 
     // (1) The slot inside the finished proof is the one the anchor derives. This is
@@ -195,7 +200,14 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     // (the derivation fails first), so catching the unwind costs nothing.
     assert_eq!(committee.slot_for(u32::MAX), None);
     let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        prover.make_proof(&committee, Vec::new(), &list, u32::MAX, LOG_INV_RATE)
+        prover.make_proof(
+            &committee,
+            Algorithms::WotsXmss,
+            Vec::new(),
+            &list,
+            u32::MAX,
+            LOG_INV_RATE,
+        )
     }));
     assert!(
         boom.is_err(),

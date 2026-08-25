@@ -12,9 +12,7 @@
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::{SignerNode, SignerNodeError};
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, StatusList, hash_any, status_list_message,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, StatusList, hash_any};
 use decentralized_root_of_trust::state::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 use lean_multisig::xmss_key_gen_from_seed;
@@ -89,7 +87,7 @@ fn publish(
     version: u32,
     signers: &[usize],
 ) -> StatusList {
-    let message = status_list_message(list, version);
+    let message = committee.message_for(Algorithms::WotsXmss, list, version);
     let slot = committee.slot_for(version).expect("slot");
 
     let signatures = signers
@@ -160,7 +158,9 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
     let (verifier, mut nodes) = bring_up(&dir, 2);
 
     let list = vec![hash_any(b"revoke-alice")];
-    let round0 = status_list_message(&list, 0);
+    let round0 = verifier
+        .get_committee()
+        .message_for(Algorithms::WotsXmss, &list, 0);
     let slot0 = verifier.get_committee().slot_for(0).expect("slot");
 
     assert!(nodes[0].sign_at(&round0, slot0).is_ok());
@@ -170,7 +170,11 @@ fn a_member_cannot_be_made_to_sign_one_round_twice() {
     // fatal, since the derivation includes the message. The counter refuses before
     // the key is ever touched, and refusing is a normal outcome: the member
     // abstains and the quorum proceeds without it.
-    let conflicting = status_list_message(&[hash_any(b"revoke-nobody")], 0);
+    let conflicting = verifier.get_committee().message_for(
+        Algorithms::WotsXmss,
+        &[hash_any(b"revoke-nobody")],
+        0,
+    );
     assert!(matches!(
         nodes[0].sign_at(&conflicting, slot0),
         Err(SignerNodeError::Slot(AtomicSlotCounterError::AlreadySpent {

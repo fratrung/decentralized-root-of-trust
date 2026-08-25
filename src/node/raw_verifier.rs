@@ -15,7 +15,7 @@
 use lean_multisig::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSignature, xmss_verify};
 
 use crate::protocol::committee::Committee;
-use crate::protocol::status_list::{StatusList, status_list_message};
+use crate::protocol::status_list::StatusList;
 
 #[derive(Debug)]
 pub enum VerifierError {
@@ -104,9 +104,15 @@ impl VerifierNode {
         };
 
         // 4) the message every member must have signed. Binding the version into
-        //    it is what makes the cleartext `version` trustworthy afterwards,
-        //    exactly as in the SNARK path.
-        let message = status_list_message(status_list.list(), status_list.version());
+        //    it is what makes the cleartext `version` trustworthy afterwards, and
+        //    the domain binds the two fields a signature would otherwise say
+        //    nothing about: the anchor, so this record cannot have been signed for
+        //    another committee, and the record's own `alg`, so relabelling the
+        //    algorithm invalidates the evidence produced under the old one.
+        //    Exactly as in the SNARK path.
+        let message =
+            self.committee
+                .message_for(status_list.alg, status_list.list(), status_list.version());
 
         // 5) every signature, against the key its bit names. Membership needs no
         //    check of its own: an index *is* a member, so a non-member is
@@ -185,7 +191,7 @@ mod tests {
         version: u32,
         signers: &[usize],
     ) -> Vec<(usize, XmssSignature)> {
-        let message = status_list_message(list, version);
+        let message = c.message_for(Algorithms::WotsXmss, list, version);
         let slot = c.slot_for(version).expect("slot");
         signers
             .iter()
@@ -204,7 +210,9 @@ mod tests {
     fn a_signature_is_refused_for_the_right_reason() {
         let (keys, node) = committee_in(1);
         let list = vec![hash_any(b"vc-1")];
-        let message = status_list_message(&list, 0);
+        let message = node
+            .get_committee()
+            .message_for(Algorithms::WotsXmss, &list, 0);
         let slot = GENESIS;
 
         // Member 0, at slot 100. This is the only time this pair signs.
@@ -221,7 +229,9 @@ mod tests {
 
         // A member's signature against the wrong message, then the wrong slot. Both
         // re-use the signature above: no `(key, slot)` pair signs twice.
-        let other = status_list_message(&[hash_any(b"vc-2")], 0);
+        let other = node
+            .get_committee()
+            .message_for(Algorithms::WotsXmss, &[hash_any(b"vc-2")], 0);
         assert!(matches!(
             node.verify(&keys[0].1, &sig, &other, slot),
             Err(VerifierError::SignatureVerificationError)
@@ -284,7 +294,7 @@ mod tests {
         let (keys, node) = committee_in(16);
         let c = node.get_committee();
         let list = vec![hash_any(b"vc-1")];
-        let message = status_list_message(&list, 0);
+        let message = c.message_for(Algorithms::WotsXmss, &list, 0);
         let slot = c.slot_for(0).expect("slot");
 
         // Each signer looks up its own seat rather than being told one.
@@ -562,7 +572,9 @@ mod tests {
         // namespace no matter how many tests are added.
         let (out_sk, _) = keypair(13, 200);
 
-        let message = status_list_message(&list, 0);
+        let message = node
+            .get_committee()
+            .message_for(Algorithms::WotsXmss, &list, 0);
         let slot = node.get_committee().slot_for(0).expect("slot");
         let outsider = xmss_sign(&out_sk, slot, &message).expect("sign");
         let mut sigs = quorum(&keys, node.get_committee(), &list, 0, &[0, 1]);

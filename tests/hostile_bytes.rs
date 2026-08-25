@@ -36,7 +36,7 @@
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, StatusList, hash_any, status_list_message,
+    Algorithms, SnarkStatusList, StatusList, hash_any,
 };
 use lean_multisig::{xmss_key_gen_from_seed, xmss_sign};
 use rand::{RngExt, SeedableRng};
@@ -74,7 +74,7 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
     let committee = verifier.get_committee();
 
     let list = entries();
-    let message = status_list_message(&list, VERSION);
+    let message = committee.message_for(Algorithms::WotsXmss, &list, VERSION);
     let slot = committee.slot_for(VERSION).expect("slot");
     let signatures = (0..T)
         .map(|i| (i, xmss_sign(&keys[i].1, slot, &message).expect("sign")))

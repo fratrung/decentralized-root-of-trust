@@ -26,7 +26,7 @@ use decentralized_root_of_trust::bench::stats::Series;
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::params::{KEY_SLOT_COUNT, KEY_SLOTS, N_UPDATES, SLOT};
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{hash_any, status_list_message};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, hash_any};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
 use lean_multisig::{xmss_key_gen, xmss_verify};
 use rand::RngExt;
@@ -90,7 +90,7 @@ fn main() {
         // and for the verifier, it is O(list), and it is not what this binary is
         // about. What is timed is the member's own cost: the durable burn and the
         // signature.
-        let message = status_list_message(&list, version);
+        let message = committee.message_for(Algorithms::WotsXmss, &list, version);
 
         let t_sign = Instant::now();
         let signature = signer.sign_at(&message, slot).expect("signing failed");

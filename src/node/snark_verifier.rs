@@ -44,10 +44,17 @@ impl PQSNARKVerifierModule {
             return false;
         }
 
-        // 2) bound to THIS list AND THIS version. Folding the version into the
-        //    signed message is what makes the cleartext `version` field
-        //    trustworthy, and so what lets freshness decisions rely on it.
-        if agg.info.core.message != status_list_message(status_list.list(), status_list.version()) {
+        // 2) bound to THIS committee, THIS algorithm, THIS list AND THIS version.
+        //    Folding the version into the signed message is what makes the
+        //    cleartext `version` field trustworthy, and so what lets freshness
+        //    decisions rely on it. The domain adds the other two: the anchor, so a
+        //    record cannot be carried to a committee it was not signed for, and
+        //    the record's own `alg`, so relabelling it changes the message the
+        //    proof would have to match.
+        let domain = self.committee.domain(status_list.alg);
+        if agg.info.core.message
+            != status_list_message(&domain, status_list.list(), status_list.version())
+        {
             return false;
         }
 
@@ -87,10 +94,31 @@ impl PQSNARKVerifierModule {
         self.select_freshest_above(candidates, None)
     }
 
+    /// How many proofs one selection will verify before giving up.
+    ///
+    /// The floor below is a work saver, not a budget: it drops records at or
+    /// *below* the mark, which is precisely what a hostile peer never sends. A
+    /// peer that stamps `mark + 1 .. mark + K` onto K junk records survives the
+    /// floor entirely, and each one costs a full SNARK verification — the most
+    /// expensive thing an unauthenticated peer can make this node do.
+    ///
+    /// So the number of *verifications* is capped, not the number of candidates:
+    /// decoding is cheap and bounded by the input, and a caller may legitimately
+    /// hold many records of which most are stale. What is bounded is the
+    /// expensive half.
+    ///
+    /// Four, because candidates are tried newest first: reaching the fifth means
+    /// the four freshest records a lookup returned all failed to verify, which is
+    /// not a network that is about to produce a good one. An honest lookup
+    /// succeeds on the first.
+    pub const MAX_VERIFICATIONS_PER_SELECTION: usize = 4;
+
     /// Like [`Self::select_freshest`], but ignores records at or below `floor`
     /// before verification.
     ///
     /// The floor saves work only: those records would be refused as stale anyway.
+    /// The budget is what bounds the work an attacker can choose — see
+    /// [`Self::MAX_VERIFICATIONS_PER_SELECTION`].
     pub fn select_freshest_above(
         &self,
         candidates: &[Vec<u8>],
@@ -102,6 +130,9 @@ impl PQSNARKVerifierModule {
             .filter(|sl| floor.is_none_or(|f| sl.version() > f))
             .collect();
         decoded.sort_by_key(|sl| std::cmp::Reverse(sl.version()));
-        decoded.into_iter().find(|sl| self.verify(sl))
+        decoded
+            .into_iter()
+            .take(Self::MAX_VERIFICATIONS_PER_SELECTION)
+            .find(|sl| self.verify(sl))
     }
 }

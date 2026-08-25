@@ -22,9 +22,7 @@ use decentralized_root_of_trust::params::{
     KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
 };
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_message,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
 use lean_multisig::{XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign};
 use rand::RngExt;
 
@@ -122,7 +120,7 @@ fn main() {
         // through the anchor rather than spelled out a second time.
         let version = i as u32;
         let slot = committee.slot_for(version).expect("slot overflow");
-        let message = status_list_message(&list, version);
+        let message = committee.message_for(Algorithms::WotsXmss, &list, version);
 
         // Signing happens here because an aggregator needs `t` signatures to have
         // something to aggregate, but it is deliberately NOT timed: in production
@@ -144,7 +142,14 @@ fn main() {
         // does. Passing a slot here would be a second place for `genesis + version`
         // to live, which is exactly the drift check 3 exists to catch.
         let t_prove = Instant::now();
-        let proof = prover.make_proof(&committee, raws, &list, version, LOG_INV_RATE);
+        let proof = prover.make_proof(
+            &committee,
+            Algorithms::WotsXmss,
+            raws,
+            &list,
+            version,
+            LOG_INV_RATE,
+        );
         let prove_time = t_prove.elapsed();
 
         let sl = SnarkStatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
@@ -197,7 +202,7 @@ fn main() {
     let good_proof = prover.sign_and_prove(
         &keypairs,
         &quorum,
-        status_list_message(&list, attack_version),
+        committee.message_for(Algorithms::WotsXmss, &list, attack_version),
         attack_slot,
         LOG_INV_RATE,
     );
@@ -222,7 +227,7 @@ fn main() {
     let out_proof = prover.sign_and_prove(
         &outsiders,
         &quorum,
-        status_list_message(&out_list, 0),
+        committee.message_for(Algorithms::WotsXmss, &out_list, 0),
         SLOT,
         LOG_INV_RATE,
     );
@@ -251,7 +256,7 @@ fn main() {
     let versioned_proof = prover.sign_and_prove(
         &keypairs,
         &quorum,
-        status_list_message(&list, signed_version),
+        committee.message_for(Algorithms::WotsXmss, &list, signed_version),
         spoof_slot,
         LOG_INV_RATE,
     );

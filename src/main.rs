@@ -18,9 +18,7 @@ use decentralized_root_of_trust::params::{
     KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
 };
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_message,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
 use lean_multisig::{
     XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover, setup_verifier, xmss_key_gen,
     xmss_sign,
@@ -83,7 +81,7 @@ fn run_flow(
 ) -> (SnarkStatusList, Duration, Duration) {
     let committee = verifier.committee_as_ref();
     // The signed message binds both the list and its version (Option B).
-    let message = status_list_message(&list, version);
+    let message = committee.message_for(Algorithms::WotsXmss, &list, version);
     let slot = committee.slot_for(version).expect("slot overflow");
 
     let mut raws: Vec<(XmssPublicKey, XmssSignature)> = Vec::new();
@@ -94,7 +92,14 @@ fn run_flow(
     }
 
     let t_prove = Instant::now();
-    let zk_proof = prover.make_proof(committee, raws, &list, version, LOG_INV_RATE);
+    let zk_proof = prover.make_proof(
+        committee,
+        Algorithms::WotsXmss,
+        raws,
+        &list,
+        version,
+        LOG_INV_RATE,
+    );
     let prove_time = t_prove.elapsed();
 
     let status_list = SnarkStatusList::new(Algorithms::WotsXmss, list, version, zk_proof);
@@ -112,6 +117,7 @@ fn run_flow(
 /// for that exact version.
 fn make_signed_proof(
     prover: &PQSNARKProverModule,
+    committee: &Committee,
     keypairs: &[(XmssSecretKey, XmssPublicKey)],
     signers: &[usize],
     list: &[[u8; 32]],
@@ -121,7 +127,7 @@ fn make_signed_proof(
     prover.sign_and_prove(
         keypairs,
         signers,
-        status_list_message(list, version),
+        committee.message_for(Algorithms::WotsXmss, list, version),
         slot,
         LOG_INV_RATE,
     )
@@ -245,6 +251,7 @@ fn main() {
     // A) tampered list carrying a valid proof of a DIFFERENT list.
     let good_proof = make_signed_proof(
         &prover,
+        committee,
         &keypairs,
         &quorum,
         &list,
@@ -265,7 +272,7 @@ fn main() {
         outsiders.push((sk, pk));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
-    let out_proof = make_signed_proof(&prover, &outsiders, &quorum, &out_list, SLOT, 0);
+    let out_proof = make_signed_proof(&prover, committee, &outsiders, &quorum, &out_list, SLOT, 0);
     let sl_outsider = SnarkStatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof);
     let outsider_rejected = !verifier.verify(&sl_outsider);
 
@@ -286,6 +293,7 @@ fn main() {
     let signed_version = (N_UPDATES - 1) as u32; // the true latest
     let versioned_proof = make_signed_proof(
         &prover,
+        committee,
         &keypairs,
         &quorum,
         &list,

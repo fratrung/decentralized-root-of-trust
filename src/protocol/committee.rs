@@ -8,8 +8,11 @@
 //! functions all taking `&Committee`.
 
 use lean_multisig::XmssPublicKey;
+use sha3::{Digest, Sha3_256};
 use ssz::{Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
+
+use crate::protocol::status_list::{Algorithms, Domain};
 
 /// SSZ wire schema for the anchor. `XmssPublicKey` is a fixed 32-byte SSZ object
 /// in leanVM v0.9, so `members` is an ordinary list of them and the container is
@@ -34,6 +37,10 @@ pub struct Committee {
     members: Vec<XmssPublicKey>,
     t: usize,
     genesis_slot: u32,
+    /// SHA3-256 of [`Committee::to_bytes`], cached because every signed message
+    /// derives from it. Never read from the wire: it is recomputed from the
+    /// decoded anchor, so it cannot disagree with the committee it names.
+    fingerprint: [u8; 32],
 }
 
 fn has_duplicate_members(members: &[XmssPublicKey]) -> bool {
@@ -41,6 +48,35 @@ fn has_duplicate_members(members: &[XmssPublicKey]) -> bool {
         .iter()
         .enumerate()
         .any(|(i, member)| members[i + 1..].contains(member))
+}
+
+/// SHA3-256 of the anchor's canonical SSZ encoding.
+///
+/// Canonicity is what makes this an identifier rather than a hint: SSZ gives the
+/// anchor exactly one byte form, so one committee has one fingerprint and two
+/// fingerprints mean two committees.
+fn fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha3_256::digest(bytes));
+    out
+}
+
+/// The same fingerprint, computed by encoding the anchor first.
+///
+/// Used where the bytes do not already exist — building a committee rather than
+/// decoding one, which happens once per process. [`Committee::from_bytes`]
+/// deliberately does **not** call this: it already holds the canonical bytes, and
+/// re-encoding them there would put an SSZ encode plus a `Vec<XmssPublicKey>`
+/// clone on the one path an attacker chooses how often to run.
+fn fingerprint_of(members: &[XmssPublicKey], t: usize, genesis_slot: u32) -> [u8; 32] {
+    fingerprint_bytes(
+        &CommitteeWire {
+            members: members.to_vec(),
+            t: t as u64,
+            genesis_slot,
+        }
+        .as_ssz_bytes(),
+    )
 }
 
 impl Committee {
@@ -64,10 +100,12 @@ impl Committee {
             !has_duplicate_members(&members),
             "committee members must have distinct public keys"
         );
+        let fingerprint = fingerprint_of(&members, t, genesis_slot);
         Committee {
             members,
             t,
             genesis_slot,
+            fingerprint,
         }
     }
 
@@ -77,10 +115,12 @@ impl Committee {
     /// `new`, and this is the only way to build one.
     #[cfg(test)]
     pub(crate) fn new_unchecked(members: Vec<XmssPublicKey>, t: usize, genesis_slot: u32) -> Self {
+        let fingerprint = fingerprint_of(&members, t, genesis_slot);
         Committee {
             members,
             t,
             genesis_slot,
+            fingerprint,
         }
     }
 
@@ -172,11 +212,51 @@ impl Committee {
         if has_duplicate_members(&value.members) {
             return Err("anchor contains duplicate member public keys".into());
         }
+        // The input *is* the canonical encoding once it has decoded: SSZ fixes
+        // every width, rejects a members offset other than the fixed-part length,
+        // refuses trailing bytes, and leanVM's `XmssPublicKey` decoder refuses a
+        // field element at or above the modulus. So hashing `bytes` is hashing
+        // `to_bytes()`, without paying to rebuild it. The `debug_assert` is what
+        // keeps that an argument rather than a hope: if the encoding ever gains a
+        // degree of freedom, every test build says so.
+        // Not a `debug_assert`: this path runs once per decoded record, and a
+        // re-encode here is the very cost being avoided — asserting it on every
+        // call put it straight back for every test build. It is pinned once, in
+        // `a_decoded_anchor_fingerprints_as_the_one_that_was_built` instead.
+        let fingerprint = fingerprint_bytes(bytes);
         Ok(Committee {
             members: value.members,
             t,
             genesis_slot: value.genesis_slot,
+            fingerprint,
         })
+    }
+
+    /// This anchor's identity, as the signed message and the freshness gate both
+    /// use it. Recomputed from the decoded committee, never carried on the wire.
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+
+    /// The trust domain every message signed under this anchor belongs to.
+    ///
+    /// The counterpart of [`Committee::slot_for`], and here for the same reason:
+    /// this is the **only** place a domain is built, so a signer and a verifier
+    /// cannot derive two different ones. Deriving it from the anchor is what makes
+    /// a record non-transferable between committees — and, since one committee has
+    /// one domain, what pins the rule that an anchor governs exactly one status
+    /// list.
+    pub fn domain(&self, alg: Algorithms) -> Domain {
+        Domain::new(&self.fingerprint, alg)
+    }
+
+    /// The 32 bytes a member signs for `(list, version)` under this anchor.
+    ///
+    /// The convenience form of `status_list_message(&self.domain(alg), ..)`, which
+    /// is what almost every call site wants: it is impossible to reach a message
+    /// here without an anchor to derive it from.
+    pub fn message_for(&self, alg: Algorithms, list: &[[u8; 32]], version: u32) -> [u8; 32] {
+        crate::protocol::status_list::status_list_message(&self.domain(alg), list, version)
     }
 }
 
@@ -339,6 +419,77 @@ mod tests {
             .expect("keygen")
             .0;
         assert_eq!(c.index_of(&outsider), None);
+    }
+
+    /// What the domain buys, stated as the property rather than as the mechanism:
+    /// a record signed under one anchor is **not** evidence under another. Before
+    /// the domain a signature said only "some key signed these entries at this
+    /// number", so evidence moved freely between committees.
+    ///
+    /// Every field of the anchor is covered, because the fingerprint is taken over
+    /// its whole canonical encoding: a different member set, a different threshold
+    /// and a different genesis slot each yield a different domain.
+    #[test]
+    fn evidence_does_not_transfer_between_anchors() {
+        use crate::protocol::status_list::Algorithms;
+
+        let list = [[7u8; 32], [8u8; 32]];
+        let msg = |c: &Committee| c.message_for(Algorithms::WotsXmss, &list, 3);
+
+        let base = committee_in(7);
+        let members = base.members().to_vec();
+
+        // Same members, same genesis, different threshold.
+        let other_t = Committee::new(members.clone(), T + 1, GENESIS);
+        assert_ne!(msg(&base), msg(&other_t), "threshold is not bound");
+
+        // Same members, same threshold, different genesis slot.
+        let other_genesis = Committee::new(members.clone(), T, GENESIS + 1);
+        assert_ne!(msg(&base), msg(&other_genesis), "genesis slot is not bound");
+
+        // A different committee entirely.
+        assert_ne!(msg(&base), msg(&committee_in(8)), "member set is not bound");
+
+        // And the anchor round-trips to the *same* domain: a verifier that loaded
+        // the anchor from bytes must agree with the signer that built it.
+        let decoded = Committee::from_bytes(&base.to_bytes()).expect("round trip");
+        assert_eq!(
+            msg(&base),
+            msg(&decoded),
+            "encoding and decoding the anchor must not change the domain"
+        );
+        assert_eq!(base.fingerprint(), decoded.fingerprint());
+    }
+
+    /// The other half of the same story, pinned so the boundary is not mistaken
+    /// for a stronger guarantee than it is.
+    ///
+    /// The domain binds the *committee*, so a record cannot be carried to another
+    /// committee. It does **not** identify *which* list a record belongs to, and
+    /// one anchor has one domain — so two status lists governed by the same
+    /// committee still produce interchangeable evidence. Closing that needs a list
+    /// identifier inside the anchor, which is a further wire change; until then
+    /// "one anchor governs exactly one status list" is an operator invariant, and
+    /// this test is where that is written down in code.
+    #[test]
+    fn one_anchor_is_one_domain_so_it_governs_one_list() {
+        use crate::protocol::status_list::Algorithms;
+
+        let c = committee_in(9);
+        let revocations = [[1u8; 32]];
+        let suspensions = [[2u8; 32]];
+
+        // Two logically different lists, one committee: the domain is the same for
+        // both, and only the entries tell them apart.
+        assert_eq!(
+            c.domain(Algorithms::WotsXmss),
+            c.domain(Algorithms::WotsXmss)
+        );
+        assert_ne!(
+            c.message_for(Algorithms::WotsXmss, &revocations, 0),
+            c.message_for(Algorithms::WotsXmss, &suspensions, 0),
+            "distinct content must still sign distinctly"
+        );
     }
 
     #[test]

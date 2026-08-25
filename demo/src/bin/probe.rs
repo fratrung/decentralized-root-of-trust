@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use decentralized_root_of_trust::protocol::status_list::{
-    SnarkStatusList, StatusList, hash_any, status_list_message,
+    Algorithms, SnarkStatusList, StatusList, hash_any,
 };
 use drot_demo::config::{self, MEMBER_IPS, Mode};
 use drot_demo::storage;
@@ -55,13 +55,17 @@ fn main() {
         None => panic!("nothing is published yet; run a normal round first"),
     };
     let version = version.unwrap_or(published + 1);
-    let predecessor = status_list_message(&list, published);
+
+    // The anchor is read before the predecessor digest, not after: since the
+    // signed message is domain-separated by the committee, the digest cannot be
+    // computed without it. The slot is not sent either, and could not be — the
+    // member derives it; reading the anchor only lets the probe name the slot it
+    // is about to compete for.
+    let committee = storage::wait_for_committee(Duration::from_secs(60)).expect("no anchor");
+    let predecessor = committee.message_for(Algorithms::WotsXmss, &list, published);
     let entry = hash_any(label.as_bytes());
     list.push(entry);
 
-    // The slot is not sent, and could not be: the member derives it. Reading the
-    // anchor here only lets the probe name the slot it is about to compete for.
-    let committee = storage::wait_for_committee(Duration::from_secs(60)).expect("no anchor");
     let slot = committee.slot_for(version).expect("version has no slot");
 
     println!(

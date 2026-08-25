@@ -30,9 +30,9 @@ cargo run --release --bin raw_agg                      # the same protocol with 
 cargo run --release --bin prover   -- [outdir]         # split: aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
-cargo test                                             # 54 unit + 9 integration tests, ~30 s (incl. three real SNARKs)
+cargo test                                             # 65 unit + 10 integration tests, 75 in all (incl. four real SNARKs)
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
-tools/mutate.py                                        # mutation testing: 24 checks, each must be caught by a test
+tools/mutate.py                                        # mutation testing: 28 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
 ./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
 ./demo/docker/demo.sh {raw|snark} verify               # node A re-checks what is published (expect a stale refusal)
@@ -62,7 +62,8 @@ host-specific: benchmark numbers are not portable across machines.
 One data flow that forks at the end:
 
 ```
-(Vec<[u8;32]>, version) --status_list_root_fe--> [KoalaBear;8]
+Committee --SHA3-256 of the anchor + alg + format--> Domain   (the fold's IV)
+(Domain, Vec<[u8;32]>, version) --status_list_root_fe--> [KoalaBear;8]
     --pack canonical LE u32--> [u8;32]   (status_list_message)
         --t x xmss_sign at slot = genesis + version--> t sigs
             |-- (index, sig) pairs --------------------> StatusList { bitmap, signatures }
@@ -71,11 +72,25 @@ One data flow that forks at the end:
 
 Library:
 - `src/protocol/status_list.rs` — the published objects and their digest. `entry_to_field`
-  maps each 32-byte entry to `[F;8]`; `status_list_root_fe(list, version)` folds
+  maps each 32-byte entry to `[F;8]`; `status_list_root_fe(domain, list, version)` folds
   the entries into the root and then closes with one more compression that mixes
   in the `version` (16-bit limbs, injective). **The fold is a Merkle–Damgård
   chain, not a tree**, despite the "root" naming: `acc = compress_pair(acc,
-  entry(e))` from `[0;8]`. Cost is O(n) sequential and there are no per-entry
+  entry(e))` — from the **domain**, not from `[0;8]`.
+  `Domain` is what stops evidence being portable between deployments. A signature
+  binds only what is inside the message, and that used to be `(list, version)`
+  alone, so any two anchors that coincided had interchangeable records. The domain
+  seeds the fold with SHA3-256 of the anchor's canonical encoding, the record's
+  `alg`, and a construction generation. **Prefixed and not appended**: a chain
+  from a shared IV lets every domain share intermediate states, so one internal
+  collision against attacker-chosen entries would be reusable across all of them.
+  It is unforgeable by construction rather than checked — `status_list_message`
+  takes a `Domain`, so there is no way to compute a message without naming one.
+  Note the boundary: one anchor has one domain, so this pins "a list is governed
+  by one committee" and **not** "a committee governs one list". Two lists under
+  one anchor still interchange; closing that needs a list id inside the anchor.
+  Changing any of this is a signed-message break, not a wire-schema one — the SSZ
+  containers and the record sizes are unchanged, but old artifacts stop verifying. Cost is O(n) sequential and there are no per-entry
   inclusion proofs. It allocates nothing on the heap, so a large list could be
   streamed rather than held in RAM. `status_list_message` closes it by packing the
   eight field elements into the 32 bytes leanVM's XMSS signs — canonical LE `u32`
@@ -98,8 +113,13 @@ Library:
   so bits past member `N-1` cannot exist and an index outside the committee is
   unrepresentable rather than checked for.
 - `src/protocol/committee.rs` — the anchor and **nothing else**: members, `t`,
-  `genesis_slot`, the SSZ wire encoding, and `slot_for` (the **only** place the
-  slot is derived). `from_bytes` re-checks `t ∈ 1..=N`, the one invariant a wire
+  `genesis_slot`, the SSZ wire encoding, `slot_for` (the **only** place the slot is
+  derived) and `domain`/`message_for` (the **only** place the signed message is).
+  The two derivations are siblings on purpose: a second copy of either is a second
+  place for a signer and a verifier to drift apart. The anchor caches its own
+  fingerprint, and `from_bytes` hashes the bytes it was handed rather than
+  re-encoding what it just decoded — a decoded anchor *is* its canonical encoding,
+  and decode is the one path an attacker chooses how often to run. `from_bytes` re-checks `t ∈ 1..=N`, the one invariant a wire
   format cannot know; canonicity it gets from SSZ, which has no varints to pad. The protocol predicates used to live here as free functions taking
   `&Committee`; they are now methods on the node type that owns the anchor, so a
   participant is one value with the operations its role can perform.
@@ -132,6 +152,34 @@ Library:
   monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
   committee rotation resets it, persisted with a write-then-rename. Lives *outside*
   the verification predicate, which stays pure.
+- `src/state/status_list_head.rs` — `SignedHead`, the append-only guard on what a
+  *member* is willing to sign next. `successor` validates one transition: the
+  proposal must name the head's digest as its predecessor, sit at exactly
+  `head.version + 1`, contain more entries than the signed head, and — the
+  check that actually decides it — its prefix up to the stored head length must
+  re-fold to the digest this member signed last round. A storage layer that swaps
+  the published record therefore cannot walk a member onto a fork.
+  Four things about it are easy to get wrong:
+  - **It is in-memory, alone in `state/` in being so.** There is no file. A restart
+    loses the head, and `from_authenticated` is how it comes back — a constructor
+    that *trusts its caller*, computes no quorum and checks no signature. The
+    contract "authenticate first" is stated in the doc comment and enforced
+    nowhere, so every call site is a place to get it wrong.
+  - **The durable backstop is `AtomicSlotCounter`, not this type.** After a restart
+    a rewound head cannot actually be exploited, because re-signing an old version
+    derives an already-spent slot and `reserve_at` answers `AlreadySpent`. That is
+    the property that makes the in-memory head safe; keep the counter durable and
+    this stays true.
+  - **One or more entries per version.** `list[..head.len]` must equal the
+    previous list, so the transition is append-only but not single-entry. A
+    provisioning round can batch several credentials into one status-list
+    version. `predecessor` is redundant with the prefix recomputation — it can
+    only reject, never authorize, and the recomputation is the real check.
+  - **A member with no head can only sign v0.** A fresh process that fails to
+    recover is not merely behind, it is out: v0's slot is long spent, so it
+    abstains forever. Recovery is not optional.
+  Its only consumer is `demo/`; nothing in the library or the four benchmark
+  binaries calls it. It is also **not** covered by `tools/mutate.py`.
 - `src/bench/mem.rs`, `src/bench/stats.rs` — RSS (resident set size) probes and descriptive
   statistics shared by every binary.
 - `src/node/snark_prover.rs` — the prover. Holding the value *is* the proof that
@@ -197,7 +245,7 @@ committee of one, and the raw path with a real `t`-of-`N` quorum. They write slo
 state into the working directory (`next_slot`, `signers/`), which `.gitignore`
 covers.
 
-Tests (`cargo test`, ~15 s warm, 58 in total: 57 run plus one `#[ignore]`d):
+Tests (`cargo test`, 75 in total: 74 run plus one `#[ignore]`d):
 - `src/*.rs` unit tests cover each module against its own contract.
   `status_list.rs`'s pin the seam this crate has with leanVM: that
   `status_list_message` is the *canonical* packing of the fold (each limb a field
@@ -354,10 +402,12 @@ signed this message at this slot". Every link to trust is a cleartext check
 outside the circuit, in `PQSNARKVerifierModule::verify` (`src/node/snark_verifier.rs`):
 
 1. every signer ∈ committee — membership against the fixed anchor;
-2. `agg.info.core.message == status_list_message(list, version)` — **the critical
-   binding**; it ties the proof to both the list (without it a valid proof of a
-   *different* list can be attached) and the `version` (without it the cleartext
-   version field is forgeable — see the versioning note below);
+2. `agg.info.core.message == status_list_message(committee.domain(record.alg), list, version)`
+   — **the critical binding**; it ties the proof to the list (without it a valid
+   proof of a *different* list can be attached), to the `version` (without it the
+   cleartext version field is forgeable — see the versioning note below), and,
+   through the domain, to *this committee* and *this algorithm*, so evidence
+   cannot be carried between deployments;
 3. `committee.slot_for(version) == Some(agg.info.core.slot)` — the slot is the one the
    anchor assigns to this round;
 4. `pubkeys.len() >= t` — quorum;
@@ -397,9 +447,20 @@ quorum check.
   single status list so it keeps a single mark in the artifact dir. Committee
   rotation (the anchor changing) is a separate, deferred protocol.
 - `version` **is** verified: it is folded into the signed message (Option B), so
-  verification recomputes `status_list_message(list, version())` and a tampered
-  version fails check 2. It is now *also* what fixes the slot, so the two bindings
-  break together. `alg` is still never verified (it only appears in `Display`).
+  verification recomputes `status_list_message(domain, list, version())` and a
+  tampered version fails check 2. It is now *also* what fixes the slot, so the two
+  bindings break together. `alg` is verified the same way since the domain took it
+  in: relabelling it changes the domain, so the evidence produced under the old
+  label no longer matches. Only one tag decodes today, so that binding is latent —
+  it is there because adding it after a second algorithm exists means breaking the
+  format twice.
+- **One anchor governs exactly one status list**, and this is an operator
+  invariant rather than something the code enforces. The domain binds the
+  committee, so a record cannot move *between* anchors; but one anchor has one
+  domain, so two lists under the same committee still produce interchangeable
+  evidence. Closing it needs a list identifier inside the anchor — a further wire
+  change. Pinned in `committee.rs`'s
+  `one_anchor_is_one_domain_so_it_governs_one_list`, which is where to start.
 - The status list is never **sorted or deduplicated**, and `status_list_root_fe`
   (the fold behind `status_list_message`) folds sequentially, so `root([a,b]) != root([b,a])`: one logical revocation set
   has `n!` valid roots. Sorting inside the fold would fix it and is a
@@ -431,6 +492,16 @@ quorum check.
 - Both paths' checks now have tests: `raw_agg` forgeries plus `cargo test` for the
   raw path, `tests/snark_path.rs` for all five SNARK checks including the
   sub-threshold quorum.
+- **Selection is budgeted, not unbounded.** `select_freshest_above` and
+  `RawNode::accept_best` verify at most `MAX_VERIFICATIONS_PER_SELECTION` (4)
+  candidates. The floor is a work saver and *not* the defence it reads as: it
+  drops records at or below the mark, which is precisely what a hostile peer never
+  sends. Records claiming versions above the mark pass it untouched, and each one
+  costs a full verification — a SNARK on one path, `t` signature checks on the
+  other. Candidates are tried newest first, so reaching the cap means the four
+  freshest records a lookup returned all failed; an honest lookup succeeds on the
+  first. What is bounded is deliberately the *expensive* half: decoding stays
+  unbounded because it is cheap and already limited by the input size.
 
 ## leanVM constraints that shape this code
 

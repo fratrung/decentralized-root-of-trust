@@ -48,6 +48,17 @@ const _: () = assert!(
      making the committee sign twice at one XMSS slot"
 );
 
+// `Committee::new` already refuses `t` outside `1..=N`, but it refuses at
+// runtime, after keygen: at `N_MEMBERS = 200, T = 201` every binary spends
+// minutes generating 200 keys and then panics on the line that builds the anchor.
+// These constants are known at compile time, so the answer is too. It is the same
+// invariant, asserted where it costs nothing to be wrong.
+const _: () = assert!(
+    T >= 1 && T <= N_MEMBERS,
+    "T must lie in 1..=N_MEMBERS: t = 0 lets a record nobody signed reach quorum, \
+     and t > N is unsatisfiable, so no update could ever be published"
+);
+
 /// WHIR inverse rate. Trades prover memory against proof size and soundness
 /// margin: changing it changes the security level, so measure before touching.
 pub const LOG_INV_RATE: usize = 2;

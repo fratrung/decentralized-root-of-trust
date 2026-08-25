@@ -23,10 +23,9 @@
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::node::snark_node::SnarkNode;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
+use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, hash_any, status_list_message,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
 use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign};
 
@@ -71,7 +70,7 @@ fn the_gate_moves_only_for_a_proof_that_verified() {
     let committee = Committee::new(members, T, GENESIS);
 
     let list = vec![hash_any(b"revoke-alice")];
-    let message = status_list_message(&list, ROUND);
+    let message = committee.message_for(Algorithms::WotsXmss, &list, ROUND);
     let slot = committee.slot_for(ROUND).expect("slot");
     let raws: Vec<(XmssPublicKey, XmssSignature)> = [0usize, 1, 2]
         .iter()
@@ -80,7 +79,14 @@ fn the_gate_moves_only_for_a_proof_that_verified() {
             (pk.clone(), xmss_sign(sk, slot, &message).expect("sign"))
         })
         .collect();
-    let proof = prover.make_proof(&committee, raws, &list, ROUND, LOG_INV_RATE);
+    let proof = prover.make_proof(
+        &committee,
+        Algorithms::WotsXmss,
+        raws,
+        &list,
+        ROUND,
+        LOG_INV_RATE,
+    );
 
     let mark = HighWaterMark::load(scratch("gate"), &committee.to_bytes());
     let mut node = SnarkNode::new(committee, mark);
@@ -129,4 +135,78 @@ fn the_gate_moves_only_for_a_proof_that_verified() {
         Outcome::Refused
     );
     assert_eq!(node.high_water(), Some(ROUND));
+
+    // --- the budget ----------------------------------------------------------
+    //
+    // The floor above only removes what a peer declares to be *old*, which is not
+    // what a hostile peer declares. Records claiming versions above the mark pass
+    // the floor untouched, and each one a selection reaches costs a full SNARK
+    // verification — the most expensive thing an unauthenticated peer can buy
+    // here. So the number verified is capped rather than the number offered.
+    //
+    // The genuine record is placed last, at the lowest surviving version, so that
+    // what this asserts is the cap stopping the walk and not a lucky early hit.
+    // A genuine record one round on. It cannot be the record above with a new
+    // label: the version is folded into the signed message, so a relabelled proof
+    // is exactly the forgery `liar` already covers. A second round means a second
+    // aggregation — the reason this case lives here, in the file that already
+    // pays for a prover, rather than in a test of its own.
+    const NEXT: u32 = ROUND + 1;
+    let next_list = vec![hash_any(b"revoke-alice"), hash_any(b"revoke-bob")];
+    let next_message = node
+        .committee()
+        .message_for(Algorithms::WotsXmss, &next_list, NEXT);
+    let next_slot = node.committee().slot_for(NEXT).expect("slot");
+    let next_raws: Vec<(XmssPublicKey, XmssSignature)> = [0usize, 1, 2]
+        .iter()
+        .map(|&i| {
+            let (pk, sk) = &keys[i];
+            (
+                pk.clone(),
+                xmss_sign(sk, next_slot, &next_message).expect("sign"),
+            )
+        })
+        .collect();
+    let next_proof = prover.make_proof(
+        node.committee(),
+        Algorithms::WotsXmss,
+        next_raws,
+        &next_list,
+        NEXT,
+        LOG_INV_RATE,
+    );
+    let fresher =
+        SnarkStatusList::new(Algorithms::WotsXmss, next_list, NEXT, next_proof).to_bytes();
+    let mut flood: Vec<Vec<u8>> = (0..PQSNARKVerifierModule::MAX_VERIFICATIONS_PER_SELECTION + 4)
+        .map(|i| {
+            // Structurally a record, above the mark, with a proof that is not one.
+            SnarkStatusList::new(
+                Algorithms::WotsXmss,
+                list.clone(),
+                NEXT + 1 + i as u32,
+                vec![0xAB; 64],
+            )
+            .to_bytes()
+        })
+        .collect();
+    flood.push(fresher.clone());
+
+    assert!(
+        flood.len() > PQSNARKVerifierModule::MAX_VERIFICATIONS_PER_SELECTION,
+        "the budget must bind, or this case is vacuous"
+    );
+    assert_eq!(
+        node.accept_best(&flood),
+        Outcome::Refused,
+        "the walk must stop at the budget rather than digging out the real record"
+    );
+    assert_eq!(
+        node.high_water(),
+        Some(ROUND),
+        "the gate must not have moved"
+    );
+
+    // And the record the budget hid is still perfectly acceptable on its own: the
+    // cap bounds work, it does not blacklist anything.
+    assert_eq!(node.accept(&fresher), Outcome::Accepted { version: NEXT });
 }

@@ -10,7 +10,7 @@ use lean_multisig::{
 };
 
 use crate::protocol::committee::Committee;
-use crate::protocol::status_list::status_list_message;
+use crate::protocol::status_list::Algorithms;
 
 pub struct PQSNARKProverModule {}
 
@@ -28,6 +28,7 @@ impl PQSNARKProverModule {
     pub fn make_proof(
         &self,
         committee: &Committee,
+        alg: Algorithms,
         raws: Vec<(XmssPublicKey, XmssSignature)>,
         status_list_elem: &[[u8; 32]],
         version: u32,
@@ -36,7 +37,10 @@ impl PQSNARKProverModule {
         let slot = committee
             .slot_for(version)
             .expect("version has no slot under this anchor");
-        let message = status_list_message(status_list_elem, version);
+        // Both derivations go through the anchor, and neither is spelled out
+        // here: `slot_for` for the round, `message_for` for the domain. A second
+        // copy of either is a second place to drift from the verifier.
+        let message = committee.message_for(alg, status_list_elem, version);
         self.aggregate(raws, message, slot, log_inv_rate)
     }
 
