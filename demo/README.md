@@ -3,13 +3,15 @@
 Two runs of the same ten-node network, differing in one decision: what the
 aggregator publishes once it has a quorum.
 
-* **raw** publishes the `t` XMSS signatures and a bitmap naming their signers.
-* **snark** publishes one aggregated proof that such a quorum existed.
+* **raw** lets any member aggregate, then publishes the `t` XMSS signatures and a
+  bitmap naming their signers.
+* **snark** publishes one aggregated proof, produced by a configured aggregator subset.
 
-Everything else is identical, which is what makes the two runs comparable: same
-committee, same threshold, same credential, same shared storage, same relying
-party. The difference shows up in exactly two places, the aggregator's
-publication step and node A's verification step, and the demo prints both.
+The protocol flow is otherwise the same: same committee, same threshold, same
+credential, same shared storage, same relying party. In SNARK mode the aggregator
+role is restricted to a small prover subset, so only those members pay
+`setup_prover()`; all ten members still sign proposals. The publication and
+verification reports remain the comparison points the demo prints.
 
 ```
 ./demo.sh raw   up        # build, start 1 bootstrap + 10 members + node A
@@ -30,7 +32,7 @@ The two demos share the `172.28.0.0/24` subnet, so only one runs at a time.
 | container | address | role |
 |---|---|---|
 | `bootstrap` | 172.28.0.5 | assembles the anchor, then exits |
-| `signer-0` … `signer-9` | 172.28.0.11 … .20 | committee members, `N = 10`, `t = 7` |
+| `signer-0` … `signer-9` | 172.28.0.11 … .20 | committee members, `N = 10`, `t = 7`; in SNARK mode `0`, `4`, `8` are also aggregators |
 | `holder` | 172.28.0.30 | node A, the relying party; resident, verifies on demand |
 | `trigger` | assigned | asks node A for one round; run on demand |
 | `probe` | assigned | double-sign probe; run on demand |
@@ -47,17 +49,20 @@ Three volumes, and the split between them is the design:
 
 ## What a round looks like
 
-1. Node A knows the committee a priori (it loads `anchor.bin`) and dials **one
-   member at random**. That member becomes the aggregator for this round and for
-   no longer.
+1. Node A knows the committee a priori (it loads `anchor.bin`) and dials one
+   aggregator. In raw mode every member is eligible. In SNARK mode only the
+   configured prover subset (`0`, `4`, `8`) is eligible, and those nodes have
+   already run `setup_prover()` during startup. `TARGET_MEMBER=<i>` can still pin
+   the target manually, but in SNARK mode it must name one of those aggregator
+   indices.
 2. The aggregator reads the published record, appends the new credential's
    fingerprint, and proposes `(version, list)` to all ten members. It does
    **not** propose a slot: every member derives that itself through
    `Committee::slot_for`, so an aggregator cannot have two versions signed at
    one XMSS slot.
-3. Each member checks that the proposal appends exactly one entry to what is
-   published, burns the slot durably, signs, and answers. A member whose slot is
-   already spent abstains, which is a normal outcome and not a fault.
+3. Each member checks that the proposal is an append-only successor of the last
+   authenticated record it signed, burns the slot durably, signs, and answers. A
+   member whose slot is already spent abstains, which is a normal outcome.
 4. The aggregator counts signatures until the seventh arrives. Each one is
    verified against the anchor's key at that index before it is counted, so the
    address map decides *where* to look and never *whether* the signature is
@@ -81,9 +86,10 @@ not move with `t` at all. The breakdown makes that structural rather than
 asserted.
 
 **Memory.** The raw verifier has no setup: it holds an anchor and calls
-`xmss_verify` `t` times. The SNARK verifier must make the aggregation bytecode
-resident before it can so much as deserialise a proof. Both demos print RSS
-before and after that step, and the peak.
+`xmss_verify` `t` times. In SNARK mode, node A loads the verifier once and the
+aggregator subset loads the prover once per aggregator process. The first cost is
+visible in node A's startup log; the second is visible in the selected members'
+startup logs. Each round then prints proof generation and verification costs.
 
 ## Node A is resident
 
@@ -107,8 +113,9 @@ like.
 
 ## The crash scenario
 
-`./demo.sh raw crash` answers one question: does a durable slot burn survive the
-machine that made it?
+`./demo.sh raw crash` and `./demo.sh snark crash` answer one question: does a
+durable slot burn survive the machine that made it? In SNARK mode, the default
+victim is also an aggregator, so restart includes a fresh `setup_prover()`.
 
 1. A member signs a version, and nobody publishes the result.
 2. The container is killed with `SIGKILL`. No shutdown hook, no flush.
@@ -116,8 +123,8 @@ machine that made it?
 4. It is asked to sign the **same version with a different list**. Two
    signatures at one XMSS slot recover the secret key, so the only safe answer
    is no, and the demo asserts it gets one.
-5. A normal round runs anyway: the committee reaches quorum with seven of the
-   other nine, which is what `t < N` buys.
+5. A normal round runs anyway: the committee reaches quorum without that
+   member's signature, which is what `t < N` buys.
 6. The next round is at a version the member has not signed, and it rejoins on
    its own. Nobody told it where it was; it derived the slot from the anchor.
 
@@ -142,11 +149,11 @@ unmodified from the parent crate.
   that carried them. The aggregator therefore knows which member it is talking
   to from the address it dialled, and an unreachable member costs the round its
   read timeout and nothing else.
-* **Structural extension check.** A member verifies that a proposal appends one
-  entry to the published record, but does not verify the published record's own
-  signatures before signing. Verifying a SNARK before every signature would put
-  the aggregator's cost on all ten nodes; the member's real defence against a
-  hostile aggregator is the slot counter, which no proposal can talk it out of.
+* **Structural extension check.** A member verifies that a proposal is an
+  append-only successor of the last authenticated record it recovered, but does
+  not verify the published record's own signatures before signing. Verifying a
+  SNARK before every signature would put the aggregator's cost on all ten nodes;
+  the member's real defence is the slot counter, which no proposal can talk it out of.
 
 ## Rebuilding
 

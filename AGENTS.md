@@ -359,8 +359,9 @@ from a `benchmark.sh` build, and the parent `Cargo.toml` must stay unaware of it
 
 Ten containers run one image and differ only by environment. `demo/src/bin/`
 holds `bootstrap` (assembles the anchor from ten published public keys, in index
-order, then exits), `signer` (a member, and the aggregator for one round when a
-holder dials it), `holder` (node A) and `probe` (asks one member to sign
+order, then exits), `signer` (a member; in raw mode any member may aggregate a
+round, while in SNARK mode only the configured prover subset aggregates and runs
+`setup_prover()` at startup), `holder` (node A) and `probe` (asks one member to sign
 directly, exit `0` signed / `3` abstained, which is what lets the crash scenario
 assert instead of grep).
 

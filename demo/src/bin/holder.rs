@@ -27,7 +27,8 @@
 //! * **one-shot** (neither): setup, one round, exit. Kept because it is the
 //!   honest measurement of what a cold verifier costs.
 //!
-//! Configured by environment: `DEMO_MODE`, `SUBJECT`, `TARGET_MEMBER`,
+//! Configured by environment: `DEMO_MODE`, `SUBJECT`, `TARGET_MEMBER` (must be
+//! one of the configured SNARK aggregators in SNARK mode),
 //! `VERIFY_ONLY`, `HOLDER_SERVE`, `HOLDER_TRIGGER`.
 
 use std::net::{TcpListener, TcpStream};
@@ -40,7 +41,7 @@ use decentralized_root_of_trust::node::snark_node::SnarkNode;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{SnarkStatusList, StatusList};
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
-use drot_demo::config::{self, MEMBER_IPS, Mode, N_MEMBERS};
+use drot_demo::config::{self, MEMBER_IPS, Mode};
 use drot_demo::wire::{self, Failure, VcIssued, VcRequest};
 use drot_demo::{report, storage, vc};
 use lean_multisig::SIGNATURE_SSZ_LEN;
@@ -136,6 +137,13 @@ impl Node {
             }
         }
         built
+    }
+
+    fn mode(&self) -> Mode {
+        match self {
+            Node::Raw(_) => Mode::Raw,
+            Node::Snark(_) => Mode::Snark,
+        }
     }
 
     /// Decode, verify and gate, in that order and without a way to reorder them.
@@ -312,7 +320,7 @@ fn trigger(kind: &str, subject: &str) {
 /// node, which is what decides.
 fn run_round(node: &mut Node, subject: Option<&str>) -> Result<String, String> {
     let issued = match subject {
-        Some(subject) => Some(request_credential(subject)?),
+        Some(subject) => Some(request_credential(node.mode(), subject)?),
         None => {
             println!("\nnode A: verify-only, checking whatever is published");
             None
@@ -355,20 +363,45 @@ fn run_round(node: &mut Node, subject: Option<&str>) -> Result<String, String> {
     Ok(format!("v{version} verified, {note}"))
 }
 
-/// Asks one member of the committee, chosen at random, for a credential.
+/// Asks one allowed aggregator, chosen at random unless `TARGET_MEMBER` is set,
+/// for a credential.
 ///
-/// At random because no member is special: whoever is dialled becomes the
-/// aggregator for that round and holds the role for exactly as long as it takes.
-fn request_credential(subject: &str) -> Result<VcIssued, String> {
-    let target = std::env::var("TARGET_MEMBER")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| (rand::rng().random::<u64>() % N_MEMBERS as u64) as usize);
+/// Raw mode keeps the original rule: every member may coordinate the round. In
+/// SNARK mode, only the configured prover subset is eligible, because those are
+/// the nodes that paid `setup_prover()` at startup.
+fn request_credential(mode: Mode, subject: &str) -> Result<VcIssued, String> {
+    let candidates = config::aggregator_indices(mode);
+    let role = match mode {
+        Mode::Raw => "member",
+        Mode::Snark => "SNARK aggregator",
+    };
+    let target = match std::env::var("TARGET_MEMBER") {
+        Ok(raw) => {
+            let target = raw
+                .parse::<usize>()
+                .map_err(|_| format!("TARGET_MEMBER must be a committee index, got `{raw}`"))?;
+            if !candidates.contains(&target) {
+                return Err(format!(
+                    "member {target} cannot aggregate in {} mode; allowed targets: [{}]",
+                    mode.as_str(),
+                    config::format_indices(candidates)
+                ));
+            }
+            target
+        }
+        Err(_) => candidates[(rand::rng().random::<u64>() % candidates.len() as u64) as usize],
+    };
 
     println!(
-        "\nnode A: asking member {target} ({}) for a credential for {subject}",
+        "\nnode A: asking {role} {target} ({}) for a credential for {subject}",
         MEMBER_IPS[target]
     );
+    if mode == Mode::Snark {
+        println!(
+            "node A: SNARK aggregator subset: [{}]",
+            config::format_indices(candidates)
+        );
+    }
     let payload = VcRequest {
         subject: subject.as_bytes().to_vec(),
     }
@@ -381,7 +414,7 @@ fn request_credential(subject: &str) -> Result<VcIssued, String> {
         wire::MSG_VC_REQUEST,
         &payload,
     )
-    .map_err(|e| format!("member {target} did not answer: {e}"))?;
+    .map_err(|e| format!("{role} {target} did not answer: {e}"))?;
 
     match kind {
         wire::MSG_VC_ISSUED => {
@@ -394,10 +427,12 @@ fn request_credential(subject: &str) -> Result<VcIssued, String> {
             println!("{}", vc::pretty(&issued.credential));
             Ok(issued)
         }
-        _ => Err(format!("the round failed: {}", Failure::text(&reply))),
+        _ => Err(format!(
+            "{role} {target} failed the round: {}",
+            Failure::text(&reply)
+        )),
     }
 }
-
 /// The last question, and the one the holder actually came for: is *my*
 /// credential in the list the committee signed?
 ///

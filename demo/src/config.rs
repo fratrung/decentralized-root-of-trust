@@ -21,6 +21,18 @@ pub const N_MEMBERS: usize = 10;
 /// Threshold `t`: how many distinct members must sign an update.
 pub const THRESHOLD: usize = 7;
 
+/// Every committee index in canonical order.
+pub const ALL_MEMBER_INDICES: [usize; N_MEMBERS] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+/// Members that are allowed to aggregate SNARK rounds.
+///
+/// They are still ordinary committee members: they sign proposals like everyone
+/// else, but they also run `setup_prover()` at startup and can turn a quorum into
+/// a `SnarkStatusList`. The other members stay signer-only, which keeps the demo
+/// closer to a realistic deployment where prover memory is paid by selected
+/// nodes and not by the whole committee.
+pub const SNARK_AGGREGATOR_INDICES: [usize; 3] = [0, 4, 8];
+
 /// Member `i` lives at `MEMBER_IPS[i]`. Position in this table *is* the
 /// committee index, the same index the anchor orders public keys by and the
 /// same one a record's bitmap names.
@@ -99,6 +111,32 @@ pub fn member_addr(index: usize) -> SocketAddr {
     format!("{}:{}", MEMBER_IPS[index], MEMBER_PORT)
         .parse()
         .expect("member address table is malformed")
+}
+
+/// Members node A may ask to coordinate a round.
+///
+/// On the raw path every member can build the published object. On the SNARK
+/// path only the configured prover subset can do it; everyone else remains
+/// available for signatures.
+pub fn aggregator_indices(mode: Mode) -> &'static [usize] {
+    match mode {
+        Mode::Raw => &ALL_MEMBER_INDICES,
+        Mode::Snark => &SNARK_AGGREGATOR_INDICES,
+    }
+}
+
+/// Whether `index` is allowed to coordinate a round in `mode`.
+pub fn can_aggregate(mode: Mode, index: usize) -> bool {
+    aggregator_indices(mode).contains(&index)
+}
+
+/// Human-readable index list for logs and failures.
+pub fn format_indices(indices: &[usize]) -> String {
+    indices
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Where node A listens for round triggers.

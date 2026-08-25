@@ -1,22 +1,22 @@
-//! A committee member, and, when a holder happens to pick it, the aggregator for
-//! one round.
+//! A committee member, and, for selected nodes, an aggregator.
 //!
-//! Every node in the demo runs this same binary. There is no privileged
-//! coordinator: the role lasts exactly as long as one round, and it is assigned
-//! by whoever the holder dialled. That is the point of a `t`-of-`N` committee,
-//! and it is why the aggregator is given no power a member does not already
-//! have. In particular it cannot name the XMSS slot; it proposes a *version*,
-//! and every member derives the slot from the anchor itself.
+//! Every node in the demo runs this same binary. In raw mode any member can
+//! coordinate a round. In SNARK mode only the configured prover subset can do
+//! that: those nodes run `setup_prover()` before they start listening, and node A
+//! requests credentials only from them. They are not more trusted than the other
+//! members; they just pay the memory and time cost needed to produce the proof.
+//! In particular an aggregator cannot name the XMSS slot. It proposes a
+//! *version*, and every member derives the slot from the anchor itself.
 //!
 //! A member's own defences are two, and both are local:
 //!
 //! * the durable slot counter, which makes signing a second message under one
 //!   slot unreachable rather than merely discouraged, and
-//! * the extension check, which refuses a proposal that does not append exactly
-//!   one entry to the record already published.
+//! * the extension check, which refuses a proposal that is not an append-only
+//!   successor of the last authenticated record this member signed.
 //!
 //! Neither depends on the aggregator being honest, which is what lets the role
-//! be handed to an arbitrary node.
+//! be handed to a small subset of committee members.
 //!
 //! Configured entirely by environment: `MEMBER_INDEX`, `MEMBER_SECRET`,
 //! `DEMO_MODE`.
@@ -32,9 +32,7 @@ use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::params::{KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, SLOT};
 use decentralized_root_of_trust::protocol::committee::Committee;
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, StatusList,
-};
+use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, StatusList};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
 use decentralized_root_of_trust::state::status_list_head::{GENESIS_PREDECESSOR, SignedHead};
 use drot_demo::config::{self, MEMBER_IPS, MEMBER_PORT, Mode, N_MEMBERS, THRESHOLD};
@@ -62,10 +60,10 @@ struct Node {
     /// once would otherwise propose the same version twice, and the second round
     /// would collect nothing but abstentions.
     round: Mutex<()>,
-    /// Built on first use, never at startup. Any of the ten nodes may become the
-    /// aggregator, and `setup_prover()` costs seconds and gigabytes; paying it on
-    /// all ten to serve one round would misrepresent what the SNARK path
-    /// actually costs a network.
+    /// True for every raw member and for the configured SNARK prover subset.
+    can_aggregate: bool,
+    /// Present only on SNARK aggregators. Signer-only nodes leave it empty and
+    /// can still answer proposals like every other committee member.
     prover: OnceLock<PQSNARKProverModule>,
     rounds_served: AtomicUsize,
 }
@@ -139,6 +137,37 @@ fn main() {
     let signed_head =
         recover_signed_head(mode, &committee).expect("published record is unreadable");
 
+    let can_aggregate = config::can_aggregate(mode, index);
+    let role = match (mode, can_aggregate) {
+        (Mode::Raw, _) => "signer + raw aggregator",
+        (Mode::Snark, true) => "signer + SNARK aggregator",
+        (Mode::Snark, false) => "signer only",
+    };
+    let prover = OnceLock::new();
+    match (mode, can_aggregate) {
+        (Mode::Snark, true) => {
+            let before = rss_now_mb();
+            let started = Instant::now();
+            println!(
+                "member {index}: SNARK aggregator role enabled; running setup_prover() before listening"
+            );
+            let module = PQSNARKProverModule::init_prover();
+            assert!(prover.set(module).is_ok(), "fresh prover slot");
+            println!(
+                "member {index}: setup_prover() ready in {:.2?}, RSS {before} MB -> {} MB",
+                started.elapsed(),
+                rss_now_mb()
+            );
+        }
+        (Mode::Snark, false) => println!(
+            "member {index}: signer-only in SNARK mode; aggregator subset is [{}]",
+            config::format_indices(config::aggregator_indices(mode))
+        ),
+        (Mode::Raw, _) => {
+            println!("member {index}: raw mode; this member can aggregate if node A dials it")
+        }
+    }
+
     let node = Arc::new(Node {
         index,
         mode,
@@ -146,13 +175,14 @@ fn main() {
         signer: Mutex::new(SignerNode::new(pk, sk, counter)),
         signed_head: Mutex::new(signed_head),
         round: Mutex::new(()),
-        prover: OnceLock::new(),
+        can_aggregate,
+        prover,
         rounds_served: AtomicUsize::new(0),
     });
 
     let listener = TcpListener::bind(("0.0.0.0", MEMBER_PORT)).expect("cannot bind");
     println!(
-        "member {index}: ready on {MEMBER_PORT}, {}-of-{} committee, RSS {} MB\n",
+        "member {index}: ready on {MEMBER_PORT} as {role}, {}-of-{} committee, RSS {} MB\n",
         THRESHOLD,
         N_MEMBERS,
         rss_now_mb()
@@ -264,9 +294,9 @@ impl Node {
                 abstain("version has no slot under this anchor"),
             );
         };
-        let message = self
-            .committee
-            .message_for(Algorithms::WotsXmss, &proposal.list, proposal.version);
+        let message =
+            self.committee
+                .message_for(Algorithms::WotsXmss, &proposal.list, proposal.version);
 
         let started = Instant::now();
         let signed = self
@@ -318,6 +348,20 @@ impl Node {
 
     /// The aggregator's side of a round, from credential to published record.
     fn on_credential_request(self: &Arc<Self>, payload: &[u8], peer: &str) -> (u8, Vec<u8>) {
+        if !self.can_aggregate {
+            let why = format!(
+                "member {} is signer-only in {} mode; ask one of [{}]",
+                self.index,
+                self.mode.as_str(),
+                config::format_indices(config::aggregator_indices(self.mode))
+            );
+            println!(
+                "member {}: credential request from {peer} refused, {why}",
+                self.index
+            );
+            return (wire::MSG_FAILURE, Failure::of(why));
+        }
+
         let request = match VcRequest::from_ssz_bytes(payload) {
             Ok(r) => r,
             Err(e) => {
@@ -422,9 +466,9 @@ impl Node {
     /// one for everybody.
     fn collect_signatures(self: &Arc<Self>, proposal: &Proposal) -> Vec<(usize, XmssSignature)> {
         let bytes = Arc::new(proposal.as_ssz_bytes());
-        let message = self
-            .committee
-            .message_for(Algorithms::WotsXmss, &proposal.list, proposal.version);
+        let message =
+            self.committee
+                .message_for(Algorithms::WotsXmss, &proposal.list, proposal.version);
         let slot = self
             .committee
             .slot_for(proposal.version)
@@ -536,25 +580,26 @@ impl Node {
                     .collect();
                 let signers = raws.len();
 
+                let prover = self.prover.get().ok_or_else(|| {
+                    format!("member {} is not a configured SNARK aggregator", self.index)
+                })?;
                 let before = rss_now_mb();
-                let started = Instant::now();
-                let prover = self.prover.get_or_init(|| {
-                    println!(
-                        "    setup_prover(): first proof on this node, this is the one-time cost"
-                    );
-                    PQSNARKProverModule::init_prover()
-                });
-                let setup = started.elapsed();
 
                 let proving = Instant::now();
-                let proof = prover.make_proof(&self.committee, Algorithms::WotsXmss, raws, list, version, LOG_INV_RATE);
+                let proof = prover.make_proof(
+                    &self.committee,
+                    Algorithms::WotsXmss,
+                    raws,
+                    list,
+                    version,
+                    LOG_INV_RATE,
+                );
                 println!(
                     "    SNARK form: {signers} signatures aggregated into {} B",
                     proof.len()
                 );
                 println!(
-                    "    setup {:.2?}, prove {:.2?}, RSS {} MB -> {} MB",
-                    setup,
+                    "    prove {:.2?}, RSS {} MB -> {} MB (setup_prover() paid at startup)",
                     proving.elapsed(),
                     before,
                     rss_now_mb()

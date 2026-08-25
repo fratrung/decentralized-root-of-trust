@@ -10,8 +10,9 @@
 #   ./demo.sh raw   down      stop the network and delete its volumes
 #
 # `snark` in place of `raw` runs the same network publishing one aggregated
-# proof instead of the signatures. The two share a subnet, so `up` tears the
-# other one down first.
+# proof instead of the signatures. Only the configured prover subset can
+# aggregate SNARK rounds; the other members still sign. The two share a subnet,
+# so `up` tears the other one down first.
 #
 # Node A is resident: `up` starts it, it does its one-time setup there, and
 # `round` and `verify` only send it a trigger. That is why the SNARK setup cost
@@ -32,9 +33,9 @@ esac
 COMPOSE=(docker compose -f "$HERE/compose.$MODE.yml")
 OTHER_COMPOSE=(docker compose -f "$HERE/compose.$OTHER.yml")
 
-# The victim of the crash scenario. Any member will do: none of them is special,
-# which is the property the scenario is there to show.
-VICTIM="${VICTIM:-3}"
+# The default victim is one of the SNARK aggregators, so the SNARK crash scenario
+# also exercises prover setup after restart. Override with VICTIM=<index>.
+VICTIM="${VICTIM:-4}"
 THRESHOLD=7
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -54,8 +55,10 @@ published_count() {
   in_volumes 'ls /shared/storage/status-*.ssz 2>/dev/null | wc -l' | tr -dc '0-9'
 }
 
+member_log() { docker logs "drot-$MODE-signer-$1" 2>&1; }
+
 # A member's own log, which is where its side of the protocol is visible.
-victim_log() { docker logs "drot-$MODE-signer-$VICTIM" 2>&1; }
+victim_log() { member_log "$VICTIM"; }
 
 # Node A's log, where the report of every round it ran is printed.
 holder_log() { docker logs "drot-$MODE-holder" 2>&1; }
@@ -70,6 +73,23 @@ wait_for_holder() {
     sleep 1
   done
 }
+
+wait_for_members() {
+  local deadline=$((SECONDS + 900)) ready i
+  while true; do
+    ready=0
+    for i in $(seq 0 9); do
+      if [ "$(member_log "$i" | grep -c 'ready on' || true)" -gt 0 ]; then
+        ready=$((ready + 1))
+      fi
+    done
+    [ "$ready" -eq 10 ] && return 0
+    [ "$SECONDS" -lt "$deadline" ] \
+      || bad "only $ready/10 members became ready; try: $0 $MODE logs"
+    sleep 1
+  done
+}
+
 
 # Triggers one round on the resident node A and shows what it printed.
 #
@@ -89,7 +109,7 @@ fire() {
 }
 
 wait_until_ready() {
-  local before="$1" deadline=$((SECONDS + 120))
+  local before="$1" deadline=$((SECONDS + 900))
   while [ "$(victim_log | grep -c 'ready on' || true)" -le "$before" ]; do
     [ "$SECONDS" -lt "$deadline" ] || bad "member $VICTIM did not come back up"
     sleep 1
@@ -109,6 +129,8 @@ case "$CMD" in
     wait_for_anchor
     say "waiting for node A to finish its one-time verifier setup"
     wait_for_holder
+    say "waiting for committee members to finish their startup"
+    wait_for_members
     holder_log | tail -n +2
     say "the committee is assembled, every member is listening, node A is ready"
     "${COMPOSE[@]}" ps
@@ -168,7 +190,7 @@ case "$CMD" in
     say "step 3: restart, and let it resume from whatever is on its volume"
     docker start "drot-$MODE-signer-$VICTIM" >/dev/null
     wait_until_ready "$ready_before"
-    victim_log | grep 'counter resumed' | tail -1
+    victim_log | grep -E 'counter resumed|setup_prover\(\) ready' | tail -2
 
     say "step 4: same version, different list. This is the double-sign attempt"
     set +e
@@ -179,9 +201,9 @@ case "$CMD" in
       && ok "refused after the crash: the slot was burned before the key touched it" \
       || bad "expected an abstention (exit 3), got exit $status"
 
-    say "step 5: a normal round. The committee does not need this member"
+    say "step 5: a normal round. The committee does not need this member's signature"
     fire round >/dev/null \
-      && ok "quorum reached without member $VICTIM, which is what t < N is for" \
+      && ok "quorum reached without member $VICTIM's signature, which is what t < N is for" \
       || bad "the round should still have succeeded"
     victim_log | grep 'abstains' | tail -1
 
