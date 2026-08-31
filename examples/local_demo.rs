@@ -31,7 +31,7 @@ use ssz::Encode as _;
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS_SLOT: u32 = 43;
-const KEY_SLOTS: u32 = 16;
+const KEY_SLOTS: u32 = 256;
 const SLOT_COUNT: u64 = KEY_SLOTS as u64 + 1;
 const LOG_INV_RATE: usize = 2;
 const BATCHES: [usize; 3] = [2, 3, 1];

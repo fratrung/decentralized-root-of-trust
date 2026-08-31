@@ -118,7 +118,10 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
         verifier.verify_status_list(&v0),
         "honest round 0 must verify"
     );
-    assert!(matches!(hwm.try_advance(v0.version()), Decision::Accepted));
+    assert!(matches!(
+        hwm.try_advance(v0.version()),
+        Ok(Decision::Accepted)
+    ));
 
     // --- round 1: members 2,3,4. Only member 2 overlaps, which is the case
     // per-member counters cannot handle and `slot_for` exists to fix.
@@ -129,7 +132,10 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
         verifier.verify_status_list(&v1),
         "honest round 1 must verify"
     );
-    assert!(matches!(hwm.try_advance(v1.version()), Decision::Accepted));
+    assert!(matches!(
+        hwm.try_advance(v1.version()),
+        Ok(Decision::Accepted)
+    ));
     assert_eq!(hwm.current(), Some(1));
 
     // Members 3 and 4 sat out round 0. Reaching round 1's slot burned round 0's
@@ -144,7 +150,10 @@ fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
         verifier.verify_status_list(&v0),
         "the stale record is still cryptographically valid"
     );
-    assert!(matches!(hwm.try_advance(v0.version()), Decision::Stale(1)));
+    assert!(matches!(
+        hwm.try_advance(v0.version()),
+        Ok(Decision::Stale(1))
+    ));
     assert_eq!(
         hwm.current(),
         Some(1),

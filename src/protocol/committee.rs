@@ -7,11 +7,14 @@
 //! value carrying the operations its role can perform, not a bag of free
 //! functions all taking `&Committee`.
 
+use std::collections::HashSet;
+
 use lean_multisig::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 use ssz::{Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
+use crate::protocol::MAX_COMMITTEE_SIZE;
 use crate::protocol::status_list::{Algorithms, Domain};
 
 /// SSZ wire schema for the anchor. `XmssPublicKey` is a fixed 32-byte SSZ object
@@ -24,6 +27,11 @@ struct CommitteeWire {
     t: u64,
     genesis_slot: u32,
 }
+
+const COMMITTEE_FIXED_WIRE_BYTES: usize = 4 + 8 + 4;
+const XMSS_PUBLIC_KEY_WIRE_BYTES: usize = 32;
+const MAX_COMMITTEE_WIRE_BYTES: usize =
+    COMMITTEE_FIXED_WIRE_BYTES + MAX_COMMITTEE_SIZE * XMSS_PUBLIC_KEY_WIRE_BYTES;
 
 /// The fixed trust anchor, embedded once in every verifier: what replaces the
 /// single root-of-trust key. The only thing a verifier must know a priori; *who*
@@ -44,10 +52,20 @@ pub struct Committee {
 }
 
 fn has_duplicate_members(members: &[XmssPublicKey]) -> bool {
+    let mut seen = HashSet::with_capacity(members.len());
     members
         .iter()
-        .enumerate()
-        .any(|(i, member)| members[i + 1..].contains(member))
+        .any(|member| !seen.insert(member.as_ssz_bytes()))
+}
+
+fn ensure_member_count_is_supported(n: usize) -> Result<(), String> {
+    if n > MAX_COMMITTEE_SIZE {
+        Err(format!(
+            "anchor names {n} members, above the ceiling of {MAX_COMMITTEE_SIZE}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// SHA3-256 of the anchor's canonical SSZ encoding.
@@ -85,16 +103,25 @@ impl Committee {
     ///
     /// # Panics
     ///
-    /// If `t` is not in `1..=members.len()` or a public key occurs more than once.
-    /// Both threshold bounds are load-bearing: `t = 0` lets a record with *no*
+    /// If `t` is not in `1..=members.len()`, the committee exceeds
+    /// [`MAX_COMMITTEE_SIZE`], or a public key occurs more than once. Both
+    /// threshold bounds are load-bearing: `t = 0` lets a record with *no*
     /// signatures reach quorum, while `t > N` is unsatisfiable. Duplicate keys
-    /// would let one key occupy several committee identities. An anchor is built
-    /// once by its owner, so this asserts rather than returning a `Result`.
+    /// would let one key occupy several committee identities. The size ceiling is
+    /// shared with the raw signer bitmap, so both published forms target the same
+    /// committee universe. An anchor is built once by its owner, so this asserts
+    /// rather than returning a `Result`.
     pub fn new(members: Vec<XmssPublicKey>, t: usize, genesis_slot: u32) -> Self {
         assert!(
             (1..=members.len()).contains(&t),
             "threshold {t} outside 1..={} for this committee",
             members.len()
+        );
+        assert!(
+            members.len() <= MAX_COMMITTEE_SIZE,
+            "anchor names {} members, above the ceiling of {}",
+            members.len(),
+            MAX_COMMITTEE_SIZE
         );
         assert!(
             !has_duplicate_members(&members),
@@ -195,14 +222,22 @@ impl Committee {
     /// decoder refuses a field element at or above the modulus. Canonicity is
     /// structural rather than checked.
     ///
-    /// What SSZ cannot know are the protocol invariants, so `t` outside `1..=N`
-    /// and duplicate public keys are refused here too: deserialization bypasses
-    /// [`Committee::new`].
+    /// What SSZ cannot know are the protocol invariants, so a member count above
+    /// the published ceiling, `t` outside `1..=N`, and duplicate public keys are
+    /// refused here too: deserialization bypasses [`Committee::new`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_COMMITTEE_WIRE_BYTES {
+            return Err(format!(
+                "anchor wire size {} B is above the ceiling of {} B for {MAX_COMMITTEE_SIZE} members",
+                bytes.len(),
+                MAX_COMMITTEE_WIRE_BYTES
+            ));
+        }
         let value = CommitteeWire::from_ssz_bytes(bytes)
             .map_err(|e| format!("committee is not valid SSZ: {e:?}"))?;
         let t = usize::try_from(value.t)
             .map_err(|_| format!("anchor threshold {} too large", value.t))?;
+        ensure_member_count_is_supported(value.members.len())?;
         if !(1..=value.members.len()).contains(&t) {
             return Err(format!(
                 "anchor threshold {t} outside 1..={}",
@@ -342,6 +377,50 @@ mod tests {
             .err()
             .expect("duplicate keys must be refused");
         assert!(err.contains("duplicate member public keys"));
+    }
+    #[test]
+    #[should_panic(expected = "above the ceiling")]
+    fn constructor_refuses_an_anchor_above_the_bitmap_ceiling() {
+        let pk = committee_in(10).members()[0].clone();
+        let _ = Committee::new(
+            vec![pk; crate::protocol::MAX_COMMITTEE_SIZE + 1],
+            1,
+            GENESIS,
+        );
+    }
+
+    #[test]
+    fn decoder_refuses_an_anchor_above_the_bitmap_ceiling() {
+        let pk = committee_in(11).members()[0].clone();
+        let bytes = CommitteeWire {
+            members: vec![pk; crate::protocol::MAX_COMMITTEE_SIZE + 1],
+            t: 1,
+            genesis_slot: GENESIS,
+        }
+        .as_ssz_bytes();
+
+        let err = Committee::from_bytes(&bytes)
+            .err()
+            .expect("oversized anchors must be refused");
+        assert!(err.contains("above the ceiling"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_decoded_anchor_fingerprints_as_the_one_that_was_built() {
+        let c = committee_in(12);
+        let bytes = c.to_bytes();
+        let decoded = Committee::from_bytes(&bytes).expect("round trip");
+
+        assert_eq!(
+            decoded.to_bytes(),
+            bytes,
+            "anchor encoding is not canonical"
+        );
+        assert_eq!(decoded.fingerprint(), c.fingerprint());
+        assert_eq!(
+            decoded.domain(crate::protocol::status_list::Algorithms::WotsXmss),
+            c.domain(crate::protocol::status_list::Algorithms::WotsXmss)
+        );
     }
 
     /// Two byte-different encodings of one committee would read as two trust

@@ -13,8 +13,9 @@ use ssz::{BitList, Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
 /// Compile-time ceiling required by SSZ `BitList`; the anchor supplies the actual
-/// committee size.
-pub const MAX_COMMITTEE_SIZE: usize = 2048;
+/// committee size. Re-exported from [`crate::protocol`] for compatibility with
+/// callers that used the old module path.
+pub use crate::protocol::MAX_COMMITTEE_SIZE;
 type MaxCommittee = typenum::U2048;
 const _: () = assert!(MAX_COMMITTEE_SIZE == <MaxCommittee as typenum::Unsigned>::USIZE);
 

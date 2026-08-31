@@ -72,7 +72,8 @@ fn main() -> ExitCode {
     let state_path = std::env::var_os("VERIFIER_STATE")
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join("verifier-highwater.state"));
-    let mut hwm = HighWaterMark::load(&state_path, &anchor);
+    let mut hwm = HighWaterMark::try_load(&state_path, &anchor)
+        .unwrap_or_else(|e| panic!("cannot open high-water mark {}: {e}", state_path.display()));
 
     println!("verifier: setup...");
     let t_setup = Instant::now();
@@ -196,7 +197,7 @@ fn main() -> ExitCode {
     };
     match verifier.select_freshest_above(&candidates, floor) {
         Some(sl) => match hwm.try_advance(sl.version()) {
-            Decision::Accepted => {
+            Ok(Decision::Accepted) => {
                 println!(
                     "  selected version {} -> accepted, high-water advanced",
                     sl.version()
@@ -206,9 +207,16 @@ fn main() -> ExitCode {
             // floor let through is strictly above it, and the gate applies the same
             // rule. Reaching it means the filter and the gate disagree, which is a
             // bug in one of them and not a quiet "nothing to do".
-            Decision::Stale(hw) => {
+            Ok(Decision::Stale(hw)) => {
                 println!(
                     "  selected version {} -> not newer than high-water {hw} <- BUG (the floor let it through)",
+                    sl.version()
+                );
+                failures += 1;
+            }
+            Err(e) => {
+                println!(
+                    "  selected version {} -> high-water update failed: {e} <- SECURITY FAILURE",
                     sl.version()
                 );
                 failures += 1;
@@ -252,16 +260,20 @@ fn main() -> ExitCode {
 
     match (hwm.current(), replayed) {
         (Some(_), Some(sl)) => match hwm.try_advance(sl.version()) {
-            Decision::Stale(hw) => println!(
+            Ok(Decision::Stale(hw)) => println!(
                 "  rollback: replayed version {} refused (high-water {})",
                 sl.version(),
                 hw
             ),
-            Decision::Accepted => {
+            Ok(Decision::Accepted) => {
                 println!(
                     "  rollback: replayed version {} ACCEPTED <- SECURITY FAILURE",
                     sl.version()
                 );
+                failures += 1;
+            }
+            Err(e) => {
+                println!("  rollback: high-water update failed: {e} <- SECURITY FAILURE");
                 failures += 1;
             }
         },

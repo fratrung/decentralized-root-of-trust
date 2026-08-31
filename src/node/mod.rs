@@ -23,7 +23,8 @@ pub enum Outcome {
     /// common case for a node polling a list that has not changed, and it is also
     /// what a replay looks like.
     Stale { version: u32, mark: u32 },
-    /// It did not decode, or did not verify under this anchor. Nothing moved.
+    /// It did not decode, did not verify under this anchor, or could not
+    /// durably advance the freshness mark. Nothing moved.
     ///
     /// The version it claimed is deliberately not reported: an unverified record
     /// is a peer's assertion, not a fact, and handing it back invites a caller to
@@ -46,8 +47,9 @@ impl Outcome {
     /// is a property of two short functions rather than of every call site.
     pub(crate) fn advance(mark: &mut HighWaterMark, version: u32) -> Outcome {
         match mark.try_advance(version) {
-            Decision::Accepted => Outcome::Accepted { version },
-            Decision::Stale(mark) => Outcome::Stale { version, mark },
+            Ok(Decision::Accepted) => Outcome::Accepted { version },
+            Ok(Decision::Stale(mark)) => Outcome::Stale { version, mark },
+            Err(_) => Outcome::Refused,
         }
     }
 }

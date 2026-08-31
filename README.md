@@ -1,4 +1,4 @@
-# decentralized-root-of-trust
+# Post-Quantum Decentralized Root of trust
 
 **Removing the single key at the root of a trust hierarchy, without giving up
 offline verification — and without assuming an adversary that cannot run a
@@ -8,7 +8,7 @@ quantum computer.**
 
 ## The problem
 
-Systems that issue credentials — PKI, verifiable credentials, firmware update
+Systems that issue credentials PKI, verifiable credentials, firmware update
 channels, device attestation — publish a **status list**: the set of identifiers
 that have been revoked. That list is the security-critical object. If an attacker
 can rewrite it, they can un-revoke a stolen key; if they can freeze it, they can
@@ -469,60 +469,6 @@ Three consequences are worth stating plainly, because none of them is obvious:
 - **Recovery is not optional.** A member with no head can only sign v0, whose slot
   is long spent — so a process that fails to recover does not lag behind, it
   abstains permanently.
-
----
-
-## Layout
-
-```
-src/
-  lib.rs                module roots and compatibility re-exports for local scratch binaries
-  protocol/
-    mod.rs
-    committee.rs        Committee anchor: members, threshold, genesis_slot, wire encoding, and the two
-                        derivations it owns — slot_for (the round's slot) and domain/message_for
-    status_list.rs      StatusList (raw + bitmap) and SnarkStatusList, Domain, versioned Poseidon2 root, wire format
-  node/
-    mod.rs              Outcome: what a relying party did with a record (accepted, stale, refused)
-    signer.rs           one member: XMSS keypair + its counter; sign (local slot) and sign_at (protocol slot)
-    raw_verifier.rs     the raw-path predicate: verify (one signature) and verify_status_list (the whole record)
-    raw_node.rs         the raw-path relying party: anchor + high-water mark, accept and accept_best
-    snark_prover.rs     the prover: make_proof (slot derived from the anchor), aggregate, sign_and_prove
-    snark_verifier.rs   the SNARK predicate: the five checks, is_newer, select_freshest(_above)
-    snark_node.rs       the SNARK relying party: the same composition over the aggregated form
-  state/
-    mod.rs
-    slot_counter.rs     durable monotonic slot allocator: reserve, reserve_at, fsync + cross-process lock
-    freshness.rs        HighWaterMark: persistent, anchor-scoped anti-rollback gate
-    status_list_head.rs SignedHead: the append-only guard on what a member will sign next
-                        (in-memory, unlike the other two; see Append-only proposals)
-  bench/
-    mod.rs
-    mem.rs              VmRSS / VmHWM probes
-    stats.rs            descriptive statistics for the benchmark records
-  params.rs             demo parameters (SLOT, N_MEMBERS, T, N_UPDATES, KEY_SLOTS, LOG_INV_RATE)
-  main.rs               combined demo: setup, N updates, 3 security tests, BENCH record
-  bin/signer.rs         split deployment: ONE member, one signature + one durable slot burn per round
-  bin/prover.rs         split deployment: the aggregator, writes artifacts, never verifies
-  bin/verifier.rs       split deployment: verify-only, calls setup_verifier() alone
-  bin/raw_agg.rs        the same protocol without a SNARK, through SignerNode / VerifierNode
-tests/
-  raw_path_round.rs     end-to-end: rotating quorums over durable counters, then the rollback refusal
-  snark_path.rs         the five checks of PQSNARKVerifierModule::verify, each broken in isolation
-  snark_modules.rs      the two SNARK node types as the binaries use them (slot derived from the anchor)
-  snark_node.rs         the seam: a genuine proof carrying a lying version must not move the gate
-  lock_two_processes.rs the cross-process slot lock, checked by re-executing the test binary
-  hostile_bytes.rs      the decoders against attacker-written bytes: no panic, no bomb, no forgery
-docs/
-  architecture.svg / .png    the diagram at the top of this file
-demo/                   the container demos: ten members over a network, a shared volume
-                        for the published records, and node A. A separate crate with its
-                        own workspace, so it cannot change what benchmark.sh measures
-benchmark.sh            reproducible multi-run benchmark (env capture, tidy CSV, CI95)
-```
-
-The demo constants live in `src/params.rs`. The `verifier` binary deliberately
-uses none of them: everything it needs comes from the committee anchor it loads.
 
 ---
 
@@ -1008,6 +954,6 @@ a byte value.
 
 ## Provenance
 
-This code was written with AI assistance GPT-5.6 Sol, GPT-5.5 and Fable 5. None of it was taken on
+This code was written with AI assistance GPT-5.6 Sol/Terra, GPT-5.5 and Fable 5. None of it was taken on
 trust: everything here was built, run and tested, the code was reviewed line by
 line before it landed, and the author takes responsibility for every commit.

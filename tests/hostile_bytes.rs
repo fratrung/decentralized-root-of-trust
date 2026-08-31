@@ -53,9 +53,11 @@ const ITERATIONS: u32 = 60_000;
 /// Seeds are `[FILE, ns, member, 0, ..]`; file 5 here. See `tests/snark_path.rs`
 /// for why the tag exists: one `(key, slot)` pair must never be shared across
 /// test files, and the slot window is not a namespace.
+const FILE: u8 = 5;
+
 fn seed(member: u8) -> [u8; 32] {
     let mut s = [0u8; 32];
-    s[0] = 5;
+    s[0] = FILE;
     s[2] = member;
     s
 }
@@ -108,6 +110,12 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
             .expect("well-formed SSZ container decodes")
             .to_bytes(),
         snark
+    );
+    assert_eq!(
+        Committee::from_bytes(&anchor)
+            .expect("honest anchor decodes")
+            .to_bytes(),
+        anchor
     );
     let mut padded_raw = raw.clone();
     padded_raw.push(0);
@@ -185,7 +193,13 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
             }
         }
         let _ = SnarkStatusList::from_bytes(&bytes);
-        let _ = Committee::from_bytes(&bytes);
+        if let Ok(anchor) = Committee::from_bytes(&bytes) {
+            assert_eq!(
+                anchor.to_bytes(),
+                bytes,
+                "alternate anchor encoding accepted"
+            );
+        }
     }
 
     // Not an assertion about a threshold: it is a guard against the whole loop
