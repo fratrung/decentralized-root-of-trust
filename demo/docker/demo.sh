@@ -4,6 +4,7 @@
 #
 #   ./demo.sh raw   up        build the image and start the network + node A
 #   ./demo.sh raw   round     node A asks for a credential, then verifies it
+#   ./demo.sh raw   revoke    remove that credential's fingerprint and verify absence
 #   ./demo.sh raw   verify    verify whatever is published, without a new round
 #   ./demo.sh raw   crash     kill a member mid-protocol and watch it re-align
 #   ./demo.sh raw   logs      follow every node
@@ -15,7 +16,7 @@
 # so `up` tears the other one down first.
 #
 # Node A is resident: `up` starts it, it does its one-time setup there, and
-# `round` and `verify` only send it a trigger. That is why the SNARK setup cost
+# `round`, `revoke` and `verify` only send it a trigger. That is why the SNARK setup cost
 # appears once, in `up`, instead of in front of every verification.
 
 set -euo pipefail
@@ -27,7 +28,7 @@ CMD="${2:-help}"
 case "$MODE" in
   raw)   OTHER=snark ;;
   snark) OTHER=raw ;;
-  *) echo "usage: $0 {raw|snark} {up|round|verify|crash|logs|ps|down}" >&2; exit 2 ;;
+  *) echo "usage: $0 {raw|snark} {up|round|revoke|verify|crash|logs|ps|down}" >&2; exit 2 ;;
 esac
 
 COMPOSE=(docker compose -f "$HERE/compose.$MODE.yml")
@@ -138,6 +139,10 @@ case "$CMD" in
 
   round)
     fire round
+    ;;
+
+  revoke)
+    fire revoke
     ;;
 
   verify)

@@ -24,7 +24,6 @@ use decentralized_root_of_trust::protocol::status_list::{
 };
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
-use decentralized_root_of_trust::state::status_list_head::{GENESIS_PREDECESSOR, SignedHead};
 use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use ssz::Encode as _;
 
@@ -34,17 +33,12 @@ const GENESIS_SLOT: u32 = 43;
 const KEY_SLOTS: u32 = 256;
 const SLOT_COUNT: u64 = KEY_SLOTS as u64 + 1;
 const LOG_INV_RATE: usize = 2;
-const BATCHES: [usize; 3] = [2, 3, 1];
+const ADDITIONS: [usize; 3] = [2, 3, 2];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Raw,
     Snark,
-}
-
-struct Member {
-    signer: SignerNode,
-    head: Option<SignedHead>,
 }
 
 struct EntryNote {
@@ -115,33 +109,42 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let domain = committee.domain(Algorithms::WotsXmss);
     let mut list = Vec::new();
-    let mut latest_head = None;
     let mut first_record = None;
 
-    for (round, batch_size) in BATCHES.into_iter().enumerate() {
+    for (round, addition_count) in ADDITIONS.into_iter().enumerate() {
         let version = round as u32;
         let slot = committee
             .slot_for(version)
             .ok_or_else(|| format!("version {version} has no slot under this anchor"))?;
-        let predecessor = latest_head.map_or(GENESIS_PREDECESSOR, |head: SignedHead| head.digest());
-
-        let added = append_batch(&mut list, round, batch_size);
+        let added = add_batch(&mut list, round, addition_count);
+        let revoked: Vec<[u8; 32]> = if round == 2 {
+            list.drain(..3.min(list.len())).collect()
+        } else {
+            Vec::new()
+        };
         let signers = rotating_quorum(round);
 
         println!("round {}", round + 1);
         println!("  version     : {version}");
         println!("  slot        : {slot}");
-        println!("  predecessor : 0x{}", short_hex(&predecessor));
         println!("  signers     : {:?}", signers);
         println!(
-            "  appended    : {} entr{}",
+            "  added       : {} entr{}",
             added.len(),
             plural_y(added.len())
         );
         for note in &added {
             println!("    - {} -> 0x{}", note.label, short_hex(&note.digest));
+        }
+        if !revoked.is_empty() {
+            println!(
+                "  revoked     : {} credential fingerprints removed",
+                revoked.len()
+            );
+            for entry in &revoked {
+                println!("    - 0x{}", short_hex(entry));
+            }
         }
         print_status_list(&list);
 
@@ -149,28 +152,16 @@ fn run() -> Result<(), String> {
         let mut indexed_signatures = Vec::with_capacity(signers.len());
 
         for index in signers {
-            sync_member_head(index, &mut members, latest_head);
-
-            let next_head = SignedHead::successor(
-                &domain,
-                members[index].head.as_ref(),
-                &predecessor,
-                version,
-                &list,
-            )?;
-
             let t_sign = Instant::now();
             let signature = members[index]
-                .signer
                 .sign_at(&message, slot)
                 .map_err(|e| format!("member {index} refused to sign v{version}: {e}"))?;
-            members[index].head = Some(next_head);
 
             println!(
                 "  member {index} signed in {} (next slot {}, {} left)",
                 fmt_duration(t_sign.elapsed()),
-                members[index].signer.next_slot(),
-                members[index].signer.remaining_slots()
+                members[index].next_slot(),
+                members[index].remaining_slots()
             );
 
             indexed_signatures.push((index, signature));
@@ -204,7 +195,6 @@ fn run() -> Result<(), String> {
             first_record = Some(record_bytes);
         }
 
-        latest_head = Some(SignedHead::from_authenticated(&domain, version, &list));
         println!();
     }
 
@@ -219,7 +209,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn bring_up_committee(dir: &Path) -> Result<(Committee, Vec<Member>), String> {
+fn bring_up_committee(dir: &Path) -> Result<(Committee, Vec<SignerNode>), String> {
     let mut pubkeys = Vec::with_capacity(N);
     let mut members = Vec::with_capacity(N);
 
@@ -236,10 +226,7 @@ fn bring_up_committee(dir: &Path) -> Result<(Committee, Vec<Member>), String> {
 
         println!("member {index} key : 0x{}", short_hex(&pk.as_ssz_bytes()));
         pubkeys.push(pk.clone());
-        members.push(Member {
-            signer: SignerNode::new(pk, sk, counter),
-            head: None,
-        });
+        members.push(SignerNode::new(pk, sk, counter));
     }
 
     Ok((Committee::new(pubkeys, T, GENESIS_SLOT), members))
@@ -343,7 +330,7 @@ fn replay_old_record(
     }
 }
 
-fn append_batch(list: &mut Vec<[u8; 32]>, round: usize, count: usize) -> Vec<EntryNote> {
+fn add_batch(list: &mut Vec<[u8; 32]>, round: usize, count: usize) -> Vec<EntryNote> {
     let mut notes = Vec::with_capacity(count);
     for offset in 0..count {
         let label = format!("did:iiot:device-{round}-{offset}");
@@ -352,20 +339,6 @@ fn append_batch(list: &mut Vec<[u8; 32]>, round: usize, count: usize) -> Vec<Ent
         notes.push(EntryNote { label, digest });
     }
     notes
-}
-
-fn sync_member_head(index: usize, members: &mut [Member], latest: Option<SignedHead>) {
-    if let Some(head) = latest {
-        let current = members[index].head;
-        if current != Some(head) {
-            members[index].head = Some(head);
-            println!(
-                "  member {index} synced authenticated head v{} ({} entries)",
-                head.version(),
-                head.entries()
-            );
-        }
-    }
 }
 
 fn rotating_quorum(round: usize) -> Vec<usize> {

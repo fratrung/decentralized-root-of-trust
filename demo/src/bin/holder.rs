@@ -22,8 +22,8 @@
 //!   round. This is what a relying party actually is, and on the SNARK path it is
 //!   the only shape in which `setup_verifier()` is a startup cost rather than a
 //!   per-check one.
-//! * **trigger** (`HOLDER_TRIGGER=round|verify`): a throwaway container that asks
-//!   the resident node A for one round and prints its verdict.
+//! * **trigger** (`HOLDER_TRIGGER=round|revoke|verify`): a throwaway container
+//!   that asks the resident node A for one operation and prints its verdict.
 //! * **one-shot** (neither): setup, one round, exit. Kept because it is the
 //!   honest measurement of what a cold verifier costs.
 //!
@@ -42,13 +42,21 @@ use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{SnarkStatusList, StatusList};
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
 use drot_demo::config::{self, MEMBER_IPS, Mode};
-use drot_demo::wire::{self, Failure, VcIssued, VcRequest};
+use drot_demo::wire::{
+    self, ACTION_ISSUE, ACTION_REVOKE, ACTION_VERIFY, Failure, StatusRequest, StatusUpdated,
+};
 use drot_demo::{report, storage, vc};
 use lean_multisig::SIGNATURE_SSZ_LEN;
 use rand::RngExt;
 use ssz::{Decode as _, Encode as _};
 
 const ANCHOR_WAIT: Duration = Duration::from_secs(300);
+
+enum Action {
+    Issue(String),
+    Revoke,
+    Verify,
+}
 
 fn main() {
     let mode = Mode::from_env();
@@ -77,10 +85,12 @@ fn main() {
         serve(&mut node, &subject);
     }
 
-    let subject = std::env::var_os("VERIFY_ONLY")
-        .is_none()
-        .then_some(subject.as_str());
-    match run_round(&mut node, subject) {
+    let action = if std::env::var_os("VERIFY_ONLY").is_some() {
+        Action::Verify
+    } else {
+        Action::Issue(subject)
+    };
+    match run_round(&mut node, action) {
         Ok(summary) => println!("\nnode A: {summary}"),
         Err(reason) => {
             println!("\nnode A: {reason}");
@@ -271,18 +281,49 @@ fn handle(node: &mut Node, subject: &str, stream: &mut TcpStream) {
         return;
     }
 
-    // An empty subject is the verify-only flavour: check what is already
-    // published without asking anyone to sign anything new.
-    let asked = VcRequest::from_ssz_bytes(&payload)
-        .map(|r| String::from_utf8_lossy(&r.subject).into_owned())
-        .unwrap_or_default();
-    let subject = match asked.as_str() {
-        "" => None,
-        "default" => Some(subject),
-        other => Some(other),
+    let request = match StatusRequest::from_ssz_bytes(&payload) {
+        Ok(request) => request,
+        Err(e) => {
+            let _ = wire::send(
+                stream,
+                wire::MSG_FAILURE,
+                &Failure::of(format!("malformed status request: {e:?}")),
+            );
+            return;
+        }
+    };
+    let action = match request.action {
+        ACTION_VERIFY => Action::Verify,
+        ACTION_REVOKE => Action::Revoke,
+        ACTION_ISSUE => {
+            let asked = match String::from_utf8(request.data) {
+                Ok(asked) => asked,
+                Err(_) => {
+                    let _ = wire::send(
+                        stream,
+                        wire::MSG_FAILURE,
+                        &Failure::of("credential subject is not UTF-8"),
+                    );
+                    return;
+                }
+            };
+            Action::Issue(if asked == "default" {
+                subject.to_string()
+            } else {
+                asked
+            })
+        }
+        other => {
+            let _ = wire::send(
+                stream,
+                wire::MSG_FAILURE,
+                &Failure::of(format!("unknown status action {other}")),
+            );
+            return;
+        }
     };
 
-    let (kind, text) = match run_round(node, subject) {
+    let (kind, text) = match run_round(node, action) {
         Ok(summary) => (wire::MSG_ROUND_RESULT, summary),
         Err(reason) => (wire::MSG_FAILURE, reason),
     };
@@ -292,14 +333,16 @@ fn handle(node: &mut Node, subject: &str, stream: &mut TcpStream) {
 
 /// Asks the resident node A for one round and exits with its verdict.
 fn trigger(kind: &str, subject: &str) {
-    let subject = match kind {
-        "verify" => "",
-        _ => subject,
+    let (action, data) = match kind {
+        "round" => (ACTION_ISSUE, subject.as_bytes().to_vec()),
+        "revoke" => (ACTION_REVOKE, Vec::new()),
+        "verify" => (ACTION_VERIFY, Vec::new()),
+        other => {
+            eprintln!("unknown holder trigger `{other}`; expected round, revoke, or verify");
+            std::process::exit(2);
+        }
     };
-    let payload = VcRequest {
-        subject: subject.as_bytes().to_vec(),
-    }
-    .as_ssz_bytes();
+    let payload = StatusRequest { action, data }.as_ssz_bytes();
 
     let (kind, reply) = wire::request(
         config::holder_addr(),
@@ -315,15 +358,32 @@ fn trigger(kind: &str, subject: &str) {
     }
 }
 
-/// One round as node A performs it: obtain a credential unless this is a
-/// verify-only pass, fetch the freshest published record, and hand it to the
-/// node, which is what decides.
-fn run_round(node: &mut Node, subject: Option<&str>) -> Result<String, String> {
-    let issued = match subject {
-        Some(subject) => Some(request_credential(node.mode(), subject)?),
-        None => {
+/// One operation as node A performs it: request an update when needed, fetch the
+/// resulting snapshot, authenticate it, and only then interpret membership.
+fn run_round(node: &mut Node, action: Action) -> Result<String, String> {
+    let (updated, expected_presence) = match action {
+        Action::Issue(subject) => (
+            Some(request_status_update(
+                node.mode(),
+                ACTION_ISSUE,
+                subject.as_bytes(),
+            )?),
+            Some(true),
+        ),
+        Action::Revoke => {
+            let credential = load_credential()?;
+            (
+                Some(request_status_update(
+                    node.mode(),
+                    ACTION_REVOKE,
+                    &credential,
+                )?),
+                Some(false),
+            )
+        }
+        Action::Verify => {
             println!("\nnode A: verify-only, checking whatever is published");
-            None
+            (None, None)
         }
     };
 
@@ -355,21 +415,57 @@ fn run_round(node: &mut Node, subject: Option<&str>) -> Result<String, String> {
         }
     };
 
-    if !contains_credential(&list, issued.as_ref()) {
+    if let Some(updated) = &updated
+        && updated.version != version
+    {
         return Err(format!(
-            "v{version} verified, but it does not contain this credential"
+            "aggregator reported v{} but storage returned v{version}",
+            updated.version
         ));
     }
-    Ok(format!("v{version} verified, {note}"))
+
+    let credential = updated
+        .as_ref()
+        .map(|updated| updated.credential.clone())
+        .or_else(load_credential_if_present);
+    let membership = credential
+        .as_deref()
+        .map(|credential| report_credential(&list, credential));
+
+    if let (Some(expected), Some(found)) = (expected_presence, membership)
+        && expected != found
+    {
+        return Err(if expected {
+            format!("v{version} verified, but the issued credential is absent")
+        } else {
+            format!("v{version} verified, but the revoked credential is still present")
+        });
+    }
+
+    let operation = match expected_presence {
+        Some(true) => {
+            let credential = credential.expect("an issuance response carries a credential");
+            storage::write_atomic(&credential_path(), &credential)
+                .map_err(|e| format!("cannot persist the issued credential: {e}"))?;
+            "credential issued and present: valid"
+        }
+        Some(false) => "credential removed: revoked",
+        None => match membership {
+            Some(true) => "saved credential is present: valid",
+            Some(false) => "saved credential is absent: revoked",
+            None => "no saved credential to query",
+        },
+    };
+    Ok(format!("v{version} verified, {operation}, {note}"))
 }
 
 /// Asks one allowed aggregator, chosen at random unless `TARGET_MEMBER` is set,
-/// for a credential.
+/// to publish one validity-snapshot update.
 ///
 /// Raw mode keeps the original rule: every member may coordinate the round. In
 /// SNARK mode, only the configured prover subset is eligible, because those are
 /// the nodes that paid `setup_prover()` at startup.
-fn request_credential(mode: Mode, subject: &str) -> Result<VcIssued, String> {
+fn request_status_update(mode: Mode, action: u8, data: &[u8]) -> Result<StatusUpdated, String> {
     let candidates = config::aggregator_indices(mode);
     let role = match mode {
         Mode::Raw => "member",
@@ -392,18 +488,28 @@ fn request_credential(mode: Mode, subject: &str) -> Result<VcIssued, String> {
         Err(_) => candidates[(rand::rng().random::<u64>() % candidates.len() as u64) as usize],
     };
 
-    println!(
-        "\nnode A: asking {role} {target} ({}) for a credential for {subject}",
-        MEMBER_IPS[target]
-    );
+    match action {
+        ACTION_ISSUE => println!(
+            "\nnode A: asking {role} {target} ({}) to issue a credential for {}",
+            MEMBER_IPS[target],
+            String::from_utf8_lossy(data)
+        ),
+        ACTION_REVOKE => println!(
+            "\nnode A: asking {role} {target} ({}) to revoke fingerprint {}",
+            MEMBER_IPS[target],
+            &vc::hex(&vc::fingerprint(data))[..16]
+        ),
+        _ => return Err(format!("unsupported status action {action}")),
+    }
     if mode == Mode::Snark {
         println!(
             "node A: SNARK aggregator subset: [{}]",
             config::format_indices(candidates)
         );
     }
-    let payload = VcRequest {
-        subject: subject.as_bytes().to_vec(),
+    let payload = StatusRequest {
+        action,
+        data: data.to_vec(),
     }
     .as_ssz_bytes();
 
@@ -411,21 +517,20 @@ fn request_credential(mode: Mode, subject: &str) -> Result<VcIssued, String> {
     let (kind, reply) = wire::request(
         config::member_addr(target),
         config::request_timeout(),
-        wire::MSG_VC_REQUEST,
+        wire::MSG_STATUS_REQUEST,
         &payload,
     )
     .map_err(|e| format!("{role} {target} did not answer: {e}"))?;
 
     match kind {
-        wire::MSG_VC_ISSUED => {
-            let issued =
-                VcIssued::from_ssz_bytes(&reply).map_err(|_| "malformed credential".to_string())?;
-            println!(
-                "node A: credential received after {:.2?}\n",
-                started.elapsed()
-            );
-            println!("{}", vc::pretty(&issued.credential));
-            Ok(issued)
+        wire::MSG_STATUS_UPDATED => {
+            let updated = StatusUpdated::from_ssz_bytes(&reply)
+                .map_err(|_| "malformed status-update response".to_string())?;
+            println!("node A: status updated after {:.2?}\n", started.elapsed());
+            if action == ACTION_ISSUE {
+                println!("{}", vc::pretty(&updated.credential));
+            }
+            Ok(updated)
         }
         _ => Err(format!(
             "{role} {target} failed the round: {}",
@@ -433,22 +538,33 @@ fn request_credential(mode: Mode, subject: &str) -> Result<VcIssued, String> {
         )),
     }
 }
-/// The last question, and the one the holder actually came for: is *my*
-/// credential in the list the committee signed?
+/// The last question, and the one the holder actually came for: is this exact
+/// credential currently valid?
 ///
 /// The fingerprint is recomputed from the credential as received, so this
-/// answers "these bytes are registered" rather than "some credential is".
-fn contains_credential(list: &[[u8; 32]], issued: Option<&VcIssued>) -> bool {
-    let Some(issued) = issued else {
-        return true;
-    };
-    let entry = vc::fingerprint(&issued.credential);
-    let found = list.contains(&entry);
+/// answers "these bytes are valid" rather than "some credential is".
+fn report_credential(list: &[[u8; 32]], credential: &[u8]) -> bool {
+    let entry = vc::fingerprint(credential);
+    let found = vc::is_valid(list, credential);
     report::rule("credential");
     println!("  fingerprint           : {}", vc::hex(&entry));
     println!("  present in the signed list: {found}");
-    if !found {
-        println!("  the committee signed a list this credential is not in");
-    }
+    println!(
+        "  status                : {}",
+        if found { "VALID" } else { "REVOKED" }
+    );
     found
+}
+
+fn credential_path() -> std::path::PathBuf {
+    storage::state_dir().join("credential.bin")
+}
+
+fn load_credential() -> Result<Vec<u8>, String> {
+    std::fs::read(credential_path())
+        .map_err(|e| format!("no issued credential is available to revoke: {e}"))
+}
+
+fn load_credential_if_present() -> Option<Vec<u8>> {
+    std::fs::read(credential_path()).ok()
 }

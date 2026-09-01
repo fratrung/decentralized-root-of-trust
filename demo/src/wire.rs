@@ -18,15 +18,13 @@ use lean_multisig::XmssSignature;
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
-pub const MSG_VC_REQUEST: u8 = 1;
+pub const MSG_STATUS_REQUEST: u8 = 1;
 pub const MSG_PROPOSAL: u8 = 2;
 pub const MSG_SIGNATURE: u8 = 3;
-pub const MSG_VC_ISSUED: u8 = 4;
+pub const MSG_STATUS_UPDATED: u8 = 4;
 pub const MSG_FAILURE: u8 = 5;
 
-/// The driver asking the resident node A to run one round. Carries a
-/// [`VcRequest`]; an empty subject means "verify what is already published"
-/// rather than "get me a credential".
+/// The driver asking the resident node A to issue, revoke or verify.
 pub const MSG_ROUND_REQUEST: u8 = 6;
 
 /// The round finished and the record verified. Carries a [`Failure`]-shaped
@@ -40,10 +38,20 @@ pub const MSG_ROUND_RESULT: u8 = 7;
 /// unauthenticated peer can make a node allocate.
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
-/// A holder asking a committee member for a credential.
+pub const ACTION_VERIFY: u8 = 0;
+pub const ACTION_ISSUE: u8 = 1;
+pub const ACTION_REVOKE: u8 = 2;
+
+/// One validity-list operation.
+///
+/// Between the trigger and the resident holder, `data` is the subject for an
+/// issuance and empty for verification or revocation. Between the holder and an
+/// aggregator, it is the subject for issuance or the canonical credential bytes
+/// whose fingerprint must be removed for revocation.
 #[derive(SszEncode, SszDecode)]
-pub struct VcRequest {
-    pub subject: Vec<u8>,
+pub struct StatusRequest {
+    pub action: u8,
+    pub data: Vec<u8>,
 }
 
 /// The aggregator asking the committee to sign the next version of the list.
@@ -54,10 +62,10 @@ pub struct VcRequest {
 /// a reused XMSS slot is a recovered secret key.
 #[derive(SszEncode, SszDecode)]
 pub struct Proposal {
-    /// Poseidon2/KoalaBear message of the status-list version being extended.
-    /// The genesis proposal uses the all-zero predecessor constant.
-    pub predecessor: [u8; 32],
     pub version: u32,
+    /// Complete snapshot of the credential fingerprints valid at `version`.
+    /// Relative to an earlier version, any number may be added or removed in the
+    /// same update. It may grow, shrink, or be empty.
     pub list: Vec<[u8; 32]>,
 }
 
@@ -77,10 +85,13 @@ pub struct SignatureReply {
     pub reason: Vec<u8>,
 }
 
-/// The credential, handed over only once its fingerprint is in a published,
-/// committee-signed record.
+/// A completed status update.
+///
+/// On issuance this carries the newly created credential; on revocation it
+/// echoes the credential whose fingerprint was removed so the holder can check
+/// the exact bytes against the newly authenticated snapshot.
 #[derive(SszEncode, SszDecode)]
-pub struct VcIssued {
+pub struct StatusUpdated {
     pub version: u32,
     pub credential: Vec<u8>,
 }

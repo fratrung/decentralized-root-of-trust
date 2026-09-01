@@ -8,15 +8,12 @@
 //! In particular an aggregator cannot name the XMSS slot. It proposes a
 //! *version*, and every member derives the slot from the anchor itself.
 //!
-//! A member's own defences are two, and both are local:
-//!
-//! * the durable slot counter, which makes signing a second message under one
-//!   slot unreachable rather than merely discouraged, and
-//! * the extension check, which refuses a proposal that is not an append-only
-//!   successor of the last authenticated record this member signed.
-//!
-//! Neither depends on the aggregator being honest, which is what lets the role
-//! be handed to a small subset of committee members.
+//! A member's cryptographic defence is its durable slot counter: signing a
+//! second snapshot under one slot is unreachable rather than merely discouraged.
+//! The status list itself is a complete validity snapshot and may grow, shrink,
+//! or become empty; one version may add and remove any number of fingerprints at
+//! once. Which changes a member approves is application policy; this demo has
+//! every member approve the requested update.
 //!
 //! Configured entirely by environment: `MEMBER_INDEX`, `MEMBER_SECRET`,
 //! `DEMO_MODE`.
@@ -34,11 +31,13 @@ use decentralized_root_of_trust::params::{KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RAT
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, StatusList};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
-use decentralized_root_of_trust::state::status_list_head::{GENESIS_PREDECESSOR, SignedHead};
 use drot_demo::config::{self, MEMBER_IPS, MEMBER_PORT, Mode, N_MEMBERS, THRESHOLD};
 use drot_demo::storage;
 use drot_demo::vc;
-use drot_demo::wire::{self, Failure, Proposal, SignatureReply, VcIssued, VcRequest};
+use drot_demo::wire::{
+    self, ACTION_ISSUE, ACTION_REVOKE, Failure, Proposal, SignatureReply, StatusRequest,
+    StatusUpdated,
+};
 use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use ssz::{Decode as _, Encode as _};
 
@@ -53,9 +52,6 @@ struct Node {
     /// their own threads, and two concurrent signatures would race the counter
     /// that exists precisely to keep them apart.
     signer: Mutex<SignerNode>,
-    /// Exact state this member last signed. Storage is consulted only to recover
-    /// it after a restart, never to authorize another transition while running.
-    signed_head: Mutex<Option<SignedHead>>,
     /// Serialises the rounds *this* node coordinates. Two holders arriving at
     /// once would otherwise propose the same version twice, and the second round
     /// would collect nothing but abstentions.
@@ -134,9 +130,6 @@ fn main() {
         "the anchor does not name this key at index {index}"
     );
 
-    let signed_head =
-        recover_signed_head(mode, &committee).expect("published record is unreadable");
-
     let can_aggregate = config::can_aggregate(mode, index);
     let role = match (mode, can_aggregate) {
         (Mode::Raw, _) => "signer + raw aggregator",
@@ -173,7 +166,6 @@ fn main() {
         mode,
         committee,
         signer: Mutex::new(SignerNode::new(pk, sk, counter)),
-        signed_head: Mutex::new(signed_head),
         round: Mutex::new(()),
         can_aggregate,
         prover,
@@ -202,29 +194,6 @@ fn main() {
     }
 }
 
-/// Re-establishes the in-memory head after a process restart. In production the
-/// bytes come from the authenticated DHT recovery policy; during a process
-/// lifetime they are never consulted again to authorize a transition.
-fn recover_signed_head(mode: Mode, committee: &Committee) -> Result<Option<SignedHead>, String> {
-    storage::latest_record()
-        .map(|(_, bytes)| {
-            let (version, list) = match mode {
-                Mode::Raw => {
-                    StatusList::from_bytes(&bytes).map(|r| (r.version(), r.list_cloned()))?
-                }
-                Mode::Snark => {
-                    SnarkStatusList::from_bytes(&bytes).map(|r| (r.version(), r.list_cloned()))?
-                }
-            };
-            Ok(SignedHead::from_authenticated(
-                &committee.domain(Algorithms::WotsXmss),
-                version,
-                &list,
-            ))
-        })
-        .transpose()
-}
-
 impl Node {
     fn serve(self: &Arc<Self>, mut stream: TcpStream) {
         let peer = stream
@@ -245,7 +214,7 @@ impl Node {
 
         let (kind, reply) = match kind {
             wire::MSG_PROPOSAL => self.on_proposal(&payload, &peer),
-            wire::MSG_VC_REQUEST => self.on_credential_request(&payload, &peer),
+            wire::MSG_STATUS_REQUEST => self.on_status_request(&payload, &peer),
             other => (
                 wire::MSG_FAILURE,
                 Failure::of(format!("unknown message type {other}")),
@@ -265,24 +234,6 @@ impl Node {
                     wire::MSG_FAILURE,
                     Failure::of(format!("malformed proposal: {e:?}")),
                 );
-            }
-        };
-
-        let mut signed_head = self.signed_head.lock().expect("signed head poisoned");
-        let next_head = match SignedHead::successor(
-            &self.committee.domain(Algorithms::WotsXmss),
-            signed_head.as_ref(),
-            &proposal.predecessor,
-            proposal.version,
-            &proposal.list,
-        ) {
-            Ok(head) => head,
-            Err(why) => {
-                println!(
-                    "member {}: v{} from {peer} refused, {why}",
-                    self.index, proposal.version
-                );
-                return (wire::MSG_SIGNATURE, abstain(&why));
             }
         };
 
@@ -306,7 +257,6 @@ impl Node {
             .sign_at(&message, slot);
         match signed {
             Ok(signature) => {
-                *signed_head = Some(next_head);
                 println!(
                     "member {}: signed v{} at slot {slot} in {:.1?} ({} entries, asked by {peer})",
                     self.index,
@@ -346,8 +296,8 @@ impl Node {
         }
     }
 
-    /// The aggregator's side of a round, from credential to published record.
-    fn on_credential_request(self: &Arc<Self>, payload: &[u8], peer: &str) -> (u8, Vec<u8>) {
+    /// The aggregator's side of one validity-snapshot update.
+    fn on_status_request(self: &Arc<Self>, payload: &[u8], peer: &str) -> (u8, Vec<u8>) {
         if !self.can_aggregate {
             let why = format!(
                 "member {} is signer-only in {} mode; ask one of [{}]",
@@ -356,13 +306,13 @@ impl Node {
                 config::format_indices(config::aggregator_indices(self.mode))
             );
             println!(
-                "member {}: credential request from {peer} refused, {why}",
+                "member {}: status request from {peer} refused, {why}",
                 self.index
             );
             return (wire::MSG_FAILURE, Failure::of(why));
         }
 
-        let request = match VcRequest::from_ssz_bytes(payload) {
+        let request = match StatusRequest::from_ssz_bytes(payload) {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -371,7 +321,6 @@ impl Node {
                 );
             }
         };
-        let subject = String::from_utf8_lossy(&request.subject).into_owned();
         let _round = self.round.lock().expect("round lock poisoned");
         let round_started = Instant::now();
 
@@ -379,17 +328,20 @@ impl Node {
             "\n--- member {} is the aggregator for this round ---",
             self.index
         );
-        println!("    {peer} asks for a credential for {subject}");
-
-        // Extend the published list. The version is derived from what is on the
-        // storage volume, not chosen: it is what every member will independently
-        // turn into an XMSS slot.
-        let (version, predecessor, mut list) = match storage::latest_record() {
+        // Start from the current validity snapshot. `Proposal` accepts the whole
+        // replacement snapshot: neither this member nor the wire format imposes
+        // a one-entry delta, a minimum size, or an append-only prefix rule.
+        let (version, mut list) = match storage::latest_record() {
             Some((_, bytes)) => match self.decode_list(&bytes) {
-                Ok((v, list)) => {
-                    let predecessor = self.committee.message_for(Algorithms::WotsXmss, &list, v);
-                    (v + 1, predecessor, list)
-                }
+                Ok((v, list)) => match v.checked_add(1) {
+                    Some(next) => (next, list),
+                    None => {
+                        return (
+                            wire::MSG_FAILURE,
+                            Failure::of("the status-list version is exhausted"),
+                        );
+                    }
+                },
                 Err(e) => {
                     return (
                         wire::MSG_FAILURE,
@@ -397,20 +349,69 @@ impl Node {
                     );
                 }
             },
-            None => (0, GENESIS_PREDECESSOR, Vec::new()),
+            None => (0, Vec::new()),
         };
 
-        let credential = vc::issue(&subject, version, self.index);
+        let credential = match request.action {
+            ACTION_ISSUE => {
+                let subject = String::from_utf8(request.data)
+                    .map_err(|_| "credential subject is not UTF-8")
+                    .and_then(|subject| {
+                        (!subject.is_empty())
+                            .then_some(subject)
+                            .ok_or("credential subject is empty")
+                    });
+                let subject = match subject {
+                    Ok(subject) => subject,
+                    Err(why) => return (wire::MSG_FAILURE, Failure::of(why)),
+                };
+                println!("    {peer} asks to issue a credential for {subject}");
+                let credential = vc::issue(&subject, version, self.index);
+                assert!(
+                    vc::add_valid(&mut list, &credential),
+                    "a newly random credential cannot already be in the valid set"
+                );
+                credential
+            }
+            ACTION_REVOKE => {
+                if request.data.is_empty() {
+                    return (
+                        wire::MSG_FAILURE,
+                        Failure::of("revocation requires the canonical credential bytes"),
+                    );
+                }
+                println!(
+                    "    {peer} asks to revoke fingerprint {}",
+                    &vc::hex(&vc::fingerprint(&request.data))[..16]
+                );
+                if !vc::revoke(&mut list, &request.data) {
+                    return (
+                        wire::MSG_FAILURE,
+                        Failure::of("credential is not valid in the current snapshot"),
+                    );
+                }
+                request.data
+            }
+            other => {
+                return (
+                    wire::MSG_FAILURE,
+                    Failure::of(format!("unknown status action {other}")),
+                );
+            }
+        };
         let entry = vc::fingerprint(&credential);
-        list.push(entry);
         println!(
-            "    v{version}: {} entries, new fingerprint {}",
+            "    v{version}: {} valid fingerprint(s), target {} is {}",
             list.len(),
-            &vc::hex(&entry)[..16]
+            &vc::hex(&entry)[..16],
+            if request.action == ACTION_ISSUE {
+                "present"
+            } else {
+                "absent"
+            }
         );
 
         let proposal = Proposal {
-            predecessor,
             version,
             list: list.clone(),
         };
@@ -445,16 +446,16 @@ impl Node {
             round_started.elapsed()
         );
 
-        // Only now is the credential handed over: a credential whose fingerprint
-        // is not yet in a published record is one the holder could not prove
-        // anything about.
+        // Only now is the result returned: the holder authenticates the published
+        // snapshot independently and checks presence for issuance or absence for
+        // revocation.
         let served = self.rounds_served.fetch_add(1, Ordering::Relaxed) + 1;
-        println!("    credential handed to {peer}; this node has aggregated {served} round(s)");
-        let issued = VcIssued {
+        println!("    update returned to {peer}; this node has aggregated {served} round(s)");
+        let updated = StatusUpdated {
             version,
             credential,
         };
-        (wire::MSG_VC_ISSUED, issued.as_ssz_bytes())
+        (wire::MSG_STATUS_UPDATED, updated.as_ssz_bytes())
     }
 
     /// Broadcasts the proposal and collects signatures until the threshold is

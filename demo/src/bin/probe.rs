@@ -19,9 +19,7 @@
 
 use std::time::Duration;
 
-use decentralized_root_of_trust::protocol::status_list::{
-    Algorithms, SnarkStatusList, StatusList, hash_any,
-};
+use decentralized_root_of_trust::protocol::status_list::{SnarkStatusList, StatusList, hash_any};
 use drot_demo::config::{self, MEMBER_IPS, Mode};
 use drot_demo::storage;
 use drot_demo::wire::{self, Failure, Proposal, SignatureReply};
@@ -46,23 +44,19 @@ fn main() {
         i += 2;
     }
 
-    // The proposal has to be one a member would accept on its merits: the
-    // published list plus exactly one entry, at the next version. Otherwise the
-    // extension check refuses it first and the slot counter is never reached,
-    // which would prove nothing.
+    // Start from the published snapshot and change one entry. The first request
+    // spends the derived slot; a second request at that same version changes the
+    // message and must be refused by the durable counter.
     let (published, mut list) = match storage::latest_record() {
         Some((_, bytes)) => decode(mode, &bytes),
         None => panic!("nothing is published yet; run a normal round first"),
     };
     let version = version.unwrap_or(published + 1);
 
-    // The anchor is read before the predecessor digest, not after: since the
-    // signed message is domain-separated by the committee, the digest cannot be
-    // computed without it. The slot is not sent either, and could not be — the
-    // member derives it; reading the anchor only lets the probe name the slot it
-    // is about to compete for.
+    // The slot is not sent and could not be: the member derives it from the
+    // anchor. Reading the anchor only lets the probe name the slot it is about to
+    // compete for in its diagnostic.
     let committee = storage::wait_for_committee(Duration::from_secs(60)).expect("no anchor");
-    let predecessor = committee.message_for(Algorithms::WotsXmss, &list, published);
     let entry = hash_any(label.as_bytes());
     list.push(entry);
 
@@ -72,12 +66,7 @@ fn main() {
         "probe: asking member {member} ({}) to sign v{version} (slot {slot}) with entry `{label}`",
         MEMBER_IPS[member]
     );
-    let payload = Proposal {
-        predecessor,
-        version,
-        list,
-    }
-    .as_ssz_bytes();
+    let payload = Proposal { version, list }.as_ssz_bytes();
     let answer = wire::request(
         config::member_addr(member),
         config::request_timeout(),

@@ -42,6 +42,34 @@ pub fn fingerprint(credential: &[u8]) -> [u8; 32] {
     hash_any(credential)
 }
 
+/// Whether this exact credential is valid in the supplied snapshot.
+pub fn is_valid(list: &[[u8; 32]], credential: &[u8]) -> bool {
+    list.contains(&fingerprint(credential))
+}
+
+/// Adds a credential to the valid snapshot without creating duplicate entries.
+///
+/// Returns `true` when the snapshot changed.
+pub fn add_valid(list: &mut Vec<[u8; 32]>, credential: &[u8]) -> bool {
+    let entry = fingerprint(credential);
+    if list.contains(&entry) {
+        return false;
+    }
+    list.push(entry);
+    true
+}
+
+/// Revokes a credential by removing its fingerprint from the valid snapshot.
+///
+/// All occurrences are removed defensively; [`add_valid`] never creates more
+/// than one. Returns `true` when the credential was present.
+pub fn revoke(list: &mut Vec<[u8; 32]>, credential: &[u8]) -> bool {
+    let entry = fingerprint(credential);
+    let before = list.len();
+    list.retain(|candidate| candidate != &entry);
+    list.len() != before
+}
+
 /// The credential as it should be read by a human, for the demo log.
 pub fn pretty(credential: &[u8]) -> String {
     serde_json::from_slice::<serde_json::Value>(credential)
@@ -51,4 +79,33 @@ pub fn pretty(credential: &[u8]) -> String {
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_valid, is_valid, revoke};
+
+    #[test]
+    fn presence_means_valid_and_revocation_means_absence() {
+        let alice = b"credential-alice";
+        let bob = b"credential-bob";
+        let mut list = Vec::new();
+
+        assert!(add_valid(&mut list, alice));
+        assert!(add_valid(&mut list, bob));
+        assert!(
+            !add_valid(&mut list, alice),
+            "a validity set has no duplicates"
+        );
+        assert!(is_valid(&list, alice));
+        assert!(is_valid(&list, bob));
+
+        assert!(revoke(&mut list, alice));
+        assert!(!is_valid(&list, alice));
+        assert!(is_valid(&list, bob));
+
+        assert!(revoke(&mut list, bob));
+        assert!(list.is_empty(), "revoking the last credential is valid");
+        assert!(!revoke(&mut list, bob));
+    }
 }

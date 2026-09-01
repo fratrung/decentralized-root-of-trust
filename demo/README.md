@@ -16,6 +16,7 @@ verification reports remain the comparison points the demo prints.
 ```
 ./demo.sh raw   up        # build, start 1 bootstrap + 10 members + node A
 ./demo.sh raw   round     # node A asks for a credential, then verifies it
+./demo.sh raw   revoke    # remove its fingerprint, then verify that it is revoked
 ./demo.sh raw   verify    # re-check what is published, without a new round
 ./demo.sh raw   crash     # kill a member mid-protocol, watch it re-align
 ./demo.sh raw   down      # stop and delete the volumes
@@ -49,32 +50,37 @@ Three volumes, and the split between them is the design:
 
 ## What a round looks like
 
+The status list is a complete snapshot of **valid credential fingerprints**.
+Presence means valid; revocation is represented by absence. A new version may
+add and remove any number of fingerprints in the same update; it may therefore
+grow, shrink, or become empty. There is no one-entry transition rule.
+
 1. Node A knows the committee a priori (it loads `anchor.bin`) and dials one
    aggregator. In raw mode every member is eligible. In SNARK mode only the
    configured prover subset (`0`, `4`, `8`) is eligible, and those nodes have
    already run `setup_prover()` during startup. `TARGET_MEMBER=<i>` can still pin
    the target manually, but in SNARK mode it must name one of those aggregator
    indices.
-2. The aggregator reads the published record, appends the new credential's
-   fingerprint, and proposes `(version, list)` to all ten members. It does
-   **not** propose a slot: every member derives that itself through
-   `Committee::slot_for`, so an aggregator cannot have two versions signed at
-   one XMSS slot.
-3. Each member checks that the proposal is an append-only successor of the last
-   authenticated record it signed, burns the slot durably, signs, and answers. A
-   member whose slot is already spent abstains, which is a normal outcome.
+2. The aggregator constructs the next complete `(version, list)` snapshot and
+   proposes it to all ten members. The protocol permits any number of additions
+   and removals in the same version; `round` and `revoke` merely drive one simple
+   operation each. The aggregator does **not** propose a slot: every member
+   derives that itself through `Committee::slot_for`.
+3. Each member burns the derived slot durably, signs the exact snapshot, and
+   answers. A member whose slot is already spent abstains, which is a normal
+   outcome. The demo approves every requested lifecycle operation; a deployment
+   supplies its own issuance and revocation policy.
 4. The aggregator counts signatures until the seventh arrives. Each one is
    verified against the anchor's key at that index before it is counted, so the
    address map decides *where* to look and never *whether* the signature is
    good.
-5. It builds the record (bitmap from those indices, or one aggregated proof),
-   publishes it atomically to the shared volume, and only then hands over the
-   credential. A credential whose fingerprint is not yet in a published record
-   is one the holder could prove nothing about.
+5. It builds the record (bitmap from those indices, or one aggregated proof) and
+   publishes it atomically to the shared volume.
 6. Node A fetches the freshest record from the volume and hands the bytes to a
    `RawNode` or a `SnarkNode`, which decodes, verifies against the anchor, and
-   only then lets the version move its anti-rollback mark. Node A then checks
-   that its own fingerprint is in the list the committee signed.
+   only then lets the version move its anti-rollback mark. Node A requires the
+   issued credential's fingerprint to be present, or the revoked credential's
+   fingerprint to be absent.
 
 ## What the output is for
 
@@ -100,11 +106,12 @@ every record it looks at, and what you would be measuring is process startup.
 Resident, it pays once — the figures appear in `up`, not in front of every
 verification — and from then on a round costs only the proof.
 
-`round` and `verify` therefore do not build a verifier. They send node A a
-trigger, and it answers with a one-line verdict; the report belongs in the log of
-the node that did the checking, so `demo.sh` prints that log rather than moving
-the text across the wire. The one-shot shape is still there (`HOLDER_SERVE`
-unset), because it is the honest measurement of what a cold verifier costs.
+`round`, `revoke` and `verify` therefore do not build a verifier. They send
+node A a trigger, and it answers with a one-line verdict; the report belongs in
+the log of the node that did the checking, so `demo.sh` prints that log rather
+than moving the text across the wire. The one-shot shape is still there
+(`HOLDER_SERVE` unset), because it is the honest measurement of what a cold
+verifier costs.
 
 Staying up is also what makes the anti-rollback mark mean anything: node A
 carries a high-water version across rounds, so `verify` twice in a row shows the
@@ -149,11 +156,12 @@ unmodified from the parent crate.
   that carried them. The aggregator therefore knows which member it is talking
   to from the address it dialled, and an unreachable member costs the round its
   read timeout and nothing else.
-* **Structural extension check.** A member verifies that a proposal is an
-  append-only successor of the last authenticated record it recovered, but does
-  not verify the published record's own signatures before signing. Verifying a
-  SNARK before every signature would put the aggregator's cost on all ten nodes;
-  the member's real defence is the slot counter, which no proposal can talk it out of.
+* **Lifecycle policy.** The demo members approve every well-formed issuance or
+  revocation request. A production member applies the application's authorization
+  policy before signing. The protocol deliberately permits arbitrary additions
+  and removals, including both in one update; the durable slot counter
+  independently prevents two different snapshots from being signed at one XMSS
+  slot.
 
 ## Rebuilding
 

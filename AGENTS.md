@@ -4,9 +4,13 @@ This file provides guidance to a generic Code Agent (Claude, GPT, Cursor etc..) 
 
 ## What this is
 
-A committee-controlled status list (e.g. a revocation list) where the single-key
-root of trust is replaced by a `t`-of-`N` committee. The `t` members sign the list
-root with post-quantum hash-based signatures (leanVM's synchronized XMSS).
+A committee-controlled snapshot of the credentials that are currently valid,
+represented by their fingerprints. Presence means validity; revocation means
+absence. A version replaces the whole snapshot and may add or remove any number
+of fingerprints in the same update, so the list may grow, shrink, or become
+empty. The single-key root of trust is replaced by a `t`-of-`N` committee, whose
+members sign the list root with post-quantum hash-based signatures (leanVM's
+synchronized XMSS).
 
 The quorum is then published in **one of two interchangeable forms**, and a
 verifier accepts either:
@@ -30,11 +34,12 @@ cargo run --release --bin raw_agg                      # the same protocol with 
 cargo run --release --bin prover   -- [outdir]         # split: aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
-cargo test                                             # 65 unit + 10 integration tests, 75 in all (incl. four real SNARKs)
+cargo test                                             # 66 unit + 10 integration tests; 75 run + 1 ignored
 ./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
 tools/mutate.py                                        # mutation testing: 28 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
 ./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
+./demo/docker/demo.sh {raw|snark} revoke               # remove that credential's fingerprint, then verify its absence
 ./demo/docker/demo.sh {raw|snark} verify               # node A re-checks what is published (expect a stale refusal)
 ./demo/docker/demo.sh {raw|snark} crash                # SIGKILL a member mid-protocol; it must refuse to re-sign
 ./demo/docker/demo.sh {raw|snark} down                 # stop and delete that demo's volumes
@@ -152,34 +157,6 @@ Library:
   monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
   committee rotation resets it, persisted with a write-then-rename. Lives *outside*
   the verification predicate, which stays pure.
-- `src/state/status_list_head.rs` — `SignedHead`, the append-only guard on what a
-  *member* is willing to sign next. `successor` validates one transition: the
-  proposal must name the head's digest as its predecessor, sit at exactly
-  `head.version + 1`, contain more entries than the signed head, and — the
-  check that actually decides it — its prefix up to the stored head length must
-  re-fold to the digest this member signed last round. A storage layer that swaps
-  the published record therefore cannot walk a member onto a fork.
-  Four things about it are easy to get wrong:
-  - **It is in-memory, alone in `state/` in being so.** There is no file. A restart
-    loses the head, and `from_authenticated` is how it comes back — a constructor
-    that *trusts its caller*, computes no quorum and checks no signature. The
-    contract "authenticate first" is stated in the doc comment and enforced
-    nowhere, so every call site is a place to get it wrong.
-  - **The durable backstop is `AtomicSlotCounter`, not this type.** After a restart
-    a rewound head cannot actually be exploited, because re-signing an old version
-    derives an already-spent slot and `reserve_at` answers `AlreadySpent`. That is
-    the property that makes the in-memory head safe; keep the counter durable and
-    this stays true.
-  - **One or more entries per version.** `list[..head.len]` must equal the
-    previous list, so the transition is append-only but not single-entry. A
-    provisioning round can batch several credentials into one status-list
-    version. `predecessor` is redundant with the prefix recomputation — it can
-    only reject, never authorize, and the recomputation is the real check.
-  - **A member with no head can only sign v0.** A fresh process that fails to
-    recover is not merely behind, it is out: v0's slot is long spent, so it
-    abstains forever. Recovery is not optional.
-  Its only consumer is `demo/`; nothing in the library or the four benchmark
-  binaries calls it. It is also **not** covered by `tools/mutate.py`.
 - `src/bench/mem.rs`, `src/bench/stats.rs` — RSS (resident set size) probes and descriptive
   statistics shared by every binary.
 - `src/node/snark_prover.rs` — the prover. Holding the value *is* the proof that
@@ -245,7 +222,7 @@ committee of one, and the raw path with a real `t`-of-`N` quorum. They write slo
 state into the working directory (`next_slot`, `signers/`), which `.gitignore`
 covers.
 
-Tests (`cargo test`, 75 in total: 74 run plus one `#[ignore]`d):
+Tests (`cargo test`, 76 registered: 75 run plus one `#[ignore]`d):
 - `src/*.rs` unit tests cover each module against its own contract.
   `status_list.rs`'s pin the seam this crate has with leanVM: that
   `status_list_message` is the *canonical* packing of the fold (each limb a field
@@ -365,14 +342,17 @@ round, while in SNARK mode only the configured prover subset aggregates and runs
 directly, exit `0` signed / `3` abstained, which is what lets the crash scenario
 assert instead of grep).
 
-`holder` is **resident**, and `round`/`verify` only send it a trigger (the same
+`holder` is **resident**, and `round`/`revoke`/`verify` only send it a trigger (the same
 binary with `HOLDER_TRIGGER` set, run as the throwaway `trigger` service).
 `setup_verifier()` is a per-process cost, so a node A that exited after every
 check would pay 5 s and ~700 MB per record and the demo would be measuring
 process startup. Keep it that way: the one-shot shape still exists (neither
 `HOLDER_SERVE` nor `HOLDER_TRIGGER`) and is the honest cold-start measurement.
 Node A holds a `RawNode` or a `SnarkNode`, so the anti-rollback mark is inside
-the node and survives a container restart on its `holder-state` volume.
+the node and survives a container restart on its `holder-state` volume. It also
+keeps the last credential in its private state: `round` accepts it only when its
+fingerprint is present in the authenticated snapshot, while `revoke` accepts the
+next snapshot only when that fingerprint is absent.
 
 Three things about it are load-bearing and easy to break by "simplifying":
 
@@ -463,7 +443,7 @@ quorum check.
   change. Pinned in `committee.rs`'s
   `one_anchor_is_one_domain_so_it_governs_one_list`, which is where to start.
 - The status list is never **sorted or deduplicated**, and `status_list_root_fe`
-  (the fold behind `status_list_message`) folds sequentially, so `root([a,b]) != root([b,a])`: one logical revocation set
+  (the fold behind `status_list_message`) folds sequentially, so `root([a,b]) != root([b,a])`: one logical validity set
   has `n!` valid roots. Sorting inside the fold would fix it and is a
   wire-format-breaking change.
 - **Published records are canonically encoded.** `StatusList`, `SnarkStatusList`

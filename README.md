@@ -8,17 +8,20 @@ quantum computer.**
 
 ## The problem
 
-Systems that issue credentials PKI, verifiable credentials, firmware update
-channels, device attestation — publish a **status list**: the set of identifiers
-that have been revoked. That list is the security-critical object. If an attacker
-can rewrite it, they can un-revoke a stolen key; if they can freeze it, they can
-keep a compromised device trusted indefinitely.
+Systems that issue credentials — PKI, verifiable credentials, firmware update
+channels, device attestation — publish a **status list**: the set of fingerprints
+of the credentials that are currently valid. Presence means validity; revocation
+is represented by removing a credential's fingerprint from the next version (and
+therefore by its absence from that snapshot). That list is the security-critical
+object. If an attacker can rewrite it, they can put a revoked credential back; if
+they can freeze it, they can keep a compromised credential trusted indefinitely.
 
 Almost universally, that list is authorized by **one signing key**. This
 concentrates two separate failures into a single point:
 
-- **Compromise.** Whoever holds the key controls revocation for the entire
-  system. There is no quorum to overrule them and no partial failure mode.
+- **Compromise.** Whoever holds the key controls which credentials remain valid
+  across the entire system. There is no quorum to overrule them and no partial
+  failure mode.
 - **Cryptographic obsolescence.** The signature is typically ECDSA or Ed25519,
   both broken by a sufficiently large quantum computer. Records that are archived
   and verified years later are exposed to *store-now-decrypt-later* on the
@@ -42,7 +45,7 @@ evidence of quorum is **one constant-size object** rather than `t` signatures.
   signed this list at this version".
 - A verifier holds **one fixed trust anchor** — the committee's `N` public keys,
   the threshold `t`, and a genesis slot — and needs **no live data fetch**,
-  no directory lookup, and no revocation service to check an update.
+  no directory lookup, and no live status service to check an update.
 
 Both the aggregated form and the raw `t`-signature form are implemented and
 measured, so the trade-off is a number in this repository rather than an
@@ -90,6 +93,11 @@ Editable source: [`docs/architecture.svg`](docs/architecture.svg).
 
 ## Trust model
 
+- Every published list is a **complete snapshot of the currently valid
+  credential fingerprints**. A relying party first authenticates the record, then
+  recomputes the credential's fingerprint and requires it to be present. Removing
+  that fingerprint in a newer version is how the committee revokes the
+  credential; an absent fingerprint is not valid under that snapshot.
 - The list is published (e.g. in a DHT) together with **evidence of a quorum**
   that replaces the old single signature.
 - The fixed **trust anchor** each verifier embeds is the **committee**: its `N`
@@ -374,9 +382,10 @@ rejects it.
 
 Selecting the newest of the records *in hand* is not enough. Verification is
 stateless — an old but validly signed `(list, version)` verifies forever — so a
-peer that serves you *only* stale records slips past `select_freshest`. For an
-authorization list this is the attack that matters: an old status list re-grants
-access to a node that has since been revoked.
+peer that serves you *only* stale records slips past `select_freshest`. For a list
+of valid credentials this is the attack that matters: an old snapshot can still
+contain a fingerprint that the committee removed in a newer version, re-granting
+validity to a credential that has since been revoked.
 
 The fix is memory. `HighWaterMark` (in `freshness.rs`) records the highest version
 this verifier has accepted and refuses anything not **strictly newer**. The rule
@@ -433,42 +442,27 @@ removed, and verifies none of them.
   resets, and how a verifier learns the new anchor (an `old signs new` hand-off, a
   chain of committees) is a separate protocol, deferred to its own design.
 
-### Append-only proposals: what a *member* agrees to sign
+### Status-list snapshots: what an update means
 
-Everything above is the relying party's side. A committee member has a symmetric
-problem, and it is not the same one: it is asked to sign a list it did not
-author, proposed by an aggregator it does not trust, and the storage layer that
-holds the previous record is not an authority either. A member that simply signs
-whatever arrives can be walked onto a fork by anyone who can replace the
-published record.
+Everything above is the relying party's side. At the application layer, each
+version replaces the previous validity snapshot as a whole. An update may add
+any number of fingerprints for newly valid credentials, remove any number of
+fingerprints to revoke credentials, or do both in one round. There is no `+1` or
+`-1` transition rule. The raw and SNARK verification predicates authenticate the
+exact `(list, version)` selected by the quorum; they deliberately do not interpret
+why an entry was added or removed.
 
-`SignedHead` (`src/state/status_list_head.rs`) is the guard. It remembers the
-exact `(version, entry count, digest)` this member last signed, and `successor`
-admits a proposal only if all four conditions hold:
+This also means that the sequence is **not append-only at the entry level**. A
+newer valid list may be shorter than its predecessor, and it may be empty after
+the last valid credential is revoked. History remains monotonic through the
+signed `version` and the verifier's high-water mark, not by retaining every old
+fingerprint forever.
 
-1. it names that digest as its `predecessor`;
-2. it sits at exactly `head.version + 1`;
-3. its list is longer than the entry count already signed;
-4. **the prefix already signed re-folds to that digest** — the check that
-   actually decides it, because it proves the proposal extends the list this
-   member signed rather than merely quoting its name.
-
-Three consequences are worth stating plainly, because none of them is obvious:
-
-- **A version may add a batch.** The guard enforces append-only history, not
-  one-entry-per-round history. A provisioning round can issue several credentials,
-  append all their fingerprints, increment the version once, and publish that one
-  raw or SNARK-backed record. Ordering inside the batch is still the caller's policy;
-  choose a canonical order before asking members to sign.
-- **The head is in-memory, and the durable backstop is elsewhere.** A restart
-  loses it; recovery rebuilds it from a record the caller must authenticate first
-  (`from_authenticated` checks nothing — it trusts its caller by contract). What
-  makes that safe is not this type but `AtomicSlotCounter`: re-signing an old
-  version derives an already-spent slot, and the member abstains. The counter is
-  the durable half of the guarantee.
-- **Recovery is not optional.** A member with no head can only sign v0, whose slot
-  is long spent — so a process that fails to recover does not lag behind, it
-  abstains permanently.
+The committee authorizes each snapshot by signing it. Credential-lifecycle rules
+that decide which additions and removals a member is willing to approve belong to
+the application; the protocol does not impose an append-only transition rule.
+Independently of that policy, `AtomicSlotCounter` still guarantees that one member
+cannot sign two competing snapshots at the same version's XMSS slot.
 
 ---
 
@@ -613,60 +607,25 @@ different runs are not interchangeable — start from a clean directory.
 
 ---
 
-## Container demos
+## Optional network demo
 
-The split deployment above is two processes on one machine, exchanging files. The
-demos in [`demo/`](demo/) run the same protocol as a network: ten containers
-holding one key each, a shared volume standing in for the DHT, and a relying
-party that starts out knowing nothing but the anchor.
+[`demo/`](demo/) is a separate, unmeasured crate that places the protocol in a
+ten-member container network. `round` issues a credential and adds its
+fingerprint to the valid snapshot; `revoke` removes it and verifies that absence
+means revoked. It exists as an integration walkthrough, not as the main artifact
+or source of the benchmark results above. Those two commands are deliberately
+small examples; the proposal they exercise always carries the complete snapshot
+and imposes no one-entry transition limit.
 
 ```sh
-./demo/docker/demo.sh raw   up      # build the image, start 1 bootstrap + 10 members + node A
-./demo/docker/demo.sh raw   round   # node A asks for a credential, then verifies it
-./demo/docker/demo.sh raw   verify  # re-check what is published, without a new round
-./demo/docker/demo.sh raw   crash   # kill a member mid-protocol, watch it re-align
-./demo/docker/demo.sh snark up      # the same network, publishing one proof instead
-./demo/docker/demo.sh raw   down
+./demo/docker/demo.sh raw up
+./demo/docker/demo.sh raw round
+./demo/docker/demo.sh raw revoke
+./demo/docker/demo.sh raw down
 ```
 
-Both demos run one committee (`N = 10`, `t = 7`) and differ in a single function:
-what the aggregator publishes once it has a quorum. There is no privileged
-coordinator. The aggregator is whichever member node A happened to dial, it holds
-the role for exactly one round, and it is given no power a member does not
-already have: it proposes a *version*, and every member derives the XMSS slot
-from the anchor itself.
-
-What a run prints is what the sections above argue in the abstract. At `t = 7`
-the raw record is about 8.5 KB, of which 8456 B are the seven signatures, and
-node A checks it in ~7 ms having run no setup at all and never passing 3 MB
-resident. The SNARK record over the same list is about 169 KB, all but a hundred
-bytes of it proof, and node A checks it in ~41 ms after a 5.4 s
-`setup_verifier()` that leaves ~700 MB resident. That is the wrong side of the
-crossover described in
-[Where the SNARK starts paying off](#where-the-snark-starts-paying-off), which is
-the point: at a committee this small the aggregation costs more than it saves,
-and the demo shows it rather than asserting it.
-
-Node A is a **resident** container rather than a one-shot, because
-`setup_verifier()` is a per-process cost: a relying party that exited after every
-check would pay those 5.4 s and 700 MB per record, and the figure being measured
-would be process startup. It pays once, at `up`. Staying up is also what makes
-its `HighWaterMark` visible — `verify` twice in a row shows the second answer
-refused as stale, and a node A that is restarted announces the version below
-which it will accept nothing again.
-
-`crash` is the scenario the unit tests cannot reach. A member signs a version,
-is killed with `SIGKILL`, restarts, and is asked to sign a **different list at
-the same version**, which is the one thing that would cost it its key. It
-refuses, because the slot was burned on disk before the key ever touched it. The
-committee then reaches quorum without it, which is what `t < N` is for, and one
-round later it is signing again, having derived its slot from the anchor rather
-than being told where it was.
-
-The demo is a separate crate with its own workspace and its own lockfile, so
-nothing in it can change what `benchmark.sh` measures. See
-[`demo/README.md`](demo/README.md) for the topology, the volume layout, and the
-deliberate simplifications.
+The same commands accept `snark`; topology and operational details live only in
+[`demo/README.md`](demo/README.md).
 
 ---
 
@@ -785,9 +744,10 @@ The sweep used **30 measured runs** after **3 warmups**, with targets interleave
 round-robin. The measured protocol parameters were `N=200`, `t=128`, and 20
 status-list updates per run.
 
-Each update is one publication of a new status-list version. A version may carry
-one entry or a batch of entries; the benchmark appends one entry per update only
-because it is measuring the cryptographic paths, not provisioning policy.
+Each update is one publication of a new status-list version. A version may add or
+remove any number of entries, including both in the same update; the benchmark
+adds one entry per update only because it is measuring the cryptographic paths,
+not provisioning policy.
 
 **Per member, per round.** A member signs once and broadcasts. It never produces
 `t` signatures locally, so this cost is paid in parallel by the quorum members

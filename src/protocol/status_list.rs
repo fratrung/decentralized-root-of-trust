@@ -574,7 +574,7 @@ mod tests {
     }
 
     /// A documented gap, pinned so it cannot change silently: the fold is
-    /// sequential, so one logical revocation set has `n!` distinct roots. Sorting
+    /// sequential, so one logical validity set has `n!` distinct roots. Sorting
     /// inside the fold would fix it and would break the wire format, which is why
     /// it has not been done; see AGENTS.md, "Known gaps in the model".
     #[test]
