@@ -199,8 +199,8 @@ before leanVM v0.9 are not compatible and must be regenerated.
 |---|---|---|
 | evidence | the `t` raw signatures + a signer bitmap | one aggregated SNARK proof |
 | naming the signers | 26 B bitmap (`N + 1` bits) | public keys inside the aggregate |
-| prover | none | 750 ms · 2.1 GB |
-| verifier setup | none | ~5 s · 651 MB resident |
+| prover | none | 670 ms · 2.0 GB peak |
+| verifier setup | none | ~5.0 s · 676 MB resident |
 | verify | `t` × `xmss_verify`, linear in `t` | one check, flat in `t` |
 | payload at `t=128` | ≈ 155 KB | ≈ 234 KB |
 | entry point | `VerifierNode::verify_status_list` | `PQSNARKVerifierModule::verify` |
@@ -901,14 +901,16 @@ ever started accepting one — which is the same drift that once removed the slo
 check from the verifier wrapper.
 
 Every check named in this section has a mutant in `tools/mutate.py`, which
-deletes one and reports which test complains. 24 of them — it was 25 until the
-signer bitmap became an SSZ `BitList` and one of the checks stopped being a check
-at all. The last full sweep caught every mutant; the patterns have been updated
-since and verified to still match their targets, but the sweep itself has not
-been re-run. Its findings so far: three checks that no test reached at all
-(`verify_status_list`'s padding bits, the bitmap width, and `t == 0`), plus a
-padding test that had been locating the bitmap by searching a signature blob for
-a byte value.
+deletes one and reports which test complains. There are currently 28. One former
+padding-bits mutant disappeared when the signer bitmap became an SSZ `BitList`:
+excess indices are now unrepresentable, so there is no longer a hand-written
+padding check to delete. The last full sweep caught every then-current mutant;
+the present patterns have since been updated and verified to still match their
+targets, but the full 28-mutant sweep itself has not been re-run. Earlier sweeps
+exposed three checks that no test reached (`verify_status_list`'s former padding
+check, the bitmap width, and `t == 0`), plus a padding test that located the bitmap
+by searching a signature blob for a byte value. The current `BitList` structure
+and tests address those findings.
 
 ---
 

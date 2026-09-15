@@ -35,7 +35,7 @@ cargo run --release --bin prover   -- [outdir]         # split: aggregate, write
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
 cargo test                                             # 66 unit + 10 integration tests; 75 run + 1 ignored
-./benchmark.sh                                         # RUNS=30 WARMUP=3 TARGETS="prover verifier" ./benchmark.sh
+./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
 tools/mutate.py                                        # mutation testing: 28 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
 ./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record

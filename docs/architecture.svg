@@ -25,7 +25,7 @@
 
   <!-- ============ DERIVATION ============ -->
   <rect x="86" y="196" width="508" height="88" rx="10" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
-  <text x="340" y="222" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#1e1b4b">message = status_list_root(list, version)</text>
+  <text x="340" y="222" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#1e1b4b">message = status_list_message(domain, list, version)</text>
   <text x="340" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#1e1b4b">slot = genesis_slot + version</text>
   <text x="340" y="270" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4338ca">derived from the anchor — never negotiated</text>
 
@@ -46,10 +46,10 @@
   <text x="180" y="414" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#134e4a">StatusList</text>
 
   <rect x="30" y="430" width="300" height="112" rx="9" fill="#f0fdfa" stroke="#5eead4" stroke-width="1.4"/>
-  <text x="46" y="453" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#134e4a">signer bitmap — ceil(N/8) = 25 B</text>
+  <text x="46" y="453" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#134e4a">SSZ BitList — ceil((N + 1)/8) = 26 B</text>
   <text x="46" y="473" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#134e4a">+ the t raw XMSS signatures</text>
   <line x1="46" y1="486" x2="314" y2="486" stroke="#99f6e4" stroke-width="1.2"/>
-  <text x="46" y="506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">≈ 189 KB on the wire</text>
+  <text x="46" y="506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">≈ 155 KB on the wire (t=128)</text>
   <text x="46" y="527" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#134e4a">no prover, no circuit, no setup</text>
 
   <!-- ============ RIGHT: SNARK ============ -->
@@ -62,7 +62,7 @@
   <text x="366" y="473" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">(leanVM — WHIR + sumcheck)</text>
   <line x1="366" y1="486" x2="634" y2="486" stroke="#e9d5ff" stroke-width="1.2"/>
   <text x="366" y="506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#6d28d9">≈ 234 KB on the wire</text>
-  <text x="366" y="527" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">prover: 750 ms · 2.1 GB RAM</text>
+  <text x="366" y="527" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">prover: 670 ms · 2.0 GB RAM</text>
 
   <line x1="180" y1="542" x2="180" y2="560" stroke="#94a3b8" stroke-width="1.8"/>
   <path d="M 180 568 L 175 558 L 185 558 Z" fill="#94a3b8"/>
@@ -80,20 +80,20 @@
 
   <!-- ============ VERIFIERS ============ -->
   <rect x="30" y="638" width="300" height="126" rx="9" fill="#f0fdfa" stroke="#14b8a6" stroke-width="1.6"/>
-  <text x="46" y="660" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#0f766e">verify_quorum</text>
-  <text x="46" y="681" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">bitmap width + padding bits</text>
-  <text x="46" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">count ≥ t · message + slot</text>
+  <text x="46" y="660" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#0f766e">VerifierNode::verify_status_list</text>
+  <text x="46" y="681" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">exact BitList width = N</text>
+  <text x="46" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">quorum ≥ t · bound message + slot</text>
   <text x="46" y="717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">t × xmss_verify</text>
   <line x1="46" y1="729" x2="314" y2="729" stroke="#99f6e4" stroke-width="1.2"/>
-  <text x="46" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">52 ms · 4 MB · no setup</text>
+  <text x="46" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">54 ms · 4 MB · no setup</text>
 
   <rect x="350" y="638" width="300" height="126" rx="9" fill="#faf5ff" stroke="#8b5cf6" stroke-width="1.6"/>
-  <text x="366" y="660" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#6d28d9">verify_proof</text>
-  <text x="366" y="681" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">pubkeys ∈ committee</text>
-  <text x="366" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">count ≥ t · message + slot</text>
+  <text x="366" y="660" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#6d28d9">PQSNARKVerifierModule::verify</text>
+  <text x="366" y="681" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">pubkeys ∈ anchor committee</text>
+  <text x="366" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">quorum ≥ t · bound message + slot</text>
   <text x="366" y="717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">1 SNARK verification</text>
   <line x1="366" y1="729" x2="634" y2="729" stroke="#e9d5ff" stroke-width="1.2"/>
-  <text x="366" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#6d28d9">33 ms · 651 MB · 5.2 s setup</text>
+  <text x="366" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#6d28d9">37 ms · 693 MB · 5.0 s setup</text>
 
   <line x1="340" y1="764" x2="340" y2="782" stroke="#94a3b8" stroke-width="1.8"/>
   <path d="M 340 790 L 335 780 L 345 780 Z" fill="#94a3b8"/>
