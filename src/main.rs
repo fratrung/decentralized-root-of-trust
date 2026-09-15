@@ -12,6 +12,10 @@
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::crypto::{
+    XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover, setup_verifier, xmss_key_gen,
+    xmss_sign,
+};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::params::{
@@ -19,10 +23,6 @@ use decentralized_root_of_trust::params::{
 };
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
-use lean_multisig::{
-    XmssPublicKey, XmssSecretKey, XmssSignature, setup_prover, setup_verifier, xmss_key_gen,
-    xmss_sign,
-};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -112,9 +112,10 @@ fn run_flow(
     (status_list, prove_time, verify_time)
 }
 
-/// Signs `(list, version)` with `signers` at `slot` and returns just the proof
-/// bytes. `version` is bound into the message, so a proof made here is only valid
-/// for that exact version.
+/// Builds adversarial fixtures with fresh, process-local keys at slots that the
+/// normal update loop has not used. Production signing must go through
+/// `SignerNode`, whose durable counter burns the slot before leanVM draws the
+/// signature randomness.
 fn make_signed_proof(
     prover: &PQSNARKProverModule,
     committee: &Committee,
@@ -124,13 +125,24 @@ fn make_signed_proof(
     slot: u32,
     version: u32,
 ) -> Vec<u8> {
-    prover.sign_and_prove(
-        keypairs,
-        signers,
-        committee.message_for(Algorithms::WotsXmss, list, version),
-        slot,
-        LOG_INV_RATE,
-    )
+    let mut unique = signers.to_vec();
+    unique.sort_unstable();
+    assert!(
+        unique.windows(2).all(|pair| pair[0] != pair[1]),
+        "adversarial fixture must not reuse an XMSS key at one slot"
+    );
+    let message = committee.message_for(Algorithms::WotsXmss, list, version);
+    let raws = signers
+        .iter()
+        .map(|&index| {
+            let (secret, public) = &keypairs[index];
+            (
+                public.clone(),
+                xmss_sign(secret, slot, &message).expect("signing failed"),
+            )
+        })
+        .collect();
+    prover.aggregate(raws, message, slot, LOG_INV_RATE)
 }
 
 fn main() {
@@ -162,7 +174,7 @@ fn main() {
     // other) makes `raw_agg`'s keygen column look like the SNARK's setup column
     // and inverts the comparison between the two.
     //
-    // `xmss_key_gen` samples the seed from the RNG itself since v0.9 and returns
+    // `xmss_key_gen` samples the seed from the RNG itself and returns
     // `(public, secret)`; this crate carries `(secret, public)` throughout, so the
     // pair is swapped here, at the boundary. The two types are distinct, so the
     // swap is compile-checked rather than a convention to remember.
@@ -347,7 +359,7 @@ fn main() {
     // the RSS reads and the printing. It is NOT comparable with the prover's
     // `prove_total_ms`, so the per-phase totals are emitted alongside it and those
     // are what the harness aggregates. Reporting the loop time under the same
-    // heading as a phase sum makes this process look ~2.5x slower than it is.
+    // heading as a phase sum would conflate unlike measurements.
     let sum_ms = |v: &[Duration]| -> f64 { v.iter().map(|d| ms(*d)).sum() };
     let bench = [
         format!("setup_verifier_ms={:.3}", ms(setup_verifier_time)),

@@ -5,23 +5,24 @@ edition = "2024"
 
 [dependencies]
 # leanVM: the SNARK prover that aggregates the XMSS signatures into a single
-# proof. leanVM ships its own field/hash backend and does NOT depend on
-# Plonky3, so the whole dependency tree is git-pinned and reproducible.
+# proof. v0.10 uses binary fields and BLAKE2s. The application message uses the
+# exact same BLAKE2s implementation
+# through the `primitives` workspace crate.
 #
-# Pinned to the `v0.9` tag by its commit, not by the tag name: a tag can be moved,
-# a commit cannot. v0.9 is a breaking release — keys, signatures and proofs from
-# any earlier revision are rejected, so artifacts must be regenerated after a
-# bump (see AGENTS.md, "leanVM constraints").
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
-backend       = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
+# Pinned to the `v0.10` tag by its commit, not by the tag name: a tag can be
+# moved, a commit cannot. This is a cryptographic and wire-format break: v0.9
+# keys, signatures, aggregates and status-list messages must be regenerated.
+leanvm = { git = "https://github.com/leanEthereum/leanVM.git", rev = "73a5f5dcd34d8dfe76a32a44dce0c0f87c86feeb" }
+leanvm-primitives = { package = "primitives", git = "https://github.com/leanEthereum/leanVM.git", rev = "73a5f5dcd34d8dfe76a32a44dce0c0f87c86feeb" }
 
 rand = "0.10"
 sha3 = "0.10.8"
 
 # Canonical, schema-driven wire format for every published object. Since leanVM
-# v0.9 this covers the leanVM types too: `XmssPublicKey` (32 B) and
-# `XmssSignature` (1208 B) implement SSZ natively, with non-canonical field
-# elements rejected on decode, so nothing here has to canonicalize them by hand.
+# v0.10 this covers the leanVM types too: `XmssPublicKey` (32 B) and
+# `XmssSignature` (1208 B) implement SSZ natively. They are byte-oriented in
+# v0.10, so exact SSZ lengths — rather than field-modulus checks — define their
+# canonical schema.
 ssz = { package = "ethereum_ssz", version = "0.10.4" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10.1" }
 # Only to name the compile-time ceiling on the signer bitmap: SSZ BitList takes
@@ -35,10 +36,17 @@ serde_json = "1.0"
 serde_jcs  = "0.2"
 
 # `tests/snark_path.rs` runs a real leanVM prover, which is not usable at
-# `opt-level = 0` — plain `cargo test` would otherwise take hours instead of
-# seconds. Optimizing the *dependencies* only leaves this crate itself
-# unoptimized, so `cargo test` keeps its debug info, its assertions and its
-# integer-overflow checks. The release profile, which the benchmark measures, is
-# untouched.
+# `opt-level = 0`. Optimizing the *dependencies* only leaves this crate itself
+# unoptimized, so `cargo test` keeps its debug info, assertions and integer
+# overflow checks. The release profile is untouched.
 [profile.dev.package."*"]
 opt-level = 3
+
+# v0.10's aggregation warm-up builds a shape-only placeholder layout with dummy
+# table heights of `1 << 10`; `lean_vm` then shifts by those synthetic heights.
+# Release builds intentionally run with overflow checks off, but a dependency
+# built in the dev profile would panic before any proof is made. Scope the
+# production-equivalent arithmetic to that upstream package only: this crate and
+# every other dependency retain their normal dev overflow checks.
+[profile.dev.package.lean_vm]
+overflow-checks = false

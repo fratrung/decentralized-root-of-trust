@@ -14,7 +14,7 @@
 //! What this binary measures is the relying party's side: verify and size.
 //!
 //! Note what this binary does **not** call: neither `setup_prover()` nor
-//! `setup_verifier()`. Raw XMSS sign/verify are pure Poseidon2: no circuit, no
+//! `setup_verifier()`. Raw XMSS sign/verify use BLAKE2s directly: no circuit, no
 //! arena, no FFT twiddles. That absence is itself a result: it is the fixed cost
 //! the SNARK path pays and this one does not.
 //!
@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::crypto::{XmssPublicKey, XmssSignature, xmss_key_gen};
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::params::{
@@ -37,7 +38,6 @@ use decentralized_root_of_trust::params::{
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, StatusList, hash_any};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
-use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -73,7 +73,7 @@ fn main() {
     let mut signers: Vec<SignerNode> = Vec::with_capacity(N_MEMBERS);
     let mut members: Vec<XmssPublicKey> = Vec::with_capacity(N_MEMBERS);
     for i in 0..N_MEMBERS {
-        // `xmss_key_gen` samples its own seed since leanVM v0.9 and returns
+        // `xmss_key_gen` samples its own seed and returns
         // `(public, secret)`; this crate carries `(secret, public)`, so the pair is
         // swapped at the boundary.
         let t_k = Instant::now();

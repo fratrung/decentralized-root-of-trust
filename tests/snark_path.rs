@@ -1,19 +1,10 @@
-//! The five checks of [`verify_proof`], each shown to be load-bearing.
+//! The five checks of `PQSNARKVerifierModule::verify`, each shown to be
+//! load-bearing, plus the v0.10 aggregate statement-shape guard.
 //!
-//! Every negative case here is a *genuinely valid SNARK*. Corrupting the proof
-//! bytes would prove nothing: that fails at deserialization, before any of the
-//! five checks run, so it cannot tell you whether check 1 or check 4 still exists.
-//! Instead each case aggregates real signatures and breaks exactly one binding,
-//! and asserts that the other four still hold, so a `false` can only have come
-//! from the check under test. Deleting any one of the five makes exactly one
-//! assertion below fail.
-//!
-//! ## Cost
-//!
-//! Four aggregations plus `setup_prover()`: about 10 s and ~1 GB resident on the
-//! reference host. That is small because the committee is: the deployed
-//! configuration is `N = 200, t = 128` and this is `N = 5, t = 3`. The subject
-//! here is the predicate, not the scale; `benchmark.sh` measures the scale.
+//! Checks 1–4 use genuinely valid SNARKs and break exactly one cleartext binding.
+//! Check 5 mutates only the proof body while preserving a decodable aggregate and
+//! its complete public statement. Each case states that the other checks still
+//! hold, so deleting one check makes its matching assertion fail.
 //!
 //! Everything lives in ONE `#[test]` on purpose. leanVM's arena allocator has a
 //! single shared region per process and `setup_prover`'s contract is "never
@@ -22,8 +13,7 @@
 //!
 //! It is deliberately not `#[ignore]`d: a security predicate whose test nobody
 //! runs is the one that drifts. `Cargo.toml` optimizes dependencies in the dev
-//! profile so that plain `cargo test` can afford it (at `opt-level = 0` leanVM's
-//! prover turns minutes into hours).
+//! profile so that plain `cargo test` exercises the real prover.
 //!
 //! ## Slot discipline
 //!
@@ -37,19 +27,19 @@
 //! per-slot budget is written out next to the constants below, and cases skip
 //! rounds rather than reuse a slot.
 
+use decentralized_root_of_trust::crypto::{
+    MESSAGE_LEN_BYTES, SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey,
+    XmssSignature, aggregate_single_message_signatures, xmss_key_gen_from_seed, xmss_sign,
+};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
-use lean_multisig::{
-    MESSAGE_LEN_BYTES, SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey,
-    XmssSignature, xmss_key_gen_from_seed, xmss_sign,
-};
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
-/// Last usable slot, inclusive; leanVM v0.9's keygen takes `WINDOW + 1` instead.
+/// Last usable offset, inclusive; this crate's adapter takes `WINDOW + 1` epochs.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this exercises the deployed configuration.
 const LOG_INV_RATE: usize = 2;
@@ -64,6 +54,7 @@ const ROUND: u32 = 2;
 //     slot 100  round 1, wrong slot    members 0, 1, 2
 //     slot 103  round 3, below quorum  members 0, 1
 //     slot 104  round 4, outsider      outsider, 0, 1
+//     slot 105  extra claim group      member 3
 //
 // Members 0 and 1 sign four times, at four distinct slots; member 2 twice, at two
 // distinct slots; the outsider once. No pair repeats.
@@ -115,6 +106,17 @@ fn info_of(sl: &SnarkStatusList) -> SingleMessageAggregateSignature {
     sl.proof().expect("the aggregate itself is well-formed")
 }
 
+/// Extracts the one XMSS group this protocol accepts and owns the values so test
+/// assertions cannot accidentally depend on leanVM's aggregate internals.
+fn claims_of(sl: &SnarkStatusList) -> (u32, [u8; MESSAGE_LEN_BYTES], Vec<XmssPublicKey>) {
+    let agg = info_of(sl);
+    assert!(agg.sphincs_signers().is_empty(), "unexpected SPHINCS claim");
+    let [(slot, message, pubkeys)] = agg.xmss_signers() else {
+        panic!("expected exactly one XMSS claim group");
+    };
+    (*slot, *message, pubkeys.clone())
+}
+
 #[test]
 fn each_of_the_five_checks_rejects_on_its_own() {
     let prover = PQSNARKProverModule::init_prover();
@@ -144,6 +146,68 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let back = SnarkStatusList::from_bytes(&valid.to_bytes()).expect("record decodes");
     assert!(verifier.verify(&back));
 
+    // ------------------------------------------- aggregate statement shape --
+    // leanVM v0.10 can prove several XMSS (slot, message) groups at once. This
+    // protocol authorizes exactly one statement, so an otherwise valid aggregate
+    // containing the honest quorum plus a second group must not be accepted by
+    // looking only at the first group.
+    let extra_slot = c.slot_for(5).expect("slot");
+    let extra_message = c.message_for(Algorithms::WotsXmss, &list, 5);
+    let honest_child = info_of(&valid);
+    let mixed = aggregate_single_message_signatures(
+        &[honest_child],
+        sign_at(&[&keys[3]], extra_message, extra_slot),
+        extra_message,
+        extra_slot,
+        LOG_INV_RATE,
+    )
+    .expect("mixed-group aggregation");
+    assert_eq!(mixed.xmss_signers().len(), 2, "test must carry two groups");
+    assert!(
+        mixed.verify().is_ok(),
+        "the broader leanVM proof is genuine"
+    );
+    assert!(
+        !verifier.verify(&record(list.clone(), ROUND, mixed.to_bytes())),
+        "the protocol must reject a multi-statement aggregate"
+    );
+
+    // leanVM can also combine XMSS and SPHINCS claims. SPHINCS is deliberately
+    // outside this protocol: even a genuine aggregate with the one permitted
+    // XMSS group must be rejected when it carries any SPHINCS claim.
+    let mut sphincs_rng = leanvm::rand::rng();
+    let (sphincs_secret, sphincs_public) = leanvm::sphincs::key_gen(&mut sphincs_rng);
+    let sphincs_message = [0x53; leanvm::sphincs::MESSAGE_LEN];
+    let sphincs_signature =
+        leanvm::sphincs::sign(&mut sphincs_rng, &sphincs_secret, &sphincs_message)
+            .expect("SPHINCS adversarial fixture signs");
+    let xmss_and_sphincs = leanvm::aggregate(
+        &[info_of(&valid)],
+        Vec::new(),
+        vec![(sphincs_public, sphincs_message, sphincs_signature)],
+        None,
+        LOG_INV_RATE,
+    )
+    .expect("mixed-family aggregation");
+    assert_eq!(
+        xmss_and_sphincs.xmss_signers().len(),
+        1,
+        "test must preserve exactly one XMSS group"
+    );
+    assert_eq!(
+        xmss_and_sphincs.sphincs_signers().len(),
+        1,
+        "test must add exactly one rejected SPHINCS claim"
+    );
+    assert!(
+        xmss_and_sphincs.verify().is_ok(),
+        "the broader leanVM proof is genuine"
+    );
+    assert!(
+        !verifier.verify(&record(list.clone(), ROUND, xmss_and_sphincs.to_bytes())),
+        "the XMSS-only protocol must reject every SPHINCS claim"
+    );
+
     // ------------------------------------------------- check 2: the message --
     // A revocation nobody authorized, appended to a list carrying a real quorum.
     // Nothing else changes: same proof, same version, same slot.
@@ -154,12 +218,12 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         // Stated, not assumed. The record carries the honest proof untouched, so
         // membership, slot and quorum are all still the honest ones and the *only*
         // thing that has moved is the list the message is computed over.
-        let agg = info_of(&tampered);
-        assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(c.slot_for(ROUND), Some(agg.info.core.slot));
-        assert!(agg.info.pubkeys.len() >= T);
+        let (agg_slot, agg_message, pubkeys) = claims_of(&tampered);
+        assert!(pubkeys.iter().all(|pk| c.members().contains(pk)));
+        assert_eq!(c.slot_for(ROUND), Some(agg_slot));
+        assert!(pubkeys.len() >= T);
         assert_ne!(
-            agg.info.core.message,
+            agg_message,
             c.message_for(Algorithms::WotsXmss, tampered.list(), tampered.version()),
             "the tampered list must actually change the message, or this case is \
              vacuous"
@@ -198,11 +262,11 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     );
     {
         // Everything but the slot is in order, so the rejection can only be check 3.
-        let agg = info_of(&wrong_slot);
-        assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(agg.info.core.message, message_1);
-        assert!(agg.info.pubkeys.len() >= T);
-        assert_eq!(agg.info.core.slot, chosen_slot);
+        let (agg_slot, agg_message, pubkeys) = claims_of(&wrong_slot);
+        assert!(pubkeys.iter().all(|pk| c.members().contains(pk)));
+        assert_eq!(agg_message, message_1);
+        assert!(pubkeys.len() >= T);
+        assert_eq!(agg_slot, chosen_slot);
     }
     assert!(
         !verifier.verify(&wrong_slot),
@@ -224,11 +288,11 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         ),
     );
     {
-        let agg = info_of(&thin);
-        assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(agg.info.core.message, message_3);
-        assert_eq!(agg.info.core.slot, slot_3);
-        assert_eq!(agg.info.pubkeys.len(), T - 1, "one short, and only that");
+        let (agg_slot, agg_message, pubkeys) = claims_of(&thin);
+        assert!(pubkeys.iter().all(|pk| c.members().contains(pk)));
+        assert_eq!(agg_message, message_3);
+        assert_eq!(agg_slot, slot_3);
+        assert_eq!(pubkeys.len(), T - 1, "one short, and only that");
     }
     assert!(
         !verifier.verify(&thin),
@@ -256,13 +320,12 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         ),
     );
     {
-        let agg = info_of(&intruded);
-        assert_eq!(agg.info.core.message, message_4);
-        assert_eq!(agg.info.core.slot, slot_4);
-        assert!(agg.info.pubkeys.len() >= T, "the count alone is satisfied");
+        let (agg_slot, agg_message, pubkeys) = claims_of(&intruded);
+        assert_eq!(agg_message, message_4);
+        assert_eq!(agg_slot, slot_4);
+        assert!(pubkeys.len() >= T, "the count alone is satisfied");
         assert_eq!(
-            agg.info
-                .pubkeys
+            pubkeys
                 .iter()
                 .filter(|pk| !c.members().contains(pk))
                 .count(),
@@ -277,21 +340,32 @@ fn each_of_the_five_checks_rejects_on_its_own() {
 
     // --------------------------------------------------- check 5: the SNARK --
     // The hard case, and the reason the other four are not enough on their own: an
-    // aggregate whose *public inputs* are the honest ones (so checks 1 to 4 pass
-    // by construction), carrying the proof body of a different execution. The four
-    // cheap checks all look at `info`; only verifying the SNARK relates `info` to
-    // the computation that is supposed to have produced it.
-    let spliced = SingleMessageAggregateSignature {
-        info: info_of(&valid).info,
-        proof: info_of(&thin).proof,
-    };
+    // aggregate whose declared claims are the honest ones (so checks 1 to 4 pass
+    // by construction), but whose proof body has one changed bit. v0.10 keeps
+    // fields private, so the test mutates its canonical bytes and requires the
+    // result to remain structurally decodable with identical claims. Only proof
+    // verification can relate those claims to the computation.
+    let honest_aggregate = info_of(&valid);
+    let mut spliced_bytes = honest_aggregate.to_bytes();
+    *spliced_bytes.last_mut().expect("proof bytes") ^= 1;
+    let spliced = SingleMessageAggregateSignature::from_bytes(&spliced_bytes)
+        .expect("changing a proof-body bit must preserve the aggregate shape");
+    assert_eq!(spliced.xmss_signers(), honest_aggregate.xmss_signers());
+    assert_eq!(
+        spliced.sphincs_signers(),
+        honest_aggregate.sphincs_signers()
+    );
+    assert!(
+        spliced.verify().is_err(),
+        "the changed proof must be invalid"
+    );
     let forged = record(list.clone(), ROUND, spliced.to_bytes());
     {
-        let agg = info_of(&forged);
-        assert!(agg.info.pubkeys.iter().all(|pk| c.members().contains(pk)));
-        assert_eq!(agg.info.core.message, message);
-        assert_eq!(c.slot_for(ROUND), Some(agg.info.core.slot));
-        assert!(agg.info.pubkeys.len() >= T);
+        let (agg_slot, agg_message, pubkeys) = claims_of(&forged);
+        assert!(pubkeys.iter().all(|pk| c.members().contains(pk)));
+        assert_eq!(agg_message, message);
+        assert_eq!(c.slot_for(ROUND), Some(agg_slot));
+        assert!(pubkeys.len() >= T);
     }
     assert!(
         !verifier.verify(&forged),

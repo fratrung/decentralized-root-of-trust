@@ -7,10 +7,7 @@
 //! the property a relying party is built out of, and the one every binary used to
 //! re-implement by hand.
 //!
-//! ## Cost
-//!
-//! One aggregation plus `setup_prover()` and `setup_verifier()`: a few seconds
-//! and about a gigabyte resident. One `#[test]`, for the reason spelled out in
+//! Everything lives in one `#[test]` for the reason spelled out in
 //! `tests/snark_path.rs`: leanVM's arena is one shared region per process, and
 //! libtest runs tests as threads.
 //!
@@ -20,6 +17,9 @@
 //! key here shares a hash chain with one in another test binary. One round is
 //! signed, at one slot, by three members: no `(key, slot)` pair repeats.
 
+use decentralized_root_of_trust::crypto::{
+    XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign,
+};
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::node::snark_node::SnarkNode;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
@@ -27,12 +27,11 @@ use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
-use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign};
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
-/// Last usable slot, inclusive; `WINDOW + 1` is the count leanVM v0.9 takes.
+/// Last usable slot, inclusive; `WINDOW + 1` is the adapter's count.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this is the deployed configuration.
 const LOG_INV_RATE: usize = 2;

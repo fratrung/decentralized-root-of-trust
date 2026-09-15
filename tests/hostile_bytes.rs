@@ -22,9 +22,9 @@
 //! ## Scope, honestly stated
 //!
 //! This is the **raw** path. `SnarkStatusList` is decoded here but not verified:
-//! `verify_proof` costs ~30 ms and `setup_verifier` a further several seconds, so
-//! a run large enough to be interesting would take hours. Property 3 therefore
-//! covers `verify_status_list` only; the SNARK predicate is covered case-by-case
+//! a mutation run large enough to be interesting should not invoke a real proof
+//! verifier for every input. Property 3 therefore covers `verify_status_list`
+//! only; the SNARK predicate is covered case-by-case
 //! in `tests/snark_path.rs`, which is the better tool for it anyway: a fuzzer is
 //! very unlikely to stumble onto a valid aggregate.
 //!
@@ -33,12 +33,12 @@
 //! reliably and novel bugs only by luck. Raising `ITERATIONS` locally is the way
 //! to go looking for the latter.
 
+use decentralized_root_of_trust::crypto::{xmss_key_gen_from_seed, xmss_sign};
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, StatusList, hash_any,
 };
-use lean_multisig::{xmss_key_gen_from_seed, xmss_sign};
 use rand::{RngExt, SeedableRng};
 
 const N: usize = 5;
@@ -96,9 +96,8 @@ fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
 
     // The wire codec is canonical: decoding then encoding an accepted record
     // yields exactly the original bytes. A trailing byte is not an alternative
-    // spelling of the same record under SSZ, and since leanVM v0.9 the same
-    // holds *inside* each signature, which is a fixed 1208-byte SSZ object whose
-    // field elements are refused at or above the modulus.
+    // spelling of the same record under SSZ, and the same holds *inside* each
+    // byte-oriented v0.10 signature, whose SSZ size is fixed at 1208 bytes.
     assert_eq!(
         StatusList::from_bytes(&raw)
             .expect("honest raw record decodes")

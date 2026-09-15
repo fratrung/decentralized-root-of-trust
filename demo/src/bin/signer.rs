@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::rss_now_mb;
+use decentralized_root_of_trust::crypto::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
@@ -38,7 +39,6 @@ use drot_demo::wire::{
     self, ACTION_ISSUE, ACTION_REVOKE, Failure, Proposal, SignatureReply, StatusRequest,
     StatusUpdated,
 };
-use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use ssz::{Decode as _, Encode as _};
 
 /// How long a node waits at startup for the bootstrap step.

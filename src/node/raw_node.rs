@@ -92,15 +92,15 @@ impl RawNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::status_list::{Algorithms, hash_any};
-    use lean_multisig::{
+    use crate::crypto::{
         XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign,
     };
+    use crate::protocol::status_list::{Algorithms, hash_any};
 
     const N: usize = 5;
     const T: usize = 3;
     const GENESIS: u32 = 100;
-    /// `GENESIS..=GENESIS + 8`, as the slot *count* leanVM v0.9 takes.
+    /// `GENESIS..=GENESIS + 8`, expressed as the adapter's slot count.
     const WINDOW: u64 = 9;
 
     /// This module's tag in the crate-wide seed namespace `[file, ns, member, 0, ..]`.

@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use decentralized_root_of_trust::crypto::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::node::raw_node::RawNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
@@ -24,7 +25,6 @@ use decentralized_root_of_trust::protocol::status_list::{
 };
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
-use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use ssz::Encode as _;
 
 const N: usize = 5;
@@ -89,7 +89,7 @@ fn run() -> Result<(), String> {
             println!("raw verifier  : no circuit setup\n");
         }
         Mode::Snark => {
-            println!("leanVM setup  : starting prover setup, this can take a few seconds");
+            println!("leanVM setup  : starting prover setup");
             let setup_prover = Instant::now();
             prover = Some(PQSNARKProverModule::init_prover());
             println!(

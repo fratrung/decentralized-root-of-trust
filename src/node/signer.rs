@@ -5,7 +5,7 @@
 //! this module adds is the one place where a slot is actually spent, and the
 //! guarantee that it is spent *forward only*.
 
-use lean_multisig::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSecretKey, XmssSignature, xmss_sign};
+use crate::crypto::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSecretKey, XmssSignature, xmss_sign};
 
 use crate::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 
@@ -80,10 +80,9 @@ impl SignerNode {
     /// no rollback path on purpose: each of those costs one slot out of `2^32`,
     /// where retrying on the same slot costs the key.
     ///
-    /// v0.9's derandomized signing makes a repeated *message* at a spent slot
-    /// harmless, and changes nothing here: the counter exists for the case that is
-    /// still fatal (a *different* message at a used slot), and telling the two
-    /// apart would need the message history it deliberately does not keep.
+    /// v0.10 draws fresh signing randomness, so even retrying the *same* message
+    /// at a spent slot is unsafe. The counter must refuse every reuse before the
+    /// key is touched.
     pub fn sign(
         &mut self,
         message: &[u8; MESSAGE_LEN_BYTES],
@@ -118,8 +117,8 @@ impl SignerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{xmss_key_gen_from_seed, xmss_verify};
     use crate::protocol::status_list::{Algorithms, Domain, hash_any, status_list_message};
-    use lean_multisig::{xmss_key_gen_from_seed, xmss_verify};
     use std::path::PathBuf;
 
     /// A `SignerNode` holds no anchor — it signs the 32 bytes it is handed — so
@@ -131,7 +130,7 @@ mod tests {
 
     const START: u32 = 100;
     const END: u32 = 110;
-    /// `START..=END`, as the count leanVM v0.9 takes instead of an inclusive end.
+    /// `START..=END`, expressed through this crate's count-based adapter.
     const WINDOW: u64 = (END - START + 1) as u64;
 
     /// Same seed discipline as `verifier_node::tests`, documented in full there:

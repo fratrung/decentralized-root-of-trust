@@ -2,8 +2,8 @@
 //!
 //! Holds the committee secret keys, aggregates each update into one SNARK proof
 //! and writes the publishable artifacts to disk (stand-in for the DHT). It
-//! **never verifies**: that is `verifier`'s job, in a separate process whose
-//! resident memory is ~36% smaller because it never calls `setup_prover()`.
+//! **never verifies**: that is `verifier`'s job, in a separate process that never
+//! calls `setup_prover()`.
 //!
 //! Artifacts written to `<outdir>`:
 //!   anchor.bin          the committee (N public keys + threshold t)
@@ -17,13 +17,15 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::crypto::{
+    XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign,
+};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::params::{
     KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
 };
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
-use lean_multisig::{XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -33,6 +35,36 @@ fn ms(d: Duration) -> f64 {
 fn write(dir: &Path, name: &str, bytes: &[u8]) {
     let path = dir.join(name);
     std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+}
+
+/// Builds a deliberately malformed published record from fresh, process-local
+/// keys at a slot unused by the honest loop. This helper is confined to the
+/// attack-artifact binary; production member signing goes through `SignerNode`
+/// and its durable burn-before-sign counter.
+fn make_adversarial_proof(
+    prover: &PQSNARKProverModule,
+    keypairs: &[(XmssSecretKey, XmssPublicKey)],
+    signers: &[usize],
+    message: [u8; 32],
+    slot: u32,
+) -> Vec<u8> {
+    let mut unique = signers.to_vec();
+    unique.sort_unstable();
+    assert!(
+        unique.windows(2).all(|pair| pair[0] != pair[1]),
+        "adversarial fixture must not reuse an XMSS key at one slot"
+    );
+    let raws = signers
+        .iter()
+        .map(|&index| {
+            let (secret, public) = &keypairs[index];
+            (
+                public.clone(),
+                xmss_sign(secret, slot, &message).expect("signing failed"),
+            )
+        })
+        .collect();
+    prover.aggregate(raws, message, slot, LOG_INV_RATE)
 }
 
 fn main() {
@@ -81,7 +113,7 @@ fn main() {
     // i.e. as if the SNARK were the cheaper of the two: the comparison inverted,
     // because the raw column was keygen and the SNARK column was not.
     //
-    // `xmss_key_gen` samples the seed from the RNG itself since leanVM v0.9 and
+    // `xmss_key_gen` samples the seed from the RNG itself and
     // returns `(public, secret)`; this crate carries `(secret, public)`, so the
     // pair is swapped here, at the boundary. The types are distinct, so the swap
     // is compile-checked rather than a convention to remember.
@@ -191,20 +223,20 @@ fn main() {
     // that is the method working as intended rather than a gap in it. Forgery C
     // signs one version's content at a *different* version's slot: `make_proof`
     // derives the slot from the anchor, so it structurally cannot express that. An
-    // attacker is under no such constraint, so the attacker's code path is
-    // `sign_and_prove`, which still takes an explicit slot.
+    // attacker is under no such constraint, so this binary's private fixture
+    // helper signs at an explicit, otherwise unused slot.
     let attack_version = N_UPDATES as u32;
     let attack_slot = committee.slot_for(attack_version).expect("slot overflow");
     let quorum: Vec<usize> = (0..T).collect();
 
     // A) a valid proof of the honest list, attached to a list with an extra row.
     //    Defeated by check 2 (message binds the list).
-    let good_proof = prover.sign_and_prove(
+    let good_proof = make_adversarial_proof(
+        &prover,
         &keypairs,
         &quorum,
         committee.message_for(Algorithms::WotsXmss, &list, attack_version),
         attack_slot,
-        LOG_INV_RATE,
     );
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION"));
@@ -224,12 +256,12 @@ fn main() {
         outsiders.push((sk, pk));
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
-    let out_proof = prover.sign_and_prove(
+    let out_proof = make_adversarial_proof(
+        &prover,
         &outsiders,
         &quorum,
         committee.message_for(Algorithms::WotsXmss, &out_list, 0),
         SLOT,
-        LOG_INV_RATE,
     );
     write(
         outdir,
@@ -253,12 +285,12 @@ fn main() {
     let spoof_version = KEY_SLOTS;
     let spoof_slot = committee.slot_for(spoof_version).expect("slot overflow");
     let signed_version = (N_UPDATES - 1) as u32; // the true latest
-    let versioned_proof = prover.sign_and_prove(
+    let versioned_proof = make_adversarial_proof(
+        &prover,
         &keypairs,
         &quorum,
         committee.message_for(Algorithms::WotsXmss, &list, signed_version),
         spoof_slot,
-        LOG_INV_RATE,
     );
     write(
         outdir,

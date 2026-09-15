@@ -16,9 +16,8 @@
 #
 # `combined` (src/main.rs, the single-process demo) is NOT in the defaults. It
 # measures a process that proves and verifies at once, which is not a role anyone
-# deploys, and its numbers duplicate the prover's: same setup, prove within 0.5%,
-# peak RSS within 2%. It stays available as `TARGETS="... combined"` when an
-# independent second reading of prove time is wanted — that is what it is for.
+# deploys. It stays available as `TARGETS="... combined"` when an independent
+# second reading of prove time is wanted — that is what it is for.
 #
 # Only `signer` reports a `sign` row, and that is the point. In production nobody
 # produces t signatures: each member signs ONCE per round on its own machine and
@@ -231,10 +230,10 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
 # Phases are carried under their OWN names — `sign_*`, `prove_*`, `verify_*` —
 # and a target simply leaves blank the ones it does not have. They used to share
 # two positional slots, `work_*` for the primary phase and `work2_*` for the
-# secondary one, which meant the same column held prove for one target and verify
-# for another, and sign (1220 ms) for one target and verify (32 ms) for the next.
-# summary.txt relabelled them per target, so it read correctly; summary.csv did
-# not, so anyone plotting a column got two different quantities on one axis.
+# secondary one, which meant the same column held different phases for different
+# targets. summary.txt relabelled them per target, so it read correctly;
+# summary.csv did not, so anyone plotting a column got two different quantities
+# on one axis.
 #
 # `setup_ms` is the leanVM circuit and ONLY that; `keygen_ms` is the N-key
 # generation every path pays, `raw_agg` included; `slot_state_ms` is the N durable
@@ -446,9 +445,8 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
   fi
 }
 
-# Per-target run counts: `prover` costs ~30 s a run while `signer` costs under a
-# second, so one global RUNS either wastes an hour or under-samples the cheap
-# targets. RUNS_<target> overrides; RUNS is the default.
+# Per-target run counts accommodate roles with different run costs without
+# forcing one global sample count. RUNS_<target> overrides; RUNS is the default.
 if [ "$INTERLEAVE" = 1 ]; then
   # Round-robin. Targets have different schedule lengths, so each one is stepped
   # only while it still has runs left; the longest simply finishes alone at the
@@ -700,9 +698,8 @@ label() {
   echo "    and what a relying party pays to check it. So the signer row applies"
   echo "    unchanged to the SNARK and the raw path alike."
 
-  # Derived from THIS sweep, never remembered. This block used to print figures
-  # from an older run (406 ms at t=70, 718 ms at t=128) as if they were results,
-  # which then contradicted the table a few lines above it in the same file.
+  # Derived from THIS sweep, never remembered. Keeping historical figures here
+  # would make them look like results of the current run.
   t_param="$(sed -n 's/^pub const T: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
   pv_raw="$(col prover "$C_PROVE_MED")"
   [ -n "$pv_raw" ] || pv_raw="$(col combined "$C_PROVE_MED")"

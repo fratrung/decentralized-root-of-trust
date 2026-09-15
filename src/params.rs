@@ -12,9 +12,6 @@ pub const SLOT: u32 = 43;
 pub const N_MEMBERS: usize = 200;
 
 /// Threshold `t`: minimum number of distinct committee members per update.
-///
-/// The proving trace pads to a power of two, so `t = 5..=8` all cost the same.
-/// Prove cost is a step function at small `t`, linear from a few dozen upward.
 pub const T: usize = 128;
 
 /// Number of sequential updates the demo performs.
@@ -28,7 +25,7 @@ pub const N_UPDATES: usize = 20;
 /// usable slot is `SLOT + KEY_SLOTS`, **inclusive**.
 pub const KEY_SLOTS: u32 = 64;
 
-/// The same window as the slot *count* `xmss_key_gen` takes since leanVM v0.9.
+/// The same window as the slot *count* this crate's `xmss_key_gen` adapter takes.
 ///
 /// The `+ 1` lives here and nowhere else: a copy at each keygen call site is a
 /// second place to get it wrong, and a window one slot short surfaces only when
@@ -40,7 +37,7 @@ pub const KEY_SLOT_COUNT: u64 = KEY_SLOTS as u64 + 1;
 // sign two different messages at one XMSS slot while the demo prints
 // `security OK: true`. `main.rs` and `prover.rs` sign by plain arithmetic on these
 // constants rather than through `AtomicSlotCounter`, so nothing at runtime would
-// catch it. Derandomized signing does not help: the two messages differ.
+// catch it. Signing randomness does not help: any reuse of an XMSS slot is unsafe.
 const _: () = assert!(
     N_UPDATES < KEY_SLOTS as usize,
     "N_UPDATES must be < KEY_SLOTS: the two security-test forgeries consume the \

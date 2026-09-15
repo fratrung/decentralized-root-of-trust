@@ -157,9 +157,8 @@ pub fn sign_window() -> Duration {
 /// How long a holder waits for its credential.
 ///
 /// Generous, because on the SNARK path this covers the aggregator's one-time
-/// `setup_prover()` and the proof itself, which are seconds and not
-/// milliseconds. That asymmetry is the point of the comparison, so the timeout
-/// must not be what ends the run.
+/// `setup_prover()` and the proof itself. The timeout must not be what ends the
+/// run.
 pub fn request_timeout() -> Duration {
     Duration::from_secs(env_u64("VC_TIMEOUT_S", 900))
 }

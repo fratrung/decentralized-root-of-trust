@@ -15,11 +15,8 @@
 //!   5. a version with no slot under the anchor panics instead of proving something
 //!      unverifiable.
 //!
-//! ## Cost
-//!
-//! ONE aggregation plus `setup_prover()`: a few seconds. Everything after the first
-//! record re-uses it, because every negative case here is about a *binding*: the
-//! proof stays valid and the thing around it changes.
+//! One aggregation is reused by every negative case here because each is about a
+//! *binding*: the proof stays valid and the thing around it changes.
 //!
 //! One `#[test]`, for the same reason as `tests/snark_path.rs`: leanVM's arena has a
 //! single shared region per process and `setup_prover`'s contract is "never generate
@@ -34,16 +31,18 @@
 //! `verifier_node.rs` (7). Exactly one `(member, slot)` pair is spent per member:
 //! members 0, 1 and 2 sign round 0 at slot 100, once.
 
+use decentralized_root_of_trust::crypto::{
+    XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign,
+};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
-use lean_multisig::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign};
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
-/// Last usable slot, inclusive; `WINDOW + 1` is the count leanVM v0.9 takes.
+/// Last usable slot, inclusive; `WINDOW + 1` is the adapter's count.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this is the deployed configuration.
 const LOG_INV_RATE: usize = 2;
@@ -101,12 +100,16 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     // the assertion the module exists for: nothing in the call gave it a slot, so if
     // it ever started taking one from a caller instead, this is what would catch it.
     let inner = honest.proof().expect("the aggregate decodes");
+    let [(proof_slot, _, _)] = inner.xmss_signers() else {
+        panic!("the protocol proof must carry exactly one XMSS group");
+    };
+    assert!(inner.sphincs_signers().is_empty());
     assert_eq!(
-        inner.info.core.slot,
+        *proof_slot,
         committee.slot_for(version).expect("slot in window"),
         "the prover module did not sign at the slot the anchor assigns to this version"
     );
-    assert_eq!(inner.info.core.slot, slot);
+    assert_eq!(*proof_slot, slot);
 
     // (2) The verifier module accepts it, and its anchor is the one it was given.
     let verifier = PQSNARKVerifierModule::new(committee.clone(), version);

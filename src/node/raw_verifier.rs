@@ -6,13 +6,13 @@
 //! distinct members sign *this* list at *this* version", and the threshold is
 //! part of it.
 //!
-//! Neither needs `setup_verifier()`, the aggregation bytecode, or a gigabyte of
-//! resident state. That is the honest comparison against
+//! Neither needs `setup_verifier()` or the aggregation bytecode. That is the
+//! honest structural comparison against
 //! [`crate::node::snark_verifier::PQSNARKVerifierModule`]: `t` independent
-//! Poseidon2 verifications, linear in `t` where the SNARK is constant, on a
-//! verifier far too small to hold the circuit.
+//! BLAKE2s-XMSS verifications, linear in `t`, versus one aggregate-proof
+//! verification on the SNARK path.
 
-use lean_multisig::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSignature, xmss_verify};
+use crate::crypto::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSignature, xmss_verify};
 
 use crate::protocol::committee::Committee;
 use crate::protocol::status_list::StatusList;
@@ -132,8 +132,8 @@ impl VerifierNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{XmssSecretKey, xmss_key_gen_from_seed, xmss_sign};
     use crate::protocol::status_list::{Algorithms, hash_any};
-    use lean_multisig::{XmssSecretKey, xmss_key_gen_from_seed, xmss_sign};
 
     /// Deliberately not a multiple of 8, so the bitmap's sentinel does not land on
     /// a byte boundary and the encoding is exercised where it is easiest to break.
@@ -145,9 +145,8 @@ mod tests {
     ///
     /// Nearly every test here signs round 0, so without a namespace one secret key
     /// would sign slot `GENESIS` a dozen times per `cargo test` over *different*
-    /// messages: the case that destroys an XMSS key. (v0.9 derandomized signing
-    /// makes a repeated slot with the *same* message harmless; two messages are as
-    /// fatal as ever.)
+    /// messages: one of the cases that destroys an XMSS key. v0.10 randomizes
+    /// signatures, so even repeating the same message at one slot is unsafe.
     ///
     /// The namespace must live in the **seed**. leanVM derives the one-time key as
     /// `gen_wots_secret_key(seed, slot, gen_public_param(seed))`: both arguments
@@ -168,7 +167,7 @@ mod tests {
         s
     }
 
-    /// `GENESIS..=GENESIS + 8`, as the slot *count* leanVM v0.9 takes.
+    /// `GENESIS..=GENESIS + 8`, through this crate's count-based adapter.
     const WINDOW: u64 = 9;
 
     fn keypair(ns: u8, member: u8) -> (XmssSecretKey, XmssPublicKey) {

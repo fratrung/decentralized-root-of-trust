@@ -18,8 +18,6 @@ publish = false
 [dependencies]
 decentralized-root-of-trust = { path = ".." }
 
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
-
 # Same wire discipline as the protocol objects: every message on the network has
 # exactly one encoding, and a decoder that refuses everything else.
 ssz = { package = "ethereum_ssz", version = "0.10.4" }

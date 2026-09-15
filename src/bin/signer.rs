@@ -13,22 +13,18 @@
 //! message, same derived slot), so what separates them is only how the quorum is
 //! evidenced and what a relying party pays to check it.
 //!
-//! It is also the cheapest role by a wide margin: a signer holds one key and one
-//! counter, and its resident memory is measured in megabytes where the
-//! aggregator's is measured in gigabytes.
-//!
 //! Usage: cargo run --release --bin signer          (always --release)
 
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::crypto::{SIGNATURE_SSZ_LEN, xmss_key_gen, xmss_verify};
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::params::{KEY_SLOT_COUNT, KEY_SLOTS, N_UPDATES, SLOT};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, hash_any};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
-use lean_multisig::{xmss_key_gen, xmss_verify};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -111,14 +107,14 @@ fn main() {
             version,
             slot,
             sign_time,
-            lean_multisig::SIGNATURE_SSZ_LEN,
+            SIGNATURE_SSZ_LEN,
             rss
         );
         if emit_samples {
             println!(
                 "SAMPLE target=signer idx={i} sign_ms={:.3} bytes={} rss_mb={rss}",
                 ms(sign_time),
-                lean_multisig::SIGNATURE_SSZ_LEN
+                SIGNATURE_SSZ_LEN
             );
         }
         sign_ms.push(ms(sign_time));
@@ -131,10 +127,7 @@ fn main() {
     println!("slot state (1 counter) : {slot_state_time:.2?}   (durable, fsync'd)");
     println!("--- per round (one member): min / median / max ---");
     println!("sign     : {sg_min:.2} / {sg_med:.2} / {sg_max:.2} ms   (incl. durable slot burn)");
-    println!(
-        "signature size         : {} B",
-        lean_multisig::SIGNATURE_SSZ_LEN
-    );
+    println!("signature size         : {} B", SIGNATURE_SSZ_LEN);
     println!("\nRAM (signer process)");
     println!("baseline (pre-keygen)  : {rss_baseline} MB");
     println!("after keygen (resident): {rss_after_keygen} MB");
@@ -153,7 +146,7 @@ fn main() {
         sign.mean(),
         sign.stddev(),
         sign.sum(),
-        lean_multisig::SIGNATURE_SSZ_LEN,
+        SIGNATURE_SSZ_LEN,
         peak_rss_mb(),
     );
 

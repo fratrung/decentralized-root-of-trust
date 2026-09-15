@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use lean_multisig::XmssPublicKey;
+use crate::crypto::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 use ssz::Encode as _;
 
@@ -192,7 +192,7 @@ impl AtomicSlotCounter {
     /// keyed to the *public* key (that is what the anchor names a member by), and
     /// a public key carries no slot window: it is a Merkle root, identical in
     /// shape whatever range it covers. (The secret key does know, via
-    /// `XmssSecretKey::activation_slots()`, but the holder of a secret key is the
+    /// `XmssSecretKey::epoch_range()`, but the holder of a secret key is the
     /// signer, not whoever opens the counter file.)
     ///
     /// A missing, truncated, or foreign state file is an error, never a fresh
@@ -239,9 +239,8 @@ impl AtomicSlotCounter {
 
     /// Burns `batch` slots per fsync instead of one.
     ///
-    /// An fsync costs milliseconds on an SSD and considerably more on the SD card
-    /// of an embedded controller, so paying one per signature can dominate
-    /// signing. Reserving a window amortises it; the cost is that an unclean
+    /// Paying one fsync per signature can dominate signing on durable storage.
+    /// Reserving a window amortises it; the cost is that an unclean
     /// shutdown discards the unused remainder of that window. That is the harmless
     /// direction (slots are skipped, never reused), so the only real budget is
     /// how much of the `2^32` window you are willing to waste per crash.
@@ -331,7 +330,7 @@ impl AtomicSlotCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lean_multisig::{XmssSecretKey, xmss_key_gen_from_seed};
+    use crate::crypto::{XmssSecretKey, xmss_key_gen_from_seed};
 
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("slotctr-{name}-{}", std::process::id()));
@@ -345,9 +344,8 @@ mod tests {
         p
     }
 
-    /// Slots 100..=140, 41 of them. leanVM v0.9 takes an activation slot and a
-    /// count where the old API took an inclusive pair, so the `+ 1` is explicit
-    /// here rather than hidden in the callee.
+    /// Slots 100..=140, 41 of them. The local adapter takes an activation slot and
+    /// a count, so the `+ 1` is explicit here rather than hidden in the callee.
     fn key(seed: u8) -> (XmssSecretKey, XmssPublicKey) {
         let (pk, sk) = xmss_key_gen_from_seed([seed; 32], 100, 41).expect("keygen");
         (sk, pk)

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 878" width="680" height="878" role="img" aria-label="Architecture of the committee-controlled status list, showing the signer nodes, the derived slot, and the two verification paths: raw signatures with a signer bitmap, and one aggregated SNARK proof.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 878" width="680" height="878" role="img" aria-label="Architecture of the committee-controlled status list after the leanVM v0.10 migration, showing BLAKE2s domain-separated messages, signer nodes, the derived slot, and the raw and SNARK verification paths.">
   <rect x="0" y="0" width="680" height="878" fill="#ffffff"/>
 
   <text x="340" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#0f172a">Decentralized Root of Trust — committee status list</text>
@@ -17,7 +17,7 @@
   <rect x="530" y="84" width="104" height="38" rx="7" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
   <text x="582" y="108" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#0f172a">M(N−1)</text>
 
-  <text x="340" y="143" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#475569">each holds an XMSS key + a durable slot counter</text>
+  <text x="340" y="143" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#475569">each holds a BLAKE2s-XMSS key + a durable slot counter</text>
   <text x="340" y="160" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#475569">the slot is burned on disk before the key touches it</text>
 
   <line x1="340" y1="168" x2="340" y2="186" stroke="#94a3b8" stroke-width="1.8"/>
@@ -25,15 +25,15 @@
 
   <!-- ============ DERIVATION ============ -->
   <rect x="86" y="196" width="508" height="88" rx="10" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
-  <text x="340" y="222" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#1e1b4b">message = status_list_message(domain, list, version)</text>
-  <text x="340" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#1e1b4b">slot = genesis_slot + version</text>
-  <text x="340" y="270" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4338ca">derived from the anchor — never negotiated</text>
+  <text x="340" y="219" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.7" fill="#1e1b4b">domain = BLAKE2s(ctx, format_LE, alg=1, SHA3(anchor))</text>
+  <text x="340" y="243" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.7" fill="#1e1b4b">message = BLAKE2s(ctx, domain, version_LE, len_LE, entries)</text>
+  <text x="340" y="267" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#4338ca">slot = genesis_slot + version — never negotiated</text>
 
   <line x1="340" y1="284" x2="340" y2="302" stroke="#94a3b8" stroke-width="1.8"/>
   <path d="M 340 310 L 335 300 L 345 300 Z" fill="#94a3b8"/>
 
   <rect x="180" y="312" width="320" height="32" rx="16" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.2"/>
-  <text x="340" y="333" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#0f172a">t signatures — one shared slot</text>
+  <text x="340" y="333" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#0f172a">t signatures — one shared message + slot</text>
 
   <path d="M 300 344 L 180 368" stroke="#94a3b8" stroke-width="1.8" fill="none"/>
   <path d="M 174 371 L 184 364 L 186 373 Z" fill="#94a3b8"/>
@@ -49,7 +49,7 @@
   <text x="46" y="453" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#134e4a">SSZ BitList — ceil((N + 1)/8) = 26 B</text>
   <text x="46" y="473" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#134e4a">+ the t raw XMSS signatures</text>
   <line x1="46" y1="486" x2="314" y2="486" stroke="#99f6e4" stroke-width="1.2"/>
-  <text x="46" y="506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">≈ 155 KB on the wire (t=128)</text>
+  <text x="46" y="506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">1,208 B × t + bitmap + payload</text>
   <text x="46" y="527" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#134e4a">no prover, no circuit, no setup</text>
 
   <!-- ============ RIGHT: SNARK ============ -->
@@ -58,11 +58,11 @@
   <text x="500" y="414" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#4c1d95">SnarkStatusList</text>
 
   <rect x="350" y="430" width="300" height="112" rx="9" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1.4"/>
-  <text x="366" y="453" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">one aggregated proof</text>
-  <text x="366" y="473" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">(leanVM — WHIR + sumcheck)</text>
+  <text x="366" y="453" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">one leanVM v0.10 aggregate</text>
+  <text x="366" y="473" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">exactly 1 XMSS group · no SPHINCS</text>
   <line x1="366" y1="486" x2="634" y2="486" stroke="#e9d5ff" stroke-width="1.2"/>
-  <text x="366" y="506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#6d28d9">≈ 234 KB on the wire</text>
-  <text x="366" y="527" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">prover: 670 ms · 2.0 GB RAM</text>
+  <text x="366" y="506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#6d28d9">aggregate serialized by leanVM</text>
+  <text x="366" y="527" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" fill="#4c1d95">BLAKE2s · binary-field VM</text>
 
   <line x1="180" y1="542" x2="180" y2="560" stroke="#94a3b8" stroke-width="1.8"/>
   <path d="M 180 568 L 175 558 L 185 558 Z" fill="#94a3b8"/>
@@ -85,15 +85,15 @@
   <text x="46" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">quorum ≥ t · bound message + slot</text>
   <text x="46" y="717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">t × xmss_verify</text>
   <line x1="46" y1="729" x2="314" y2="729" stroke="#99f6e4" stroke-width="1.2"/>
-  <text x="46" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">54 ms · 4 MB · no setup</text>
+  <text x="46" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">direct XMSS checks · no VM setup</text>
 
   <rect x="350" y="638" width="300" height="126" rx="9" fill="#faf5ff" stroke="#8b5cf6" stroke-width="1.6"/>
   <text x="366" y="660" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#6d28d9">PQSNARKVerifierModule::verify</text>
-  <text x="366" y="681" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">pubkeys ∈ anchor committee</text>
-  <text x="366" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">quorum ≥ t · bound message + slot</text>
-  <text x="366" y="717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">1 SNARK verification</text>
+  <text x="366" y="681" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">exactly 1 XMSS group · no SPHINCS</text>
+  <text x="366" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">pubkeys ∈ anchor · quorum ≥ t</text>
+  <text x="366" y="717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#4c1d95">bound message + slot · agg.verify()</text>
   <line x1="366" y1="729" x2="634" y2="729" stroke="#e9d5ff" stroke-width="1.2"/>
-  <text x="366" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#6d28d9">37 ms · 693 MB · 5.0 s setup</text>
+  <text x="366" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#6d28d9">verification-only VM setup</text>
 
   <line x1="340" y1="764" x2="340" y2="782" stroke="#94a3b8" stroke-width="1.8"/>
   <path d="M 340 790 L 335 780 L 345 780 Z" fill="#94a3b8"/>

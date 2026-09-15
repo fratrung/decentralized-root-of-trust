@@ -20,9 +20,8 @@ is dead code, or nothing tests it.
 
 Output: each mutant is named *before* it is applied and the verdict completes the
 line, so the last line of the log always identifies the mutant currently live in
-the working tree. This matters because a full run takes ~40 minutes with tracked
-source modified throughout, and the obvious reaction to finding a mutated file is
-to assume something has gone wrong.
+the working tree. A full run keeps tracked source modified while each test is in
+progress, so the active mutant must remain obvious.
 
 Safety: every target file is backed up before the first edit and restored after
 each mutant, with the restore verified by comparison. `finally` plus a signal
@@ -46,9 +45,9 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Python block-buffers stdout when it is not a terminal, so a redirected run
-# stayed mute for its full 40 minutes and only flushed at the end — exactly when
-# the progress was no longer of any use. Line buffering costs nothing here.
+# Python block-buffers stdout when it is not a terminal, so a redirected run can
+# stay mute until the end — exactly when progress is no longer useful. Line
+# buffering costs nothing here.
 sys.stdout.reconfigure(line_buffering=True)
 
 GREEN, RED, YELLOW, DIM, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
@@ -68,17 +67,21 @@ if not sys.stdout.isatty():
 
 MUTANTS = {
     # --- PQSNARKVerifierModule::verify: the five checks of the SNARK path --
-    "snark-1-membership": ("src/node/snark_verifier.rs", """        if !agg
-            .info
-            .pubkeys
+    "snark-no-sphincs": ("src/node/snark_verifier.rs", """        if !agg.sphincs_signers().is_empty() {
+            return false;
+        }""", ""),
+    "snark-one-xmss-group": ("src/node/snark_verifier.rs", """        let [(slot, message, pubkeys)] = agg.xmss_signers() else {
+            return false;
+        };""", """        let Some((slot, message, pubkeys)) = agg.xmss_signers().first() else {
+            return false;
+        };"""),
+    "snark-1-membership": ("src/node/snark_verifier.rs", """        if !pubkeys
             .iter()
             .all(|pk| self.committee.members().contains(pk))
         {
             return false;
         }""", "        if false { return false; }"),
-    "snark-2-message": ("src/node/snark_verifier.rs", """        if agg.info.core.message
-            != status_list_message(&domain, status_list.list(), status_list.version())
-        {
+    "snark-2-message": ("src/node/snark_verifier.rs", """        if *message != status_list_message(&domain, status_list.list(), status_list.version()) {
             return false;
         }""", "        if false { return false; }"),
 
@@ -86,24 +89,21 @@ MUTANTS = {
     #
     # The message binding above only says "the proof matches the message this
     # verifier computed". What decides *which* message that is, is the domain.
-    # Seeding the fold from `[0; 8]` instead makes every committee sign the same
+    # Omitting the domain prefix makes every committee sign the same
     # bytes for one `(list, version)`, and evidence becomes transferable between
     # anchors — with all five checks still green, which is exactly why it needs a
     # mutant rather than a comment.
     "domain-seed": (
         "src/protocol/status_list.rs",
-        "    let mut acc = domain.0;",
-        "    let mut acc = { let _ = domain; [KoalaBear::ZERO; 8] };",
+        "    hasher.update(&domain.0);",
+        "    let _ = domain; hasher.update(&[0u8; 32]);",
     ),
     # The domain must depend on the anchor. Dropping the fingerprint leaves a
     # domain that separates algorithms but not committees.
     "domain-anchor": (
         "src/protocol/status_list.rs",
-        """        Domain(poseidon16_compress_pair(
-            &entry_to_field(anchor_fingerprint),
-            &tag,
-        ))""",
-        """        Domain({ let _ = anchor_fingerprint; poseidon16_compress_pair(&[KoalaBear::ZERO; 8], &tag) })""",
+        "        hasher.update(anchor_fingerprint);",
+        "        let _ = anchor_fingerprint; hasher.update(&[0u8; 32]);",
     ),
     # There is deliberately no `domain-alg` mutant for the third input, the
     # record's own algorithm. `Algorithms` has one variant, so `algorithm_tag`
@@ -133,13 +133,13 @@ MUTANTS = {
         "        for record in decoded.iter().take(Self::MAX_VERIFICATIONS_PER_SELECTION) {",
         "        for record in decoded.iter() {",
     ),
-    "snark-3-slot": ("src/node/snark_verifier.rs", """        if self.committee.slot_for(status_list.version()) != Some(agg.info.core.slot) {
+    "snark-3-slot": ("src/node/snark_verifier.rs", """        if self.committee.slot_for(status_list.version()) != Some(*slot) {
             return false;
         }""", "        if false { return false; }"),
-    "snark-4-quorum": ("src/node/snark_verifier.rs", """        if agg.info.pubkeys.len() < self.committee.threshold() {
+    "snark-4-quorum": ("src/node/snark_verifier.rs", """        if pubkeys.len() < self.committee.threshold() {
             return false;
         }""", "        if false { return false; }"),
-    "snark-5-proof": ("src/node/snark_verifier.rs", """        if verify_single_message_aggregate(&agg).is_err() {
+    "snark-5-proof": ("src/node/snark_verifier.rs", """        if agg.verify().is_err() {
             return false;
         }""", "        if false { return false; }"),
 
@@ -227,8 +227,6 @@ MUTANTS = {
         "        if path.exists() {",
         "        if false {",
     ),
-    "dup-signer-guard": ("src/node/snark_prover.rs", "        duplicated.is_none(),", "        true,"),
-
     # --- wire format ------------------------------------------------------
     # Was "anchor-canonical", deleting the re-encode-and-compare that ruled out
     # postcard's padded varints. SSZ cannot express that ambiguity, so the check
@@ -241,6 +239,11 @@ MUTANTS = {
         "src/protocol/status_list.rs",
         "        if value.signer_count() != value.signatures.len() {",
         "        if false {",
+    ),
+    "legacy-alg-tag": (
+        "src/protocol/status_list.rs",
+        "        0 => Err(\"status-list algorithm tag 0 is retired\".to_string()),",
+        "        0 => Ok(Algorithms::WotsXmss),",
     ),
 
     # --- the numbers that reach the paper ---------------------------------

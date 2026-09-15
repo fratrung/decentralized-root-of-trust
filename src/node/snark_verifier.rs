@@ -3,7 +3,7 @@
 //! Constructing the module initializes leanVM verification. Freshness stays
 //! outside this pure predicate in [`crate::state::freshness`].
 
-use lean_multisig::{setup_verifier, verify_single_message_aggregate};
+use crate::crypto::setup_verifier;
 
 use crate::protocol::committee::Committee;
 use crate::protocol::status_list::{SnarkStatusList, status_list_message};
@@ -34,10 +34,19 @@ impl PQSNARKVerifierModule {
             Err(_) => return false,
         };
 
+        // v0.10 aggregates a general collection of XMSS epoch/message groups
+        // and SPHINCS claims. This protocol accepts exactly one XMSS group and
+        // no other signature family; accepting a broader statement here would
+        // silently change what the five checks below mean.
+        if !agg.sphincs_signers().is_empty() {
+            return false;
+        }
+        let [(slot, message, pubkeys)] = agg.xmss_signers() else {
+            return false;
+        };
+
         // 1) every signer must belong to the committee
-        if !agg
-            .info
-            .pubkeys
+        if !pubkeys
             .iter()
             .all(|pk| self.committee.members().contains(pk))
         {
@@ -52,9 +61,7 @@ impl PQSNARKVerifierModule {
         //    the record's own `alg`, so relabelling it changes the message the
         //    proof would have to match.
         let domain = self.committee.domain(status_list.alg);
-        if agg.info.core.message
-            != status_list_message(&domain, status_list.list(), status_list.version())
-        {
+        if *message != status_list_message(&domain, status_list.list(), status_list.version()) {
             return false;
         }
 
@@ -62,18 +69,18 @@ impl PQSNARKVerifierModule {
         //    is already authenticated inside every signature, so this adds no
         //    integrity; it pins the *policy*: one slot per round, derived rather
         //    than chosen. Without it a quorum re-signs a version at will.
-        if self.committee.slot_for(status_list.version()) != Some(agg.info.core.slot) {
+        if self.committee.slot_for(status_list.version()) != Some(*slot) {
             return false;
         }
 
         // 4) quorum: at least `t` signers. Distinctness is free: leanVM requires
         //    `pubkeys` strictly sorted with no duplicates.
-        if agg.info.pubkeys.len() < self.committee.threshold() {
+        if pubkeys.len() < self.committee.threshold() {
             return false;
         }
 
         // 5) the SNARK aggregate itself must verify
-        if verify_single_message_aggregate(&agg).is_err() {
+        if agg.verify().is_err() {
             return false;
         }
         true

@@ -6,8 +6,8 @@
 
 use std::fmt;
 
-use backend::*;
-use lean_multisig::{SingleMessageAggregateSignature, XmssSignature};
+use crate::crypto::{SingleMessageAggregateSignature, XmssSignature};
+use leanvm_primitives::hash::Hasher as Blake2s256;
 use sha3::{Digest, Sha3_256};
 use ssz::{BitList, Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
@@ -52,13 +52,16 @@ struct SnarkStatusListWire {
 
 fn algorithm_tag(alg: Algorithms) -> u8 {
     match alg {
-        Algorithms::WotsXmss => 0,
+        // Tag 0 named the incompatible v0.9 construction. Never reinterpret an
+        // old record as BLAKE2s merely because its SSZ shape fits.
+        Algorithms::WotsXmss => 1,
     }
 }
 
 fn algorithm_from_tag(tag: u8) -> Result<Algorithms, String> {
     match tag {
-        0 => Ok(Algorithms::WotsXmss),
+        1 => Ok(Algorithms::WotsXmss),
+        0 => Err("status-list algorithm tag 0 is retired".to_string()),
         _ => Err(format!("unknown status-list algorithm tag {tag}")),
     }
 }
@@ -71,24 +74,15 @@ pub fn hash_any(data: impl AsRef<[u8]>) -> [u8; 32] {
     out
 }
 
-/// Maps an entry to `[KoalaBear; 8]`; each input byte is already canonical.
-pub fn entry_to_field(entry: &[u8; 32]) -> [KoalaBear; 8] {
-    let mut lo = [KoalaBear::ZERO; 16];
-    let mut hi = [KoalaBear::ZERO; 16];
-    for i in 0..16 {
-        lo[i] = KoalaBear::from_u32(u32::from(entry[i]));
-        hi[i] = KoalaBear::from_u32(u32::from(entry[16 + i]));
-    }
-    poseidon16_compress_pair(&poseidon16_compress(lo), &poseidon16_compress(hi))
-}
-
 /// Generation of the signed-message construction.
 ///
 /// It is **not** the wire schema's version — the SSZ containers are unchanged by
 /// it. It is the epoch of what a signature *means*. Bumping it makes every
 /// previously signed message stop verifying, which is the intended effect when
 /// the construction below changes shape.
-const MESSAGE_FORMAT: u32 = 1;
+const MESSAGE_FORMAT: u32 = 2;
+const DOMAIN_CONTEXT: &[u8] = b"decentralized-root-of-trust/status-list-domain";
+const MESSAGE_CONTEXT: &[u8] = b"decentralized-root-of-trust/status-list-message";
 
 /// The trust domain a signed message belongs to.
 ///
@@ -99,8 +93,8 @@ const MESSAGE_FORMAT: u32 = 1;
 /// same version, same derived slot, all five checks green. One anchor could
 /// therefore govern exactly one list, and nothing in the code said so.
 ///
-/// The domain closes that by starting the fold from a committee-specific IV
-/// instead of `[0; 8]`. It binds three things:
+/// The domain closes that by prefixing the BLAKE2s message with a
+/// committee-specific digest. It binds three things:
 ///
 /// - the **anchor**, through a fingerprint of its canonical encoding, so every
 ///   member key, `t` and the genesis slot are all covered. A different committee
@@ -113,17 +107,15 @@ const MESSAGE_FORMAT: u32 = 1;
 ///   second one exists, and by then the format would be frozen;
 /// - the **construction generation** ([`MESSAGE_FORMAT`]).
 ///
-/// Prefixed, not appended, and that is the part worth keeping: a Merkle–Damgård
-/// chain that starts from a shared IV lets every domain share its intermediate
-/// states, so one internal collision found against attacker-chosen entries would
-/// be reusable across all of them. Starting from a domain-specific IV means two
-/// domains have no common prefix to attack.
+/// Prefixed, not appended, and that is the part worth keeping: two domains have
+/// no shared application-message prefix. Fixed context strings separate the
+/// domain hash from the signed-message hash.
 ///
 /// It is unforgeable by construction rather than checked: there is no way to
 /// compute a message without naming a domain, because [`status_list_message`]
 /// takes one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Domain([KoalaBear; 8]);
+pub struct Domain([u8; 32]);
 
 impl Domain {
     /// Builds the domain from a fingerprint of the anchor's canonical encoding.
@@ -133,43 +125,31 @@ impl Domain {
     /// it owns `slot_for`, and a second place to compute either is a second place
     /// to drift.
     pub fn new(anchor_fingerprint: &[u8; 32], alg: Algorithms) -> Self {
-        let mut tag = [KoalaBear::ZERO; 8];
-        tag[0] = KoalaBear::from_u32(MESSAGE_FORMAT);
-        tag[1] = KoalaBear::from_u32(u32::from(algorithm_tag(alg)));
-        Domain(poseidon16_compress_pair(
-            &entry_to_field(anchor_fingerprint),
-            &tag,
-        ))
+        let mut hasher = Blake2s256::new();
+        hasher.update(DOMAIN_CONTEXT);
+        hasher.update(&MESSAGE_FORMAT.to_le_bytes());
+        hasher.update(&[algorithm_tag(alg)]);
+        hasher.update(anchor_fingerprint);
+        Domain(hasher.finalize())
     }
 }
 
-/// Folds the entries and version into a Poseidon2 root, under `domain`.
+/// Hashes the complete, unambiguous status-list statement with BLAKE2s-256.
 ///
-/// The version is split into 16-bit limbs to avoid field aliasing, binding the
-/// cleartext version to the signed list.
-pub fn status_list_root_fe(domain: &Domain, list: &[[u8; 32]], version: u32) -> [KoalaBear; 8] {
-    let mut acc = domain.0;
-    for e in list {
-        acc = poseidon16_compress_pair(&acc, &entry_to_field(e));
-    }
-    let mut ver = [KoalaBear::ZERO; 8];
-    ver[0] = KoalaBear::from_u32(version & 0xFFFF);
-    ver[1] = KoalaBear::from_u32(version >> 16);
-    poseidon16_compress_pair(&acc, &ver)
-}
-
-/// Canonically packs the root into the 32-byte message signed by XMSS.
-///
-/// Each limb is its canonical little-endian `u32`, making the packing injective.
+/// The domain comes first. Fixed-width little-endian integers and the explicit
+/// entry count make the preimage prefix-free; every entry is already exactly 32
+/// bytes. The list is deliberately order-sensitive and is streamed without a
+/// heap allocation.
 pub fn status_list_message(domain: &Domain, list: &[[u8; 32]], version: u32) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (chunk, fe) in out
-        .chunks_exact_mut(4)
-        .zip(status_list_root_fe(domain, list, version))
-    {
-        chunk.copy_from_slice(&fe.as_canonical_u32().to_le_bytes());
+    let mut hasher = Blake2s256::new();
+    hasher.update(MESSAGE_CONTEXT);
+    hasher.update(&domain.0);
+    hasher.update(&version.to_le_bytes());
+    hasher.update(&(list.len() as u64).to_le_bytes());
+    for entry in list {
+        hasher.update(entry);
     }
-    out
+    hasher.finalize()
 }
 
 /// The SNARK-attested form: one succinct proof in place of the `t` signatures.
@@ -217,7 +197,7 @@ impl SnarkStatusList {
     /// `setup_prover()` or `setup_verifier()` must have initialized the bytecode.
     pub fn proof(&self) -> Result<SingleMessageAggregateSignature, String> {
         let value = SingleMessageAggregateSignature::from_bytes(&self.zk_proof)
-            .ok_or("proof not deserializable")?;
+            .map_err(|e| format!("proof not deserializable: {e}"))?;
         if value.to_bytes() != self.zk_proof {
             return Err("proof is not canonically encoded".to_string());
         }
@@ -358,10 +338,9 @@ impl StatusList {
     ///
     /// Decodes the SSZ schema and rejects a bitmap whose population does not
     /// match the number of signatures, the one relation between two fields that
-    /// no schema can express. The signatures are decoded by leanVM's own
-    /// SSZ implementation, which fixes their length at 1208 bytes and refuses a
-    /// field element outside the modulus, so a non-canonical encoding cannot be
-    /// smuggled inside an otherwise canonical container.
+    /// no schema can express. The signatures are decoded by leanVM's own SSZ
+    /// implementation, which fixes their byte-oriented encoding at 1208 bytes,
+    /// so a second spelling cannot be smuggled inside the container.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let value = RawStatusListWire::from_ssz_bytes(bytes)
             .map_err(|e| format!("raw status list is not valid SSZ: {e:?}"))?;
@@ -393,7 +372,7 @@ fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
 impl fmt::Display for Algorithms {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Algorithms::WotsXmss => write!(f, "WOTS-XMSS"),
+            Algorithms::WotsXmss => write!(f, "WOTS-XMSS-BLAKE2s"),
         }
     }
 }
@@ -461,43 +440,59 @@ mod tests {
         vec![hash_any(b"vc-1"), hash_any(b"vc-2")]
     }
 
-    /// One fixed domain for the tests that are about the fold rather than about
+    /// One fixed domain for the tests that are about the message rather than about
     /// the domain. `domain_separation_is_a_prefix` is the one that varies it.
     fn dom() -> Domain {
         Domain::new(&[0x5A; 32], Algorithms::WotsXmss)
     }
 
-    /// The packing is the new seam between this crate's Poseidon2 fold and
-    /// leanVM's byte-oriented XMSS API, and every binding argument in the protocol
-    /// rests on it being injective. It cannot be tested exhaustively, so what is
-    /// pinned here is the property that makes it injective: each of the eight
-    /// 4-byte groups is a field element's *canonical* representative, and the map
-    /// from the eight elements to the 32 bytes is a bijection onto that set.
+    /// The framing is the seam between this crate and leanVM's BLAKE2s-based XMSS
+    /// API. Pin every byte in it: context, domain prefix, little-endian version,
+    /// little-endian entry count, then fixed-size entries in order.
     #[test]
-    fn the_message_is_the_canonical_packing_of_the_root() {
+    fn the_message_is_blake2s_of_the_framed_statement() {
         let list = entries();
-        let root = status_list_root_fe(&dom(), &list, 3);
-        let message = status_list_message(&dom(), &list, 3);
-
-        for (i, (chunk, fe)) in message.chunks_exact(4).zip(root).enumerate() {
-            let value = u32::from_le_bytes(chunk.try_into().expect("4 bytes"));
-            assert_eq!(value, fe.as_canonical_u32(), "limb {i} is not the element");
-            assert!(
-                value < KoalaBear::ORDER_U32,
-                "limb {i} is outside the field, so the packing is not canonical"
-            );
+        let domain = dom();
+        let mut expected = Blake2s256::new();
+        expected.update(MESSAGE_CONTEXT);
+        expected.update(&domain.0);
+        expected.update(&3u32.to_le_bytes());
+        expected.update(&2u64.to_le_bytes());
+        for entry in &list {
+            expected.update(entry);
         }
         assert_eq!(
-            message,
-            status_list_message(&dom(), &list, 3),
-            "the message must be a function of (list, version) alone"
+            status_list_message(&domain, &list, 3),
+            expected.finalize(),
+            "the signed-message framing changed"
+        );
+
+        // Independently generated with Python's hashlib.blake2s. This pins both
+        // the standard hash and the exact byte framing, instead of only comparing
+        // two calls through leanVM's Hasher implementation.
+        assert_eq!(
+            domain.0,
+            [
+                0xa3, 0xa6, 0x59, 0xa7, 0xaa, 0xef, 0xe0, 0x78, 0x84, 0x47, 0xa5, 0x92, 0x4b, 0xb3,
+                0xf5, 0x70, 0xf6, 0xa2, 0x75, 0x3c, 0xa0, 0xbd, 0x47, 0x10, 0xcb, 0xe3, 0xba, 0xa5,
+                0x2d, 0x81, 0xde, 0x2b,
+            ],
+            "the domain framing no longer matches standard BLAKE2s"
+        );
+        assert_eq!(
+            status_list_message(&domain, &list, 3),
+            [
+                0x3c, 0x9a, 0xa7, 0x58, 0x66, 0x34, 0x77, 0x39, 0xd8, 0x0d, 0x34, 0x8d, 0xb0, 0x87,
+                0xb7, 0xff, 0x53, 0x04, 0x83, 0x4e, 0xaf, 0x8d, 0xb8, 0x1c, 0x72, 0x42, 0xcc, 0xbb,
+                0x53, 0x38, 0x22, 0xf8,
+            ],
+            "the signed statement no longer matches standard BLAKE2s"
         );
     }
 
     /// Check 2 of both verification paths is "the proof is bound to THIS list and
     /// THIS version". That is only worth anything if the message actually moves
-    /// when either does: the packing must not collapse the distinction the fold
-    /// makes.
+    /// when either does: the framing and hash must not collapse the distinction.
     #[test]
     fn the_message_moves_with_both_the_list_and_the_version() {
         let list = entries();
@@ -522,8 +517,8 @@ mod tests {
             "an appended entry left the message unchanged"
         );
 
-        // The version is folded in as 16-bit limbs, so the high half has to reach
-        // the message too: a `u32 & 0xFFFF` truncation would alias these two.
+        // The complete little-endian u32 must reach the message: truncating to
+        // its low half would alias these two.
         assert_ne!(
             status_list_message(&dom(), &list, 1),
             status_list_message(&dom(), &list, 1 + (1 << 16)),
@@ -532,7 +527,7 @@ mod tests {
     }
 
     /// The property the domain exists for, and the one a "simplification" back to
-    /// a `[0; 8]` IV would silently undo.
+    /// a shared or omitted domain prefix would silently undo.
     ///
     /// Before the domain, a signed message was `(list, version)` and nothing more.
     /// Two status lists under one committee therefore had interchangeable records:
@@ -564,26 +559,40 @@ mod tests {
             "the domain must depend on the whole fingerprint, not a prefix of it"
         );
 
-        // And the domain really is the *start* of the chain, not something folded
-        // in at the end: the fold over an empty list already differs.
+        // And the domain really is a prefix: even an empty list differs.
         assert_ne!(
             status_list_message(&a, &[], 0),
             status_list_message(&b, &[], 0),
-            "the domain must seed the fold, not close it"
+            "the domain must prefix the statement"
         );
     }
 
-    /// A documented gap, pinned so it cannot change silently: the fold is
-    /// sequential, so one logical validity set has `n!` distinct roots. Sorting
-    /// inside the fold would fix it and would break the wire format, which is why
+    /// A documented gap, pinned so it cannot change silently: the encoding is
+    /// sequential, so one logical validity set has `n!` distinct messages. Sorting
+    /// before hashing would fix it and would break the protocol, which is why
     /// it has not been done; see AGENTS.md, "Known gaps in the model".
     #[test]
-    fn the_fold_is_order_sensitive() {
+    fn the_message_is_order_sensitive() {
         let list = entries();
         let reversed = vec![list[1], list[0]];
         assert_ne!(
             status_list_message(&dom(), &list, 0),
             status_list_message(&dom(), &reversed, 0)
         );
+    }
+
+    /// The SSZ container did not gain a version field during migration. The
+    /// algorithm tag is therefore the hard rejection boundary for persisted v0.9
+    /// records whose byte shape would otherwise still decode.
+    #[test]
+    fn the_retired_wire_tag_is_rejected() {
+        let current = SnarkStatusList::new(Algorithms::WotsXmss, entries(), 1, Vec::new());
+        let mut bytes = current.to_bytes();
+        assert_eq!(bytes[0], 1, "the v0.10 BLAKE2s tag must be on wire");
+        bytes[0] = 0;
+        let err = SnarkStatusList::from_bytes(&bytes)
+            .err()
+            .expect("the retired tag must not decode");
+        assert!(err.contains("tag 0 is retired"), "unexpected error: {err}");
     }
 }

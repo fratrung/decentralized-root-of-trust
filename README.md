@@ -47,9 +47,7 @@ evidence of quorum is **one constant-size object** rather than `t` signatures.
   the threshold `t`, and a genesis slot — and needs **no live data fetch**,
   no directory lookup, and no live status service to check an update.
 
-Both the aggregated form and the raw `t`-signature form are implemented and
-measured, so the trade-off is a number in this repository rather than an
-assertion.
+Both the aggregated form and the raw `t`-signature form are implemented.
 
 ## What it demonstrates
 
@@ -63,7 +61,7 @@ that tests it:
 | Evidence cannot be lifted from one *committee* onto another | the domain seeding the signed message ([Domain separation](#domain-separation-one-anchor-one-list)) |
 | A peer cannot choose how much verification work a node does | the selection budget in `accept_best` / `select_freshest_above` |
 | A stale but validly signed record cannot be replayed | the persistent anti-rollback gate in [`src/state/freshness.rs`](src/state/freshness.rs) |
-| Aggregation is worth its cost above some `t`, and is not below it | [Benchmark](#benchmark), which measures both forms on the same host |
+| Raw and aggregated costs can be compared without mixing roles | [Benchmark](#benchmark) |
 
 Two properties are treated as safety-critical rather than best-effort, because
 their failure modes are silent and unrecoverable:
@@ -78,10 +76,9 @@ their failure modes are silent and unrecoverable:
 
 ## What it is not
 
-A research prototype measured on one machine, not a deployment. Committee
-rotation is not implemented, and every number in [Benchmark](#benchmark) is
-host-specific — the binaries are built with `target-cpu=native`. The open gaps
-are listed in [`AGENTS.md`](AGENTS.md) rather than left for the reader to discover.
+A research prototype, not a deployment. Committee rotation is not implemented.
+The open gaps are listed in [`AGENTS.md`](AGENTS.md) rather than left for the
+reader to discover.
 
 ---
 
@@ -107,11 +104,14 @@ Editable source: [`docs/architecture.svg`](docs/architecture.svg).
   anchor does not.
 
 The evidence comes in two interchangeable forms, described in
-[Two published forms](#two-published-forms). Both are checked in five steps:
+[Two published forms](#two-published-forms). The SNARK form is first required to
+contain exactly one XMSS `(slot, message, pubkeys)` group and no SPHINCS claims;
+this prevents leanVM v0.10's more general aggregate language from widening the
+protocol. Both forms then follow the same five logical checks:
 
 1. every signer ∈ committee (membership);
 2. the evidence is bound to **this** committee, **this** list *and this version*
-   (`message == status_list_root(domain, list, version)`);
+   (`message == status_list_message(domain, list, version)`);
 3. the slot is the one the anchor assigns to this version
    (`slot == genesis_slot + version`);
 4. quorum reached (`#signers ≥ t`);
@@ -134,28 +134,24 @@ slots of its own choosing. See [Slot derivation](#slot-derivation).
 
 ## Signature scheme
 
-Signing uses **leanVM's own synchronized XMSS** (Poseidon2, `LOG_LIFETIME = 32`)
-— the scheme leanVM can aggregate. Since leanVM v0.9 its public API takes a raw
-32-byte message and embeds it into the eight field elements the WOTS encoding
-consumes; this project hands it `status_list_message`, the canonical packing of
-the Poseidon2 root described under [Two published forms](#two-published-forms).
+Signing uses **leanVM v0.10's synchronized XMSS over BLAKE2s-256** — the scheme
+the pinned VM aggregates. Its API signs a raw 32-byte message; this project hands
+it `status_list_message`, a BLAKE2s-256 digest of an explicitly framed domain,
+version, entry count and ordered list described under
+[Domain separation](#domain-separation-one-anchor-one-list).
 
 It is a *stateful* signature: a given `(key, slot)` must sign **at most once**, so
-each update uses a new slot. v0.9 narrowed what that protects without removing
-the rule. Signing is now derandomized — the randomness is derived from
-`(secret seed, slot, attempt, hashed message)` — so re-signing the *same* message
-at the same slot returns a bit-identical signature and is harmless. Two
-**different** messages at one slot still expose enough of the WOTS hash chains to
-forge, and that is the case the durable slot counter exists for. It cannot tell
-the two apart without keeping a history of every message it has signed, which is
-exactly the state a counter exists to avoid.
+each update uses a new slot. v0.10 draws fresh signature randomness, which makes
+even a retry of the **same** message at the same slot unsafe. The durable counter
+therefore refuses every reuse and burns the slot before signing.
 
-> Note: the standalone `leanSig` XMSS (Poseidon1, `LOG_LIFETIME = 18`)
-> is a **different, incompatible** parametrization and **cannot** be fed to
-> leanVM's aggregator. This project therefore signs with leanVM's XMSS only.
+Only the XMSS types re-exported by the pinned `leanvm` crate enter the protocol;
+the local `crypto` module is the single compatibility boundary around that API.
 
-A key is generated for a **window** — an activation slot and a slot count, or
-`SLOT..=SLOT + KEY_SLOTS` as this project states it — and the window is
+A key is generated for a **window** — the inclusive range
+`SLOT..=SLOT + KEY_SLOTS`. leanVM v0.10 accepts that inclusive pair; this
+project's compatibility module keeps the existing `(start, count)` contract and
+performs the checked conversion in one place. The window is
 baked into its identity: leaves outside it are pseudorandom fillers
 (`gen_random_node`) that feed the Merkle root, so regenerating the same seed with
 a wider window yields a *different* public key. A window cannot be extended — an
@@ -182,27 +178,24 @@ The committee anchor is SSZ too, which matters because the freshness gate
 fingerprints it to identify its trust domain: a second byte-encoding of the same
 committee would read as a rotation and silently reset the anti-rollback mark.
 
-Since leanVM v0.9 the cryptographic objects *inside* those containers are SSZ as
-well. `XmssSignature` is a fixed 1208 bytes and `XmssPublicKey` a fixed 32, field
-elements written as canonical little-endian `u32` and refused on decode at or
-above the modulus. So canonicality is a property of the schema rather than
-something this project enforces by decoding and re-encoding, as it had to when
-those objects were opaque postcard blobs. The one exception is the aggregate
+The cryptographic objects *inside* those containers are SSZ as well.
+`XmssSignature` is a fixed 1208 bytes and `XmssPublicKey` a fixed 32. In v0.10
+they are byte-oriented: every value of the exact size has one SSZ encoding, so
+canonicality comes from fixed lengths rather than field-modulus rejection. The
+one exception is the aggregate
 proof, which cannot be a typed field — deserializing it needs the process-global
 aggregation bytecode — and is therefore still canonicalized by re-encoding and
 comparing.
 
-This is a wire-format commitment. Records, anchors, keys and proofs produced
-before leanVM v0.9 are not compatible and must be regenerated.
+This is a wire-format commitment. The migration reserves algorithm tag `1` for
+the BLAKE2s construction and explicitly rejects retired tag `0`. v0.9 records,
+keys, signatures and proofs are incompatible and must be regenerated.
 
 | | `StatusList` | `SnarkStatusList` |
 |---|---|---|
 | evidence | the `t` raw signatures + a signer bitmap | one aggregated SNARK proof |
-| naming the signers | 26 B bitmap (`N + 1` bits) | public keys inside the aggregate |
-| prover | none | 670 ms · 2.0 GB peak |
-| verifier setup | none | ~5.0 s · 676 MB resident |
-| verify | `t` × `xmss_verify`, linear in `t` | one check, flat in `t` |
-| payload at `t=128` | ≈ 155 KB | ≈ 234 KB |
+| naming the signers | bitmap (`N + 1` bits) | public keys inside the aggregate |
+| verification | verify each named XMSS signature | verify one aggregate plus the cleartext bindings |
 | entry point | `VerifierNode::verify_status_list` | `PQSNARKVerifierModule::verify` |
 
 A signer is named by its **index into the committee's member list**. The anchor
@@ -252,9 +245,9 @@ record published under one verified, in full, under the other. Membership, quoru
 slot and message binding all pass, because from the verifier's side there is
 nothing to distinguish them.
 
-The fix is to start the Poseidon2 fold from a **domain-specific IV** instead of
-`[0; 8]`. The domain is derived once, by the anchor itself
-(`Committee::domain`), from three things:
+The fix is to prefix the signed statement with a **domain-specific BLAKE2s-256
+digest**. The domain is derived once, by the anchor itself
+(`Committee::domain`), from a fixed context string and three things:
 
 | bound | why |
 |---|---|
@@ -262,11 +255,25 @@ The fix is to start the Poseidon2 fold from a **domain-specific IV** instead of
 | the record's `alg` | a record cannot be relabelled to another signature scheme while keeping evidence produced under the first. Latent while one algorithm exists, and cheapest to add before it does |
 | a construction generation | bumping it retires every message signed under the old shape |
 
-It is **prefixed, not appended**, and that part is load-bearing. A Merkle–Damgård
-chain that starts from a shared IV lets every domain share its intermediate
-states, so a single internal collision found against attacker-chosen entries would
-be reusable across all of them. A domain-specific IV leaves two domains with no
-common prefix to attack.
+It is **prefixed, not appended**, and that part is load-bearing: two committees
+must not share the application-message prefix an attacker controls. A second
+fixed context string separates the status-list message from the domain hash. The
+full preimage is:
+
+```text
+BLAKE2s-256(
+  "decentralized-root-of-trust/status-list-domain" ||
+  construction_generation_le_u32 || alg_u8 || anchor_fingerprint[32]
+) -> domain[32]
+
+BLAKE2s-256(
+  "decentralized-root-of-trust/status-list-message" ||
+  domain[32] || version_le_u32 || entry_count_le_u64 || entries[32]...
+)
+```
+
+The fixed-width integers and explicit count make the encoding unambiguous. It is
+streamed without allocation and remains deliberately order-sensitive.
 
 There is no way to compute a message without naming a domain, because
 `status_list_message` takes one — so this is enforced by the type, not by a check
@@ -280,9 +287,9 @@ identifier inside the anchor, which is a further wire change. Until then *one
 anchor governs exactly one status list* is an operator invariant, pinned in
 `committee.rs`'s `one_anchor_is_one_domain_so_it_governs_one_list`.
 
-> This is a **signed-message** change, not a wire-schema one: the SSZ containers
-> are byte-identical to before, and record sizes are unchanged. But keys, records
-> and proofs generated earlier no longer verify — regenerate `artifacts/`.
+> This is both a **signed-message** and algorithm-tag change. The SSZ field layout
+> is unchanged, but tag `0` is rejected and the construction generation is now
+> `2`. Regenerate `artifacts/`, committee keys and durable signer state.
 
 ---
 
@@ -470,12 +477,12 @@ cannot sign two competing snapshots at the same version's XMSS slot.
 
 The leanVM dependencies are **git-pinned** (no vendored clones):
 
-- `lean-multisig`, `backend` — from `leanEthereum/leanVM`, pinned to the **v0.9**
-  release by its commit `a5909d1` rather than by the tag name, since a tag can be
-  moved. leanVM ships its own field/hash backend and **does not depend on
-  Plonky3**, so the whole tree resolves reproducibly.
+- `leanvm`, `primitives` — from `leanEthereum/leanVM`, pinned to the **v0.10**
+  release by its commit `73a5f5d` rather than by the tag name, since a tag can be
+  moved. `primitives` supplies the exact BLAKE2s-256 implementation used by the
+  VM, avoiding a second hash implementation at the application/VM seam.
 - `ethereum_ssz` / `ethereum_ssz_derive` — SSZ encoding compatible with the
-  Ethereum consensus specification. leanVM v0.9 uses the same crate for its own
+  Ethereum consensus specification. leanVM v0.10 uses the same crate for its own
   keys and signatures, which is what lets them appear as typed fields in the
   schemas here instead of opaque byte-lists.
 - `rand`, `sha3` — from crates.io. `serde` and `postcard` are no longer direct
@@ -485,9 +492,12 @@ The leanVM dependencies are **git-pinned** (no vendored clones):
   binaries under `src/bin/my_test*.rs`; nothing in the library uses them.)
 
 Upgrading leanVM across a breaking release invalidates persisted state as well as
-wire formats: v0.9 changed the XMSS leaf hash, so keys, signatures and proofs from
-v0.8 no longer verify. Delete `artifacts/` and any durable slot state before
-re-running — a counter is bound to a fingerprint of its key.
+wire formats. The v0.10 binary-field/BLAKE2s construction is incompatible with
+v0.9 keys, signatures and proofs; the status-list message format also moved to
+generation `2` and wire algorithm tag `1`. Delete `artifacts/` and any durable
+slot state before re-running — a counter is bound to a fingerprint of its key.
+There is intentionally no mixed-version acceptance window. The Poseidon2 version
+is preserved in the `poseidon2` branch.
 
 `Cargo.lock` is committed. The direct leanVM revision alone does not lock its
 transitive tree; the lockfile is part of the reproducible build contract and
@@ -495,6 +505,11 @@ transitive tree; the lockfile is part of the reproducible build contract and
 
 `.cargo/config.toml` sets a large `RUST_MIN_STACK` (the prover uses a very deep
 stack) and `target-cpu=native`.
+
+For `cargo test`, dependencies are optimized while this crate remains a debug
+build. `lean_vm` alone uses release-equivalent overflow arithmetic in the dev
+profile because v0.10's shape-only aggregation warm-up otherwise trips a debug
+shift check before proving; this crate retains its debug overflow checks.
 
 ---
 
@@ -573,27 +588,9 @@ cargo run --release --bin prover && cargo run --release --bin verifier
 **Why bother:** a verify-only process calls `setup_verifier()` and nothing else.
 It skips the arena and the DFT twiddles, and — more importantly — it never runs
 `zk_alloc::enable_arena()`, which sets `M_TRIM_THRESHOLD = -1` so that a *prover*
-process never returns freed memory to the OS. The measured effect on RSS
-(*resident set size* — the physical pages a process actually holds, and the
-quantity behind every memory row in this document):
-
-At the **small** committee (`N=10, t=7`), median of 30 runs:
-
-| | prover | verifier | member (`signer`) |
-|---|---|---|---|
-| resident after setup / keygen | 786 MB | **676 MB** | ~2 MB |
-| peak RSS | 1082 MB | **694 MB** | **~2 MB** |
-
-**36% less peak RAM** for a node that only verifies, and three orders of magnitude
-less for one that only signs. The saving grows with the committee, because only
-the prover's side scales: at the current defaults (`N=200, t=128`, see
-[Reference numbers](#reference-numbers)) the first two become 2053 / 692 MB — a
-**66%** reduction — while the member stays at ~2 MB. The verifier's peak is
-essentially constant in `t`; the prover's is not.
-
-The more useful property is the *slope*: the verifier's RSS is flat in the number
-of verifications (676 → 678 MB over 10), while the prover's climbs monotonically
-and never comes back down.
+process keeps prover allocation policy out of a verification-only role. The
+benchmark treats prover, verifier and signer as separate targets so this boundary
+can be measured without initializing components the role would not deploy.
 
 Since the verifier's only input is the anchor plus the published structure, the
 artifact directory can simply be copied to the target device:
@@ -645,9 +642,8 @@ It writes to `bench-<timestamp>/`:
 
 `combined` (`src/main.rs`, the single-process demo) is **not** in the defaults. It
 measures a process that proves and verifies at once, which is not a role anyone
-deploys, and its numbers duplicate the prover's: same setup, `prove` within 0.5%,
-peak RSS within 2%. Add it with `TARGETS="... combined"` when an independent
-second reading of prove time is what you want — that is what it is good for.
+deploys. Add it with `TARGETS="... combined"` when an independent second reading
+of prove time is what you want — that is what it is good for.
 
 | file | contents |
 |---|---|
@@ -696,7 +692,7 @@ Design points that matter if you quote these numbers:
   broadcasts, and the aggregator receives `t` and produces none. A `sign` figure
   taken from a process that signs `t` times is the summed work of `t` machines
   billed to one, and describes no process that exists — which is what the old
-  `sign / update` column did, reading ~1 s at `t=128`. `prover`, `combined` and
+  `sign / update` column did. `prover`, `combined` and
   `raw_agg` still *produce* their `t` signatures, because a record needs them;
   they simply do not time them. The `signer` target signs through `SignerNode`,
   so its figure includes the durable slot burn (write, `fsync`, rename, `fsync`
@@ -730,100 +726,6 @@ Everything the script prints is **measured on the host it ran on**, and nothing 
 extrapolated to other hardware. `target-cpu=native` already makes the binaries
 host-specific, so the way to get numbers for another machine is to run
 `benchmark.sh` there.
-
-### Reference numbers
-
-Current benchmark artifact: [`bench-20260820-191959/`](bench-20260820-191959/).
-The detailed human-readable analysis is
-[`benchmark-report-it.pdf`](bench-20260820-191959/benchmark-report-it.pdf), with the
-Markdown source next to it.
-
-Host **AMD Ryzen 7 4800H** (8c/16t), CPU governor `performance`, Rust nightly
-1.97.0, leanVM pinned at `a5909d1`, release build with `target-cpu=native`.
-The sweep used **30 measured runs** after **3 warmups**, with targets interleaved
-round-robin. The measured protocol parameters were `N=200`, `t=128`, and 20
-status-list updates per run.
-
-Each update is one publication of a new status-list version. A version may add or
-remove any number of entries, including both in the same update; the benchmark
-adds one entry per update only because it is measuring the cryptographic paths,
-not provisioning policy.
-
-**Per member, per round.** A member signs once and broadcasts. It never produces
-`t` signatures locally, so this cost is paid in parallel by the quorum members
-and is identical for the raw and SNARK forms.
-
-| metric | median |
-|---|---:|
-| keygen, one key | 15.65 ms |
-| durable slot-counter setup | 2.80 ms |
-| sign one round, including durable slot burn | 11.91 ms |
-| signature on the wire | 1 208 B |
-| peak RSS | 2 MB |
-
-**Per update, aggregator and relying party.** Signing is not included here because
-it is the same cost on both paths and is paid by the members, not by the
-aggregator or verifier process.
-
-| metric | SNARK prover | SNARK verifier | raw XMSS verifier |
-|---|---:|---:|---:|
-| setup, once per process | 5.09 s | 5.01 s | none |
-| prove / update | 670.06 ms | — | — |
-| verify / update, including decode | — | 37.06 ms | 54.25 ms |
-| published record size | 234 141 B | — | 155 019 B |
-| resident after setup/keygen | 747 MB | 676 MB | 3 MB |
-| peak RSS | 2 009.5 MB | 693 MB | 4 MB |
-
-The raw record is smaller at this threshold. The SNARK record is about **79 KB
-larger** (+51%), but verification is **17.19 ms faster** than checking the 128
-XMSS signatures directly, a **31.7%** reduction for the relying party. Producing
-that faster-to-check record costs the aggregator about **670 ms** and a peak just
-over **2 GB**.
-
-Key generation for all 200 committee members is a separate fixed cost: 3.55 s in
-the SNARK prover run and 3.73 s in the raw baseline. The raw baseline also creates
-200 durable counters, measured at 617 ms. A real member pays one key and one
-counter, which is why the signer table is the right number for deployed members.
-
-### Where the SNARK starts paying off
-
-At the measured point (`t=128`), the CPU-only break-even is about **39 relying
-party verifications per update**:
-
-```text
-raw   :          54.25 * V
-SNARK : 670.06 + 37.06 * V
-break-even: 670.06 / (54.25 - 37.06) ~= 39
-```
-
-This intentionally ignores costs that are either common or deployment-specific:
-signing is common to both paths, setup is paid once per long-lived process, and
-network/storage costs depend on the deployment. The formula is still useful: the
-prover pays a fixed cost once, while verification is paid by every relying party
-that checks the update.
-
-Do not extrapolate a full scaling law from this one benchmark point. The raw path
-is exactly linear in `t` for signature bytes and signature checks. The SNARK path
-is much flatter for verification, but proof size, prove time and prover memory
-must be swept at the `t` values you intend to claim.
-
-### Memory is the gate, and it is what the split answers
-
-Time changes with hardware; peak RSS decides whether a role can run on a machine
-at all.
-
-| role | peak RSS | practical meaning |
-|---|---:|---|
-| member (`signer`) | 2 MB | suitable for small nodes; one key, one counter |
-| raw relying party | 4 MB in the baseline process | tiny memory, but verify time and bytes grow with `t` |
-| SNARK relying party | 693 MB | faster at `t=128`, but needs the verification bytecode resident |
-| SNARK aggregator | 2 009.5 MB | the heavy role; isolate it on a memory-rich node |
-
-That is the deployment split this repository is built around: keep members small,
-put proving where memory is available, and choose raw versus SNARK verification
-based on whether relying parties can afford the roughly 700 MB verifier floor.
-The measurements above are for this host; run `benchmark.sh` natively on any
-machine whose verdict you actually need.
 
 ---
 
@@ -875,23 +777,30 @@ reach:
   cannot tell a real `flock` from a process-local mutex, and the failure it guards
   against is ordinary — one state directory, two nodes started from it — while its
   cost is a destroyed key. Removing the lock makes it fail with
-  `PROBE=acquired:102`, naming the slot both holders would have issued.
+  `PROBE=acquired:102`, naming the slot both holders would have issued. Its
+  `child_probe` entry is the suite's single `#[ignore]`: it is a subprocess
+  fixture, not a skipped security case. The two parent tests launch it explicitly
+  with `--ignored --exact`, supply the required protocol arguments and assert its
+  output; running it directly under the normal test harness would have no parent
+  protocol to execute.
 - `src/bench/stats.rs`'s tests are the only guard on the numbers in
   [Benchmark](#benchmark). They pin the median against the mean on skewed samples,
   and the standard deviation as the Bessel-corrected (`n-1`) one that the
   confidence interval is built from.
 
 It also carries the SNARK path's own negative suite (`tests/snark_path.rs`), on a
-small committee (`N=5, t=3`, ~10 s) so it can afford real proofs. Each of the five
+small committee (`N=5, t=3`) so it can afford real proofs. Each of the five
 checks in `PQSNARKVerifierModule::verify` gets a case that breaks **only** that check, and the case
 asserts the other four still hold — so a rejection can only have come from the
 check under test. Deleting any one of the five makes exactly one assertion fail.
 
-The interesting one is check 5. Checks 1 to 4 all read the aggregate's `info`
-(message, slot, public keys); nothing relates that header to the computation
-underneath it. The test splices an honest record's `info` onto another
-aggregate's proof body: checks 1-4 pass by construction, and only verifying the
-SNARK tells the two apart.
+The interesting one is check 5. Checks 1 to 4 read the aggregate's declared XMSS
+group (message, slot, public keys); nothing relates that statement to the
+computation underneath it. The test changes one bit in the proof body while
+requiring the aggregate to remain decodable with identical claims: checks 1-4
+pass by construction, and only verifying the SNARK tells the two apart. A second
+case proves that v0.10's more general multi-group aggregate is rejected rather
+than silently widening this protocol's statement.
 
 `tests/snark_modules.rs` covers the two node wrappers the binaries go through.
 The assertion that earns its keep is the first one: the slot recorded *inside* the
@@ -901,12 +810,12 @@ ever started accepting one — which is the same drift that once removed the slo
 check from the verifier wrapper.
 
 Every check named in this section has a mutant in `tools/mutate.py`, which
-deletes one and reports which test complains. There are currently 28. One former
+deletes one and reports which test complains. There are currently 30. One former
 padding-bits mutant disappeared when the signer bitmap became an SSZ `BitList`:
 excess indices are now unrepresentable, so there is no longer a hand-written
 padding check to delete. The last full sweep caught every then-current mutant;
 the present patterns have since been updated and verified to still match their
-targets, but the full 28-mutant sweep itself has not been re-run. Earlier sweeps
+targets, but the full 30-mutant sweep itself has not been re-run. Earlier sweeps
 exposed three checks that no test reached (`verify_status_list`'s former padding
 check, the bitmap width, and `t == 0`), plus a padding test that located the bitmap
 by searching a signature blob for a byte value. The current `BitList` structure

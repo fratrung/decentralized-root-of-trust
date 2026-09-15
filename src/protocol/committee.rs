@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use lean_multisig::XmssPublicKey;
+use crate::crypto::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 use ssz::{Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
@@ -18,7 +18,7 @@ use crate::protocol::MAX_COMMITTEE_SIZE;
 use crate::protocol::status_list::{Algorithms, Domain};
 
 /// SSZ wire schema for the anchor. `XmssPublicKey` is a fixed 32-byte SSZ object
-/// in leanVM v0.9, so `members` is an ordinary list of them and the container is
+/// in leanVM v0.10, so `members` is an ordinary list of them and the container is
 /// canonical by construction; see [`Committee::from_bytes`].
 #[derive(SszEncode, SszDecode)]
 #[ssz(struct_behaviour = "container")]
@@ -218,9 +218,8 @@ impl Committee {
     ///
     /// That is why the encoding is SSZ. Every field is fixed-width or a list of
     /// fixed-width items: no length varints to pad, no alternative spelling of an
-    /// integer, trailing bytes a decode error, and leanVM's `XmssPublicKey`
-    /// decoder refuses a field element at or above the modulus. Canonicity is
-    /// structural rather than checked.
+    /// integer or key, and trailing bytes a decode error. Canonicity is structural
+    /// rather than checked; v0.10 keys are byte-oriented fixed vectors.
     ///
     /// What SSZ cannot know are the protocol invariants, so a member count above
     /// the published ceiling, `t` outside `1..=N`, and duplicate public keys are
@@ -249,11 +248,9 @@ impl Committee {
         }
         // The input *is* the canonical encoding once it has decoded: SSZ fixes
         // every width, rejects a members offset other than the fixed-part length,
-        // refuses trailing bytes, and leanVM's `XmssPublicKey` decoder refuses a
-        // field element at or above the modulus. So hashing `bytes` is hashing
-        // `to_bytes()`, without paying to rebuild it. The `debug_assert` is what
-        // keeps that an argument rather than a hope: if the encoding ever gains a
-        // degree of freedom, every test build says so.
+        // refuses trailing bytes, and a public key is exactly 32 identity-bearing
+        // bytes. So hashing `bytes` is hashing `to_bytes()`, without paying to
+        // rebuild it.
         // Not a `debug_assert`: this path runs once per decoded record, and a
         // re-encode here is the very cost being avoided — asserting it on every
         // call put it straight back for every test build. It is pinned once, in
@@ -298,7 +295,7 @@ impl Committee {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lean_multisig::xmss_key_gen_from_seed;
+    use crate::crypto::xmss_key_gen_from_seed;
 
     const N: usize = 5;
     const T: usize = 3;
@@ -317,7 +314,7 @@ mod tests {
         s
     }
 
-    /// A slot *count*, as leanVM v0.9 takes it: nine slots is `GENESIS..=GENESIS + 8`.
+    /// A slot *count*: the adapter maps nine slots to `GENESIS..=GENESIS + 8`.
     const WINDOW: u64 = 9;
 
     fn committee_in(ns: u8) -> Committee {
@@ -423,32 +420,33 @@ mod tests {
         );
     }
 
-    /// Two byte-different encodings of one committee would read as two trust
-    /// domains and silently reset the freshness gate. SSZ makes the container
-    /// canonical; the one degree of freedom left is *inside* a member key, where a
-    /// field element could be written at or above the KoalaBear modulus and still
-    /// reduce to a legal value. leanVM's decoder refuses that, which is what makes
-    /// the anchor canonical end to end and not merely at the container level.
+    /// v0.10 public keys are byte-oriented: every exact 32-byte value is a
+    /// canonical key encoding, rather than eight field elements which might have
+    /// non-canonical representatives. Changing a key byte must therefore decode
+    /// as a *different* anchor, round-trip exactly and change its trust domain.
     #[test]
-    fn a_member_key_outside_the_field_is_refused() {
+    fn every_exact_length_member_key_is_canonical_and_identity_bearing() {
         let c = committee_in(3);
         let mut bytes = c.to_bytes();
         assert!(Committee::from_bytes(&bytes).is_ok());
 
         // Fixed section: the `members` offset (4) + `t` (8) + `genesis_slot` (4).
-        // The member list therefore starts at byte 16, and its first four bytes are
-        // member 0's first field element, little-endian.
+        // The member list therefore starts at byte 16.
         const FIXED_LEN: usize = 4 + 8 + 4;
         assert_eq!(
             u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
             FIXED_LEN,
             "the members list starts right after the fixed section"
         );
-        bytes[FIXED_LEN..FIXED_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[FIXED_LEN] ^= 1;
 
-        assert!(
-            Committee::from_bytes(&bytes).is_err(),
-            "a field element at or above the modulus must not decode"
+        let changed = Committee::from_bytes(&bytes).expect("every 32-byte key is canonical");
+        assert_eq!(changed.to_bytes(), bytes, "the key must round-trip exactly");
+        assert_ne!(changed.fingerprint(), c.fingerprint());
+        assert_ne!(
+            changed.domain(crate::protocol::status_list::Algorithms::WotsXmss),
+            c.domain(crate::protocol::status_list::Algorithms::WotsXmss),
+            "changing a member key must change the signed-message domain"
         );
     }
 
