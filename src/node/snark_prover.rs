@@ -4,10 +4,8 @@
 //! derives slots from the anchor; [`PQSNARKProverModule::aggregate`] accepts one
 //! explicitly only to aggregate already-produced signatures in adversarial tests.
 
-use crate::crypto::{
-    MESSAGE_LEN_BYTES, XmssPublicKey, XmssSignature, aggregate_single_message_signatures,
-    setup_prover,
-};
+use leanvm::xmss::{MESSAGE_LEN, XmssPublicKey, XmssSignature};
+use leanvm::{aggregate, setup_prover};
 
 use crate::protocol::committee::Committee;
 use crate::protocol::status_list::Algorithms;
@@ -49,11 +47,15 @@ impl PQSNARKProverModule {
     pub fn aggregate(
         &self,
         raws: Vec<(XmssPublicKey, XmssSignature)>,
-        message: [u8; MESSAGE_LEN_BYTES],
+        message: [u8; MESSAGE_LEN],
         slot: u32,
         log_inv_rate: usize,
     ) -> Vec<u8> {
-        aggregate_single_message_signatures(&[], raws, message, slot, log_inv_rate)
+        let xmss = raws
+            .into_iter()
+            .map(|(public, signature)| (public, slot, message, signature))
+            .collect();
+        aggregate(&[], xmss, Vec::new(), None, log_inv_rate)
             .expect("aggregation failed")
             .to_bytes()
     }

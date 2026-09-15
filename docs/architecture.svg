@@ -83,7 +83,7 @@
   <text x="46" y="660" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#0f766e">VerifierNode::verify_status_list</text>
   <text x="46" y="681" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">exact BitList width = N</text>
   <text x="46" y="699" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">quorum ≥ t · bound message + slot</text>
-  <text x="46" y="717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">t × xmss_verify</text>
+  <text x="46" y="717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#134e4a">t × XMSS verify</text>
   <line x1="46" y1="729" x2="314" y2="729" stroke="#99f6e4" stroke-width="1.2"/>
   <text x="46" y="750" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f766e">direct XMSS checks · no VM setup</text>
 

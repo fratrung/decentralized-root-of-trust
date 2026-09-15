@@ -92,16 +92,13 @@ impl RawNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{
-        XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign,
-    };
     use crate::protocol::status_list::{Algorithms, hash_any};
+    use leanvm::xmss::{XmssPublicKey, XmssSecretKey, XmssSignature, key_gen_from_seed, sign};
 
     const N: usize = 5;
     const T: usize = 3;
     const GENESIS: u32 = 100;
-    /// `GENESIS..=GENESIS + 8`, expressed as the adapter's slot count.
-    const WINDOW: u64 = 9;
+    const MAX_VERSION: u32 = 8;
 
     /// This module's tag in the crate-wide seed namespace `[file, ns, member, 0, ..]`.
     /// See [`crate::node::raw_verifier`]'s tests for why the namespace must live in
@@ -122,18 +119,18 @@ mod tests {
         p
     }
 
-    fn keys_in(ns: u8) -> Vec<(XmssPublicKey, XmssSecretKey)> {
+    fn keys_in(ns: u8) -> Vec<(XmssSecretKey, XmssPublicKey)> {
         (0..N)
             .map(|i| {
-                xmss_key_gen_from_seed(seed(ns, i as u8), u64::from(GENESIS), WINDOW)
+                key_gen_from_seed(seed(ns, i as u8), GENESIS, GENESIS + MAX_VERSION)
                     .expect("keygen")
             })
             .collect()
     }
 
-    fn node_in(ns: u8, name: &str) -> (Vec<(XmssPublicKey, XmssSecretKey)>, RawNode) {
+    fn node_in(ns: u8, name: &str) -> (Vec<(XmssSecretKey, XmssPublicKey)>, RawNode) {
         let keys = keys_in(ns);
-        let members: Vec<XmssPublicKey> = keys.iter().map(|(pk, _)| pk.clone()).collect();
+        let members: Vec<XmssPublicKey> = keys.iter().map(|(_, pk)| pk.clone()).collect();
         let committee = Committee::new(members, T, GENESIS);
         let mark = HighWaterMark::load(scratch(name), &committee.to_bytes());
         (keys, RawNode::new(committee, mark))
@@ -141,7 +138,7 @@ mod tests {
 
     /// A published record, signed by `signers` at the slot the anchor derives.
     fn record(
-        keys: &[(XmssPublicKey, XmssSecretKey)],
+        keys: &[(XmssSecretKey, XmssPublicKey)],
         committee: &Committee,
         list: &[[u8; 32]],
         version: u32,
@@ -149,9 +146,10 @@ mod tests {
     ) -> Vec<u8> {
         let message = committee.message_for(Algorithms::WotsXmss, list, version);
         let slot = committee.slot_for(version).expect("slot");
+        let mut rng = leanvm::rand::rng();
         let signatures: Vec<(usize, XmssSignature)> = signers
             .iter()
-            .map(|&i| (i, xmss_sign(&keys[i].1, slot, &message).expect("sign")))
+            .map(|&i| (i, sign(&mut rng, &keys[i].0, &message, slot).expect("sign")))
             .collect();
         StatusList::new(Algorithms::WotsXmss, list.to_vec(), version, N, signatures)
             .expect("well-formed record")
@@ -232,7 +230,7 @@ mod tests {
         // one so it sorts first. The versions stay inside the key window — these
         // are records a real peer could actually have produced, not ones the
         // signer would refuse to make.
-        let mut candidates: Vec<Vec<u8>> = (1..(WINDOW as u32))
+        let mut candidates: Vec<Vec<u8>> = (1..=MAX_VERSION)
             .map(|v| record(&keys, &committee, &[hash_any(b"junk")], v, &[0, 1]))
             .collect();
         candidates.push(honest.clone());

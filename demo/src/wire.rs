@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use decentralized_root_of_trust::crypto::XmssSignature;
+use leanvm::xmss::XmssSignature;
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 

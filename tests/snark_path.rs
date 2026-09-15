@@ -27,19 +27,19 @@
 //! per-slot budget is written out next to the constants below, and cases skip
 //! rounds rather than reuse a slot.
 
-use decentralized_root_of_trust::crypto::{
-    MESSAGE_LEN_BYTES, SingleMessageAggregateSignature, XmssPublicKey, XmssSecretKey,
-    XmssSignature, aggregate_single_message_signatures, xmss_key_gen_from_seed, xmss_sign,
-};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
+use leanvm::AggregateSignature;
+use leanvm::xmss::{
+    MESSAGE_LEN, XmssPublicKey, XmssSecretKey, XmssSignature, key_gen_from_seed, sign,
+};
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
-/// Last usable offset, inclusive; this crate's adapter takes `WINDOW + 1` epochs.
+/// Last usable offset, inclusive.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this exercises the deployed configuration.
 const LOG_INV_RATE: usize = 2;
@@ -73,9 +73,7 @@ fn seed(member: u8) -> [u8; 32] {
 }
 
 fn keypair(member: u8) -> Keypair {
-    let (pk, sk) = xmss_key_gen_from_seed(seed(member), u64::from(GENESIS), u64::from(WINDOW) + 1)
-        .expect("keygen");
-    (sk, pk)
+    key_gen_from_seed(seed(member), GENESIS, GENESIS + WINDOW).expect("keygen")
 }
 
 fn committee() -> (Vec<Keypair>, Committee) {
@@ -84,16 +82,21 @@ fn committee() -> (Vec<Keypair>, Committee) {
     (keys, Committee::new(members, T, GENESIS))
 }
 
-/// Signs `message` at `slot` with the given keypairs, in the shape
-/// `aggregate_single_message_signatures` wants.
+/// Signs `message` at `slot` with the given keypairs.
 fn sign_at(
     signers: &[&Keypair],
-    message: [u8; MESSAGE_LEN_BYTES],
+    message: [u8; MESSAGE_LEN],
     slot: u32,
 ) -> Vec<(XmssPublicKey, XmssSignature)> {
+    let mut rng = leanvm::rand::rng();
     signers
         .iter()
-        .map(|(sk, pk)| (pk.clone(), xmss_sign(sk, slot, &message).expect("sign")))
+        .map(|(sk, pk)| {
+            (
+                pk.clone(),
+                sign(&mut rng, sk, &message, slot).expect("sign"),
+            )
+        })
         .collect()
 }
 
@@ -102,13 +105,13 @@ fn record(list: Vec<[u8; 32]>, version: u32, proof: Vec<u8>) -> SnarkStatusList 
 }
 
 /// Decodes a record's aggregate, so a case can state what the *other* checks see.
-fn info_of(sl: &SnarkStatusList) -> SingleMessageAggregateSignature {
+fn info_of(sl: &SnarkStatusList) -> AggregateSignature {
     sl.proof().expect("the aggregate itself is well-formed")
 }
 
 /// Extracts the one XMSS group this protocol accepts and owns the values so test
 /// assertions cannot accidentally depend on leanVM's aggregate internals.
-fn claims_of(sl: &SnarkStatusList) -> (u32, [u8; MESSAGE_LEN_BYTES], Vec<XmssPublicKey>) {
+fn claims_of(sl: &SnarkStatusList) -> (u32, [u8; MESSAGE_LEN], Vec<XmssPublicKey>) {
     let agg = info_of(sl);
     assert!(agg.sphincs_signers().is_empty(), "unexpected SPHINCS claim");
     let [(slot, message, pubkeys)] = agg.xmss_signers() else {
@@ -154,11 +157,15 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let extra_slot = c.slot_for(5).expect("slot");
     let extra_message = c.message_for(Algorithms::WotsXmss, &list, 5);
     let honest_child = info_of(&valid);
-    let mixed = aggregate_single_message_signatures(
+    let extra_signatures = sign_at(&[&keys[3]], extra_message, extra_slot)
+        .into_iter()
+        .map(|(pk, signature)| (pk, extra_slot, extra_message, signature))
+        .collect();
+    let mixed = leanvm::aggregate(
         &[honest_child],
-        sign_at(&[&keys[3]], extra_message, extra_slot),
-        extra_message,
-        extra_slot,
+        extra_signatures,
+        Vec::new(),
+        None,
         LOG_INV_RATE,
     )
     .expect("mixed-group aggregation");
@@ -348,7 +355,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     let honest_aggregate = info_of(&valid);
     let mut spliced_bytes = honest_aggregate.to_bytes();
     *spliced_bytes.last_mut().expect("proof bytes") ^= 1;
-    let spliced = SingleMessageAggregateSignature::from_bytes(&spliced_bytes)
+    let spliced = AggregateSignature::from_bytes(&spliced_bytes)
         .expect("changing a proof-body bit must preserve the aggregate shape");
     assert_eq!(spliced.xmss_signers(), honest_aggregate.xmss_signers());
     assert_eq!(

@@ -29,15 +29,13 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::Series;
-use decentralized_root_of_trust::crypto::{XmssPublicKey, XmssSignature, xmss_key_gen};
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
-use decentralized_root_of_trust::params::{
-    KEY_SLOT_COUNT, KEY_SLOTS, N_MEMBERS, N_UPDATES, SLOT, T,
-};
+use decentralized_root_of_trust::params::{KEY_SLOTS, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, StatusList, hash_any};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
+use leanvm::xmss::{XmssPublicKey, XmssSignature, key_gen};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -68,17 +66,14 @@ fn main() {
     // `AtomicSlotCounter`s, a cost of the safe *signer* rather than of the crypto.
     println!("raw_agg: keygen (no SNARK setup, no circuit)...");
     let mut rng = rand::rng();
+    let mut xmss_rng = leanvm::rand::rng();
     let mut keygen_time = Duration::ZERO;
     let mut slot_state_time = Duration::ZERO;
     let mut signers: Vec<SignerNode> = Vec::with_capacity(N_MEMBERS);
     let mut members: Vec<XmssPublicKey> = Vec::with_capacity(N_MEMBERS);
     for i in 0..N_MEMBERS {
-        // `xmss_key_gen` samples its own seed and returns
-        // `(public, secret)`; this crate carries `(secret, public)`, so the pair is
-        // swapped at the boundary.
         let t_k = Instant::now();
-        let (pk, sk) =
-            xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("keygen failed");
+        let (sk, pk) = key_gen(&mut xmss_rng, SLOT, SLOT + KEY_SLOTS).expect("keygen failed");
         keygen_time += t_k.elapsed();
 
         let path: PathBuf = state_dir.join(format!("member-{i:04}"));
@@ -234,7 +229,7 @@ fn main() {
     // D) an outsider claiming a member's seat. There is no other way in: a record
     //    names signers by index, so a non-member is unnameable rather than merely
     //    rejected.
-    let (out_pk, out_sk) = xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("keygen");
+    let (out_sk, out_pk) = key_gen(&mut xmss_rng, SLOT, SLOT + KEY_SLOTS).expect("keygen");
     let out_counter =
         AtomicSlotCounter::create(state_dir.join("outsider"), &out_pk, SLOT, SLOT + KEY_SLOTS)
             .expect("slot state");

@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::crypto::XmssPublicKey;
+use leanvm::xmss::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 use ssz::Encode as _;
 
@@ -139,7 +139,7 @@ pub struct AtomicSlotCounter {
     /// Highest `next_free` written to disk. Slots in `next..durable` are already
     /// burned on disk and can be handed out without another fsync.
     durable: u64,
-    /// Last usable slot, inclusive (as passed to `xmss_key_gen`).
+    /// Last usable slot, inclusive (as passed to `leanvm::xmss::key_gen`).
     end: u32,
     /// How many slots to burn per fsync. See [`AtomicSlotCounter::with_batch`].
     batch: u64,
@@ -330,7 +330,7 @@ impl AtomicSlotCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{XmssSecretKey, xmss_key_gen_from_seed};
+    use leanvm::xmss::{XmssSecretKey, key_gen_from_seed};
 
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("slotctr-{name}-{}", std::process::id()));
@@ -344,11 +344,9 @@ mod tests {
         p
     }
 
-    /// Slots 100..=140, 41 of them. The local adapter takes an activation slot and
-    /// a count, so the `+ 1` is explicit here rather than hidden in the callee.
+    /// Slots 100..=140, passed directly as leanVM's inclusive interval.
     fn key(seed: u8) -> (XmssSecretKey, XmssPublicKey) {
-        let (pk, sk) = xmss_key_gen_from_seed([seed; 32], 100, 41).expect("keygen");
-        (sk, pk)
+        key_gen_from_seed([seed; 32], 100, 140).expect("keygen")
     }
 
     #[test]

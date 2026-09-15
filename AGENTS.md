@@ -34,7 +34,7 @@ cargo run --release --bin raw_agg                      # the same protocol with 
 cargo run --release --bin prover   -- [outdir]         # split: aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
-cargo test                                             # 66 unit + 10 integration tests; 75 run + 1 ignored
+cargo test                                             # 65 unit + 10 integration tests; 74 run + 1 ignored
 ./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
 tools/mutate.py                                        # mutation testing: 30 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
@@ -74,9 +74,9 @@ One data flow that forks at the end:
 Committee --BLAKE2s(context + format_LE + alg=1 + SHA3(anchor))--> Domain[32]
 (Domain, Vec<[u8;32]>, version)
     --BLAKE2s(context + domain + version_LE + len_LE + entries)--> message[32]
-        --t x xmss_sign at slot = genesis + version--> t sigs
+        --t x leanvm::xmss::sign at slot = genesis + version--> t sigs
             |-- (index, sig) pairs --------------------> StatusList { bitmap, signatures }
-            `-- aggregate_single_message_signatures --> SNARK --> SnarkStatusList.zk_proof
+            `-- leanvm::aggregate (XMSS inputs only) --> SNARK --> SnarkStatusList.zk_proof
 ```
 
 Library:
@@ -116,11 +116,6 @@ Library:
   size always comes from the anchor. Its length in bits rides in a sentinel bit,
   so bits past member `N-1` cannot exist and an index outside the committee is
   unrepresentable rather than checked for.
-- `src/crypto.rs` — the only compatibility boundary around leanVM v0.10. It maps
-  this protocol's `(start, count)` key window to v0.10's inclusive epoch range,
-  bridges rand 0.10 callers to leanVM's rand 0.9 without mixing traits, restores
-  the local `(public, secret)` convention, supplies randomized signing, and
-  maps the production one-message call into v0.10's general aggregation API.
 - `src/protocol/committee.rs` — the anchor and **nothing else**: members, `t`,
   `genesis_slot`, the SSZ wire encoding, `slot_for` (the **only** place the slot is
   derived) and `domain`/`message_for` (the **only** place the signed message is).
@@ -195,7 +190,7 @@ Binaries:
   not a measurement target — `benchmark.sh` no longer runs it by default. It is
   also the one binary that does not go through the node types end to end: it calls
   `setup_prover`/`setup_verifier` directly, to time the two phases apart, and signs
-  with `xmss_sign` rather than through `SignerNode`.
+  with `leanvm::xmss::sign` rather than through `SignerNode`.
 - `src/bin/prover.rs` — holds the secret keys, writes artifacts, **never verifies**.
 - `src/bin/verifier.rs` — calls **only** `setup_verifier()`; loads `anchor.bin`
   and hardcodes nothing else.
@@ -224,7 +219,7 @@ committee of one, and the raw path with a real `t`-of-`N` quorum. They write slo
 state into the working directory (`next_slot`, `signers/`), which `.gitignore`
 covers.
 
-Tests (`cargo test`, 76 registered: 75 run plus one `#[ignore]`d):
+Tests (`cargo test`, 75 registered: 74 run plus one `#[ignore]`d):
 - `src/*.rs` unit tests cover each module against its own contract.
   `status_list.rs`'s pin the seam this crate has with leanVM: that
   `status_list_message` is BLAKE2s-256 of the exact domain/version/count/entries
@@ -478,22 +473,21 @@ incompatible, wire algorithm tag `0` is explicitly rejected, and the
 signed-message generation is `2`. Delete `artifacts/` and every durable slot-state
 file when deploying the new anchor. There is no mixed-version mode.
 
-- **`src/crypto.rs` is the version boundary.** Callers use this crate's stable
-  count-based key-window and single-message helper API; only this module speaks
-  leanVM v0.10 directly. Keep rand 0.10 and leanVM's rand 0.9 traits separated by
-  drawing a 32-byte seed and calling deterministic upstream keygen.
+- **Use leanVM v0.10's XMSS API directly.** Import types and `key_gen`,
+  `key_gen_from_seed`, `sign` and `verify` from `leanvm::xmss`; there is no local
+  compatibility module. XMSS randomness comes from `leanvm::rand::rng()`. The
+  root crate's rand 0.10 remains separate and is used only for application data.
 - **XMSS is stateful.** A `(key, slot)` pair must sign **at most once**. v0.10
   draws fresh signing randomness, so even signing the same message twice at one
   slot is unsafe. The durable counter must refuse every reuse before the key is
   touched; burn-before-sign cannot be weakened.
 - **Keys are generated for `SLOT..=SLOT + KEY_SLOTS`**, both bounds inclusive,
-  i.e. `KEY_SLOTS + 1` signatures. Upstream v0.10 takes an inclusive epoch pair;
-  `crypto.rs` maps this crate's `(start, count)` contract to it with checked
-  arithmetic. The `+ 1` lives in `params::KEY_SLOT_COUNT` and nowhere else.
-- **`xmss_key_gen` samples one seed** from the caller's RNG and returns
-  `(public, secret)`. This crate carries `(secret, public)`, so every call site
-  swaps at the boundary; the two types are distinct, so a missed swap is a compile
-  error. `xmss_key_gen_from_seed` is the deterministic form tests and containers use.
+  i.e. `KEY_SLOTS + 1` signatures. Pass those inclusive `u32` bounds directly
+  to upstream v0.10; do not reintroduce a count-based adapter.
+- **`key_gen` and `key_gen_from_seed` return `(secret, public)`**, which is the
+  ordering used throughout the project. Tests and containers use the
+  deterministic form with namespaced seeds; production/demo random keygen uses
+  leanVM's own RNG.
 - **A key's slot window cannot be extended.** Leaves outside `slot_start..=slot_end`
   are `gen_random_node` fillers that still feed the Merkle root, so the same seed
   with a wider window produces a *different* public key. An exhausted key can only
@@ -512,13 +506,13 @@ file when deploying the new anchor. There is no mixed-version mode.
   `sphincs_signers()`, and verify through `AggregateSignature::verify()`. The
   signer set can still be omitted with `to_bytes_without_pubkeys`, but this
   project deliberately keeps it on wire until it has a replacement bitmap.
-- **Messages are 32 raw bytes** (`MESSAGE_LEN_BYTES`). `status_list_message` uses
+- **Messages are 32 raw bytes** (`leanvm::xmss::MESSAGE_LEN`). `status_list_message` uses
   the exact BLAKE2s-256 implementation from leanVM's `primitives` crate and is the
   application/VM boundary.
 - **Never prove two things concurrently in one process**: leanVM's arena
   allocator has a single shared region. Parallelize with separate processes.
 - Setup is paid **once per process** and is not persisted.
-- Only the XMSS types re-exported by the pinned `leanvm` crate may enter the
+- Only the XMSS types exported by the pinned `leanvm` crate may enter the
   aggregator. The type path is part of the boundary; another hash-based signature
   crate taking the same `[u8; 32]` message is not interchangeable.
 

@@ -3,7 +3,7 @@
 //! Constructing the module initializes leanVM verification. Freshness stays
 //! outside this pure predicate in [`crate::state::freshness`].
 
-use crate::crypto::setup_verifier;
+use leanvm::setup_verifier;
 
 use crate::protocol::committee::Committee;
 use crate::protocol::status_list::{SnarkStatusList, status_list_message};

@@ -1,5 +1,4 @@
 pub mod bench;
-pub mod crypto;
 pub mod node;
 pub mod params;
 pub mod protocol;

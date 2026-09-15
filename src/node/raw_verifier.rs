@@ -12,7 +12,7 @@
 //! BLAKE2s-XMSS verifications, linear in `t`, versus one aggregate-proof
 //! verification on the SNARK path.
 
-use crate::crypto::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSignature, xmss_verify};
+use leanvm::xmss::{MESSAGE_LEN, XmssPublicKey, XmssSignature, verify};
 
 use crate::protocol::committee::Committee;
 use crate::protocol::status_list::StatusList;
@@ -43,14 +43,14 @@ impl VerifierNode {
         &self,
         pub_key: &XmssPublicKey,
         signature: &XmssSignature,
-        message: &[u8; MESSAGE_LEN_BYTES],
+        message: &[u8; MESSAGE_LEN],
         slot: u32,
     ) -> Result<(), VerifierError> {
         if !self.committee.members().contains(pub_key) {
             return Err(VerifierError::NotAMemberOfCommittee);
         }
 
-        xmss_verify(pub_key, slot, message, signature)
+        verify(pub_key, message, signature, slot)
             .map_err(|_| VerifierError::SignatureVerificationError)
     }
 
@@ -121,7 +121,7 @@ impl VerifierNode {
         status_list
             .signer_indices()
             .zip(status_list.signatures())
-            .all(|(i, sig)| xmss_verify(&members[i], slot, &message, sig).is_ok())
+            .all(|(i, sig)| verify(&members[i], &message, sig, slot).is_ok())
     }
 
     pub fn get_committee(&self) -> &Committee {
@@ -132,8 +132,8 @@ impl VerifierNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{XmssSecretKey, xmss_key_gen_from_seed, xmss_sign};
     use crate::protocol::status_list::{Algorithms, hash_any};
+    use leanvm::xmss::{XmssSecretKey, key_gen_from_seed, sign};
 
     /// Deliberately not a multiple of 8, so the bitmap's sentinel does not land on
     /// a byte boundary and the encoding is exercised where it is easiest to break.
@@ -167,13 +167,10 @@ mod tests {
         s
     }
 
-    /// `GENESIS..=GENESIS + 8`, through this crate's count-based adapter.
-    const WINDOW: u64 = 9;
+    const KEY_END: u32 = GENESIS + 8;
 
     fn keypair(ns: u8, member: u8) -> (XmssSecretKey, XmssPublicKey) {
-        let (pk, sk) =
-            xmss_key_gen_from_seed(seed(ns, member), u64::from(GENESIS), WINDOW).expect("keygen");
-        (sk, pk)
+        key_gen_from_seed(seed(ns, member), GENESIS, KEY_END).expect("keygen")
     }
 
     fn committee_in(ns: u8) -> (Vec<(XmssSecretKey, XmssPublicKey)>, VerifierNode) {
@@ -192,9 +189,10 @@ mod tests {
     ) -> Vec<(usize, XmssSignature)> {
         let message = c.message_for(Algorithms::WotsXmss, list, version);
         let slot = c.slot_for(version).expect("slot");
+        let mut rng = leanvm::rand::rng();
         signers
             .iter()
-            .map(|&i| (i, xmss_sign(&keys[i].0, slot, &message).expect("sign")))
+            .map(|&i| (i, sign(&mut rng, &keys[i].0, &message, slot).expect("sign")))
             .collect()
     }
 
@@ -215,12 +213,13 @@ mod tests {
         let slot = GENESIS;
 
         // Member 0, at slot 100. This is the only time this pair signs.
-        let sig = xmss_sign(&keys[0].0, slot, &message).expect("sign");
+        let mut rng = leanvm::rand::rng();
+        let sig = sign(&mut rng, &keys[0].0, &message, slot).expect("sign");
         assert!(node.verify(&keys[0].1, &sig, &message, slot).is_ok());
 
         // An outsider's own valid signature: refused for membership.
         let (out_sk, out_pk) = keypair(1, 200);
-        let out_sig = xmss_sign(&out_sk, slot, &message).expect("outsider sign");
+        let out_sig = sign(&mut rng, &out_sk, &message, slot).expect("outsider sign");
         assert!(matches!(
             node.verify(&out_pk, &out_sig, &message, slot),
             Err(VerifierError::NotAMemberOfCommittee)
@@ -303,9 +302,10 @@ mod tests {
             .collect();
         assert_eq!(mine, vec![0, 2, 4]);
 
+        let mut rng = leanvm::rand::rng();
         let sigs: Vec<(usize, XmssSignature)> = mine
             .iter()
-            .map(|&i| (i, xmss_sign(&keys[i].0, slot, &message).expect("sign")))
+            .map(|&i| (i, sign(&mut rng, &keys[i].0, &message, slot).expect("sign")))
             .collect();
         assert!(node.verify_status_list(&record(list.clone(), 0, sigs.clone())));
 
@@ -575,7 +575,8 @@ mod tests {
             .get_committee()
             .message_for(Algorithms::WotsXmss, &list, 0);
         let slot = node.get_committee().slot_for(0).expect("slot");
-        let outsider = xmss_sign(&out_sk, slot, &message).expect("sign");
+        let mut rng = leanvm::rand::rng();
+        let outsider = sign(&mut rng, &out_sk, &message, slot).expect("sign");
         let mut sigs = quorum(&keys, node.get_committee(), &list, 0, &[0, 1]);
         // The outsider takes member 2's seat: the only way in, and it fails
         // because seat 2 is checked against member 2's key.

@@ -35,7 +35,6 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::rss_now_mb;
-use decentralized_root_of_trust::crypto::SIGNATURE_SSZ_LEN;
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::node::raw_node::RawNode;
 use decentralized_root_of_trust::node::snark_node::SnarkNode;
@@ -47,6 +46,7 @@ use drot_demo::wire::{
     self, ACTION_ISSUE, ACTION_REVOKE, ACTION_VERIFY, Failure, StatusRequest, StatusUpdated,
 };
 use drot_demo::{report, storage, vc};
+use leanvm::xmss::SIGNATURE_SSZ_LEN;
 use rand::RngExt;
 use ssz::{Decode as _, Encode as _};
 

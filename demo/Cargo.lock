@@ -910,6 +910,7 @@ dependencies = [
  "decentralized-root-of-trust",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "leanvm",
  "rand 0.10.2",
  "serde_jcs",
  "serde_json",

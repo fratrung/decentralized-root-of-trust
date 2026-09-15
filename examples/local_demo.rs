@@ -13,7 +13,6 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::crypto::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::node::raw_node::RawNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
@@ -25,13 +24,13 @@ use decentralized_root_of_trust::protocol::status_list::{
 };
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
+use leanvm::xmss::{XmssPublicKey, XmssSignature, key_gen_from_seed};
 use ssz::Encode as _;
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS_SLOT: u32 = 43;
 const KEY_SLOTS: u32 = 256;
-const SLOT_COUNT: u64 = KEY_SLOTS as u64 + 1;
 const LOG_INV_RATE: usize = 2;
 const ADDITIONS: [usize; 3] = [2, 3, 2];
 
@@ -214,7 +213,7 @@ fn bring_up_committee(dir: &Path) -> Result<(Committee, Vec<SignerNode>), String
     let mut members = Vec::with_capacity(N);
 
     for index in 0..N {
-        let (pk, sk) = xmss_key_gen_from_seed(seed(index), u64::from(GENESIS_SLOT), SLOT_COUNT)
+        let (sk, pk) = key_gen_from_seed(seed(index), GENESIS_SLOT, GENESIS_SLOT + KEY_SLOTS)
             .map_err(|e| format!("keygen for member {index} failed: {e:?}"))?;
         let counter = AtomicSlotCounter::create(
             dir.join(format!("member-{index}.slot")),

@@ -8,22 +8,19 @@
 //! It stays on the raw path on purpose: the property under test does not require
 //! prover or verifier setup.
 
-use decentralized_root_of_trust::crypto::xmss_key_gen_from_seed;
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::{SignerNode, SignerNodeError};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, StatusList, hash_any};
 use decentralized_root_of_trust::state::freshness::{Decision, HighWaterMark};
 use decentralized_root_of_trust::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
+use leanvm::xmss::key_gen_from_seed;
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
 /// Last usable slot, inclusive: `GENESIS..=GENESIS + WINDOW`.
 const WINDOW: u32 = 16;
-/// The same window as the slot count the local keygen adapter takes.
-const SLOT_COUNT: u64 = WINDOW as u64 + 1;
-
 /// Seeds are `[FILE, ns, member, 0, ..]`. Each test gets its own `ns` because
 /// each also gets its own scratch dir, so the durable slot counters do *not*
 /// deduplicate across tests: without this, node 0 would sign slot `GENESIS` once
@@ -58,8 +55,8 @@ fn bring_up(dir: &std::path::Path, ns: u8) -> (VerifierNode, Vec<SignerNode>) {
     let mut members = Vec::with_capacity(N);
 
     for i in 0..N {
-        let (pk, sk) = xmss_key_gen_from_seed(seed(ns, i as u8), u64::from(GENESIS), SLOT_COUNT)
-            .expect("keygen");
+        let (sk, pk) =
+            key_gen_from_seed(seed(ns, i as u8), GENESIS, GENESIS + WINDOW).expect("keygen");
         let counter = AtomicSlotCounter::create(
             dir.join(format!("member-{i}")),
             &pk,
@@ -208,8 +205,7 @@ fn a_restart_does_not_replay_spent_slots() {
     let _ = publish(verifier.get_committee(), &mut nodes, &list, 0, &[0, 1, 2]);
     drop(nodes); // releases every lock, as a process exit would
 
-    let (pk, _) =
-        xmss_key_gen_from_seed(seed(3, 0), u64::from(GENESIS), SLOT_COUNT).expect("keygen");
+    let (_, pk) = key_gen_from_seed(seed(3, 0), GENESIS, GENESIS + WINDOW).expect("keygen");
     let counter =
         AtomicSlotCounter::open(dir.join("member-0"), &pk, GENESIS + WINDOW).expect("reopen");
     assert_eq!(

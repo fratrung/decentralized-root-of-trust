@@ -92,7 +92,7 @@ not move with `t` at all. The breakdown makes that structural rather than
 asserted.
 
 **Memory.** The raw verifier has no setup: it holds an anchor and calls
-`xmss_verify` `t` times. In SNARK mode, node A loads the verifier once and the
+`leanvm::xmss::verify` `t` times. In SNARK mode, node A loads the verifier once and the
 aggregator subset loads the prover once per aggregator process. The first cost is
 visible in node A's startup log; the second is visible in the selected members'
 startup logs. Each round then prints proof generation and verification costs.

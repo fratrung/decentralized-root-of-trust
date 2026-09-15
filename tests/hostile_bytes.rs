@@ -33,12 +33,12 @@
 //! reliably and novel bugs only by luck. Raising `ITERATIONS` locally is the way
 //! to go looking for the latter.
 
-use decentralized_root_of_trust::crypto::{xmss_key_gen_from_seed, xmss_sign};
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, StatusList, hash_any,
 };
+use leanvm::xmss::{key_gen_from_seed, sign};
 use rand::{RngExt, SeedableRng};
 
 const N: usize = 5;
@@ -69,17 +69,23 @@ fn entries() -> Vec<[u8; 32]> {
 #[test]
 fn a_hostile_encoder_cannot_panic_exhaust_or_forge() {
     let keys: Vec<_> = (0..N)
-        .map(|i| xmss_key_gen_from_seed(seed(i as u8), u64::from(GENESIS), 9).expect("keygen"))
+        .map(|i| key_gen_from_seed(seed(i as u8), GENESIS, GENESIS + 8).expect("keygen"))
         .collect();
-    let committee = Committee::new(keys.iter().map(|(pk, _)| pk.clone()).collect(), T, GENESIS);
+    let committee = Committee::new(keys.iter().map(|(_, pk)| pk.clone()).collect(), T, GENESIS);
     let verifier = VerifierNode::new(committee);
     let committee = verifier.get_committee();
 
     let list = entries();
     let message = committee.message_for(Algorithms::WotsXmss, &list, VERSION);
     let slot = committee.slot_for(VERSION).expect("slot");
+    let mut xmss_rng = leanvm::rand::rng();
     let signatures = (0..T)
-        .map(|i| (i, xmss_sign(&keys[i].1, slot, &message).expect("sign")))
+        .map(|i| {
+            (
+                i,
+                sign(&mut xmss_rng, &keys[i].0, &message, slot).expect("sign"),
+            )
+        })
         .collect();
 
     let honest = StatusList::new(Algorithms::WotsXmss, list.clone(), VERSION, N, signatures)

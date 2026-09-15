@@ -35,7 +35,7 @@ pub fn raw_sizes(record_bytes: usize, entries: usize, signatures: usize, sig_len
 
 /// Byte sizes of the SNARK form, with the raw record it replaces for scale.
 pub fn snark_sizes(record_bytes: usize, entries: usize, proof_bytes: usize, quorum: usize) {
-    const SIG_LEN: usize = decentralized_root_of_trust::crypto::SIGNATURE_SSZ_LEN;
+    const SIG_LEN: usize = leanvm::xmss::SIGNATURE_SSZ_LEN;
     let list_total = entries * 32;
     rule("record size, SNARK form");
     println!("  record (SSZ)          : {record_bytes:>9} B");

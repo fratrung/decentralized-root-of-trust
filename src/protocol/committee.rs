@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::crypto::XmssPublicKey;
+use leanvm::xmss::XmssPublicKey;
 use sha3::{Digest, Sha3_256};
 use ssz::{Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
@@ -295,7 +295,7 @@ impl Committee {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::xmss_key_gen_from_seed;
+    use leanvm::xmss::key_gen_from_seed;
 
     const N: usize = 5;
     const T: usize = 3;
@@ -314,15 +314,14 @@ mod tests {
         s
     }
 
-    /// A slot *count*: the adapter maps nine slots to `GENESIS..=GENESIS + 8`.
-    const WINDOW: u64 = 9;
+    const KEY_END: u32 = GENESIS + 8;
 
     fn committee_in(ns: u8) -> Committee {
         let members = (0..N)
             .map(|i| {
-                xmss_key_gen_from_seed(seed(ns, i as u8), u64::from(GENESIS), WINDOW)
+                key_gen_from_seed(seed(ns, i as u8), GENESIS, KEY_END)
                     .expect("keygen")
-                    .0
+                    .1
             })
             .collect();
         Committee::new(members, T, GENESIS)
@@ -478,9 +477,9 @@ mod tests {
         let c = committee_in(6);
 
         for i in 0..N {
-            let pk = xmss_key_gen_from_seed(seed(6, i as u8), u64::from(GENESIS), WINDOW)
+            let pk = key_gen_from_seed(seed(6, i as u8), GENESIS, KEY_END)
                 .expect("keygen")
-                .0;
+                .1;
             let found = c.index_of(&pk).expect("a member must find itself");
             assert_eq!(found, i, "member {i} reported index {found}");
             assert_eq!(
@@ -492,9 +491,9 @@ mod tests {
 
         // Index 200 is outside any committee this suite builds, so it cannot
         // collide however many tests are added.
-        let outsider = xmss_key_gen_from_seed(seed(6, 200), u64::from(GENESIS), WINDOW)
+        let outsider = key_gen_from_seed(seed(6, 200), GENESIS, KEY_END)
             .expect("keygen")
-            .0;
+            .1;
         assert_eq!(c.index_of(&outsider), None);
     }
 

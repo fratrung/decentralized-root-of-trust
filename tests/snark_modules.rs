@@ -31,18 +31,16 @@
 //! `verifier_node.rs` (7). Exactly one `(member, slot)` pair is spent per member:
 //! members 0, 1 and 2 sign round 0 at slot 100, once.
 
-use decentralized_root_of_trust::crypto::{
-    XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign,
-};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
+use leanvm::xmss::{XmssPublicKey, XmssSignature, key_gen_from_seed, sign};
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
-/// Last usable slot, inclusive; `WINDOW + 1` is the adapter's count.
+/// Last usable slot offset, inclusive.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this is the deployed configuration.
 const LOG_INV_RATE: usize = 2;
@@ -63,12 +61,9 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     let prover = PQSNARKProverModule::init_prover();
 
     let keys: Vec<_> = (0..N)
-        .map(|i| {
-            xmss_key_gen_from_seed(seed(i as u8), u64::from(GENESIS), u64::from(WINDOW) + 1)
-                .expect("keygen")
-        })
+        .map(|i| key_gen_from_seed(seed(i as u8), GENESIS, GENESIS + WINDOW).expect("keygen"))
         .collect();
-    let members: Vec<XmssPublicKey> = keys.iter().map(|(pk, _)| pk.clone()).collect();
+    let members: Vec<XmssPublicKey> = keys.iter().map(|(_, pk)| pk.clone()).collect();
     let committee = Committee::new(members, T, GENESIS);
 
     // Round 0. The signers sign the message the *verifier* will recompute, at the
@@ -77,11 +72,12 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     let list = vec![hash_any(b"row-a"), hash_any(b"row-b")];
     let message = committee.message_for(Algorithms::WotsXmss, &list, version);
     let slot = committee.slot_for(version).expect("slot in window");
+    let mut rng = leanvm::rand::rng();
     let raws: Vec<(XmssPublicKey, XmssSignature)> = (0..T)
         .map(|i| {
             (
-                keys[i].0.clone(),
-                xmss_sign(&keys[i].1, slot, &message).expect("sign"),
+                keys[i].1.clone(),
+                sign(&mut rng, &keys[i].0, &message, slot).expect("sign"),
             )
         })
         .collect();

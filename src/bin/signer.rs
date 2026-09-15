@@ -6,7 +6,7 @@
 //! signatures and produces none. So a `sign` figure taken from a process that
 //! signs `t` times is the summed work of `t` machines attributed to one, which
 //! describes no process that exists. This binary measures what a member actually
-//! pays for a round: one `xmss_sign`, preceded by one durable slot burn.
+//! pays for a round: one `leanvm::xmss::sign`, preceded by one durable slot burn.
 //!
 //! That makes the two published forms comparable by construction. The signing
 //! cost is *identical* on the raw and SNARK paths (same key, same 32-byte
@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::Series;
-use decentralized_root_of_trust::crypto::{SIGNATURE_SSZ_LEN, xmss_key_gen, xmss_verify};
 use decentralized_root_of_trust::node::signer::SignerNode;
-use decentralized_root_of_trust::params::{KEY_SLOT_COUNT, KEY_SLOTS, N_UPDATES, SLOT};
+use decentralized_root_of_trust::params::{KEY_SLOTS, N_UPDATES, SLOT};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, hash_any};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
+use leanvm::xmss::{SIGNATURE_SSZ_LEN, key_gen, verify};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -49,13 +49,14 @@ fn main() {
 
     let rss_baseline = rss_now_mb();
     let mut rng = rand::rng();
+    let mut xmss_rng = leanvm::rand::rng();
 
     // One key, not `N`: a member generates its own and nobody else's. This is the
     // fixed cost a member pays, where `prover`/`raw_agg` report the whole
     // committee's because they stand in for all of it.
     println!("signer: keygen (one key, no circuit)...");
     let t_keygen = Instant::now();
-    let (pk, sk) = xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("keygen failed");
+    let (sk, pk) = key_gen(&mut xmss_rng, SLOT, SLOT + KEY_SLOTS).expect("keygen failed");
     let keygen_time = t_keygen.elapsed();
 
     let t_state = Instant::now();
@@ -94,7 +95,7 @@ fn main() {
 
         // Not part of a member's job, and not timed: a cheap guard that the run
         // produced real signatures rather than measuring an error path.
-        if xmss_verify(signer.public_key(), slot, &message, &signature).is_err() {
+        if verify(signer.public_key(), &message, &signature, slot).is_err() {
             failures += 1;
         }
 

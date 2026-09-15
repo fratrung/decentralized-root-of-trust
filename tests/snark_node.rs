@@ -17,9 +17,6 @@
 //! key here shares a hash chain with one in another test binary. One round is
 //! signed, at one slot, by three members: no `(key, slot)` pair repeats.
 
-use decentralized_root_of_trust::crypto::{
-    XmssPublicKey, XmssSignature, xmss_key_gen_from_seed, xmss_sign,
-};
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::node::snark_node::SnarkNode;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
@@ -27,11 +24,12 @@ use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
 use decentralized_root_of_trust::state::freshness::HighWaterMark;
+use leanvm::xmss::{XmssPublicKey, XmssSignature, key_gen_from_seed, sign};
 
 const N: usize = 5;
 const T: usize = 3;
 const GENESIS: u32 = 100;
-/// Last usable slot, inclusive; `WINDOW + 1` is the adapter's count.
+/// Last usable slot offset, inclusive.
 const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this is the deployed configuration.
 const LOG_INV_RATE: usize = 2;
@@ -60,22 +58,23 @@ fn the_gate_moves_only_for_a_proof_that_verified() {
     let prover = PQSNARKProverModule::init_prover();
 
     let keys: Vec<_> = (0..N)
-        .map(|i| {
-            xmss_key_gen_from_seed(seed(i as u8), u64::from(GENESIS), u64::from(WINDOW) + 1)
-                .expect("keygen")
-        })
+        .map(|i| key_gen_from_seed(seed(i as u8), GENESIS, GENESIS + WINDOW).expect("keygen"))
         .collect();
-    let members: Vec<XmssPublicKey> = keys.iter().map(|(pk, _)| pk.clone()).collect();
+    let members: Vec<XmssPublicKey> = keys.iter().map(|(_, pk)| pk.clone()).collect();
     let committee = Committee::new(members, T, GENESIS);
 
     let list = vec![hash_any(b"revoke-alice")];
     let message = committee.message_for(Algorithms::WotsXmss, &list, ROUND);
     let slot = committee.slot_for(ROUND).expect("slot");
+    let mut rng = leanvm::rand::rng();
     let raws: Vec<(XmssPublicKey, XmssSignature)> = [0usize, 1, 2]
         .iter()
         .map(|&i| {
-            let (pk, sk) = &keys[i];
-            (pk.clone(), xmss_sign(sk, slot, &message).expect("sign"))
+            let (sk, pk) = &keys[i];
+            (
+                pk.clone(),
+                sign(&mut rng, sk, &message, slot).expect("sign"),
+            )
         })
         .collect();
     let proof = prover.make_proof(
@@ -159,10 +158,10 @@ fn the_gate_moves_only_for_a_proof_that_verified() {
     let next_raws: Vec<(XmssPublicKey, XmssSignature)> = [0usize, 1, 2]
         .iter()
         .map(|&i| {
-            let (pk, sk) = &keys[i];
+            let (sk, pk) = &keys[i];
             (
                 pk.clone(),
-                xmss_sign(sk, next_slot, &next_message).expect("sign"),
+                sign(&mut rng, sk, &next_message, next_slot).expect("sign"),
             )
         })
         .collect();

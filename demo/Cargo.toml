@@ -17,6 +17,7 @@ publish = false
 
 [dependencies]
 decentralized-root-of-trust = { path = ".." }
+leanvm = { git = "https://github.com/leanEthereum/leanVM.git", rev = "73a5f5dcd34d8dfe76a32a44dce0c0f87c86feeb" }
 
 # Same wire discipline as the protocol objects: every message on the network has
 # exactly one encoding, and a decoder that refuses everything else.

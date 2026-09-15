@@ -160,7 +160,7 @@ MUTANTS = {
         }""", "        if false { return false; }"),
     "raw-signatures": (
         "src/node/raw_verifier.rs",
-        "            .all(|(i, sig)| xmss_verify(&members[i], slot, &message, sig).is_ok())",
+        "            .all(|(i, sig)| verify(&members[i], &message, sig, slot).is_ok())",
         "            .all(|(i, sig)| { let _ = (i, sig); true })",
     ),
 

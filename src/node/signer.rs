@@ -5,7 +5,7 @@
 //! this module adds is the one place where a slot is actually spent, and the
 //! guarantee that it is spent *forward only*.
 
-use crate::crypto::{MESSAGE_LEN_BYTES, XmssPublicKey, XmssSecretKey, XmssSignature, xmss_sign};
+use leanvm::xmss::{MESSAGE_LEN, XmssPublicKey, XmssSecretKey, XmssSignature, sign};
 
 use crate::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 
@@ -75,7 +75,7 @@ impl SignerNode {
     /// under the same slot. Signing first and recording after leaves exactly that
     /// window open, and a reused XMSS slot means a recoverable secret key.
     ///
-    /// So the slot is gone the moment it is issued, whether `xmss_sign` fails,
+    /// So the slot is gone the moment it is issued, whether XMSS signing fails,
     /// the caller drops the signature, or the update is never published. There is
     /// no rollback path on purpose: each of those costs one slot out of `2^32`,
     /// where retrying on the same slot costs the key.
@@ -85,10 +85,11 @@ impl SignerNode {
     /// key is touched.
     pub fn sign(
         &mut self,
-        message: &[u8; MESSAGE_LEN_BYTES],
+        message: &[u8; MESSAGE_LEN],
     ) -> Result<(u32, XmssSignature), SignerNodeError> {
         let slot = self.a_slot_counter.reserve()?;
-        let signature = xmss_sign(&self.sk, slot, message)
+        let mut rng = leanvm::rand::rng();
+        let signature = sign(&mut rng, &self.sk, message, slot)
             .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))?;
         Ok((slot, signature))
     }
@@ -105,11 +106,12 @@ impl SignerNode {
     /// the published version passes its counter.
     pub fn sign_at(
         &mut self,
-        message: &[u8; MESSAGE_LEN_BYTES],
+        message: &[u8; MESSAGE_LEN],
         slot: u32,
     ) -> Result<XmssSignature, SignerNodeError> {
         self.a_slot_counter.reserve_at(slot)?;
-        xmss_sign(&self.sk, slot, message)
+        let mut rng = leanvm::rand::rng();
+        sign(&mut rng, &self.sk, message, slot)
             .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))
     }
 }
@@ -117,8 +119,8 @@ impl SignerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{xmss_key_gen_from_seed, xmss_verify};
     use crate::protocol::status_list::{Algorithms, Domain, hash_any, status_list_message};
+    use leanvm::xmss::{key_gen_from_seed, verify};
     use std::path::PathBuf;
 
     /// A `SignerNode` holds no anchor — it signs the 32 bytes it is handed — so
@@ -130,9 +132,6 @@ mod tests {
 
     const START: u32 = 100;
     const END: u32 = 110;
-    /// `START..=END`, expressed through this crate's count-based adapter.
-    const WINDOW: u64 = (END - START + 1) as u64;
-
     /// Same seed discipline as `verifier_node::tests`, documented in full there:
     /// `[FILE, namespace, member, 0…]`, one namespace per test. Without it every
     /// test here would sign slot 100 with one key over a *different* message,
@@ -159,7 +158,7 @@ mod tests {
     }
 
     fn node(path: &PathBuf, counter_end: u32, ns: u8) -> SignerNode {
-        let (pk, sk) = xmss_key_gen_from_seed(seed(ns), u64::from(START), WINDOW).expect("keygen");
+        let (sk, pk) = key_gen_from_seed(seed(ns), START, END).expect("keygen");
         let counter = AtomicSlotCounter::create(path, &pk, START, counter_end).expect("counter");
         SignerNode::new(pk, sk, counter)
     }
@@ -174,7 +173,7 @@ mod tests {
             let message = status_list_message(&dom(), &list, expected);
             let (slot, sig) = signer.sign(&message).expect("sign");
             assert_eq!(slot, expected);
-            assert!(xmss_verify(signer.public_key(), slot, &message, &sig).is_ok());
+            assert!(verify(signer.public_key(), &message, &sig, slot).is_ok());
         }
         assert_eq!(signer.next_slot(), u64::from(START + 3));
     }

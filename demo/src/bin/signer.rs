@@ -24,11 +24,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::rss_now_mb;
-use decentralized_root_of_trust::crypto::{XmssPublicKey, XmssSignature, xmss_key_gen_from_seed};
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
-use decentralized_root_of_trust::params::{KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, SLOT};
+use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, SLOT};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, StatusList};
 use decentralized_root_of_trust::state::slot_counter::AtomicSlotCounter;
@@ -39,6 +38,7 @@ use drot_demo::wire::{
     self, ACTION_ISSUE, ACTION_REVOKE, Failure, Proposal, SignatureReply, StatusRequest,
     StatusUpdated,
 };
+use leanvm::xmss::{XmssPublicKey, XmssSignature, key_gen_from_seed};
 use ssz::{Decode as _, Encode as _};
 
 /// How long a node waits at startup for the bootstrap step.
@@ -96,7 +96,7 @@ fn main() {
     // Same seed on a restart, therefore the same key, therefore a counter file
     // that still belongs to its key. See `storage::member_seed`.
     let seed = storage::member_seed(&secret, &run_id, index);
-    let (pk, sk) = xmss_key_gen_from_seed(seed, u64::from(SLOT), KEY_SLOT_COUNT).expect("keygen");
+    let (sk, pk) = key_gen_from_seed(seed, SLOT, SLOT + KEY_SLOTS).expect("keygen");
 
     let key_file = storage::member_key_file(index);
     if !key_file.exists() {

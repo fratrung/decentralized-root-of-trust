@@ -25,13 +25,6 @@ pub const N_UPDATES: usize = 20;
 /// usable slot is `SLOT + KEY_SLOTS`, **inclusive**.
 pub const KEY_SLOTS: u32 = 64;
 
-/// The same window as the slot *count* this crate's `xmss_key_gen` adapter takes.
-///
-/// The `+ 1` lives here and nowhere else: a copy at each keygen call site is a
-/// second place to get it wrong, and a window one slot short surfaces only when
-/// the last security test fails to sign.
-pub const KEY_SLOT_COUNT: u64 = KEY_SLOTS as u64 + 1;
-
 // `N_UPDATES == KEY_SLOTS` destroys the committee keys *silently*: both forgeries
 // then derive slot `SLOT + KEY_SLOTS`, still inside the key window, so `t` members
 // sign two different messages at one XMSS slot while the demo prints

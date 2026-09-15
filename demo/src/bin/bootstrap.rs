@@ -17,12 +17,12 @@
 
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::crypto::XmssPublicKey;
 use decentralized_root_of_trust::params::SLOT;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use drot_demo::config::{N_MEMBERS, THRESHOLD};
 use drot_demo::storage;
 use drot_demo::vc::hex;
+use leanvm::xmss::XmssPublicKey;
 use rand::RngExt;
 use ssz::Decode as _;
 

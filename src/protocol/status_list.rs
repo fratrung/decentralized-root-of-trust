@@ -6,7 +6,8 @@
 
 use std::fmt;
 
-use crate::crypto::{SingleMessageAggregateSignature, XmssSignature};
+use leanvm::AggregateSignature;
+use leanvm::xmss::XmssSignature;
 use leanvm_primitives::hash::Hasher as Blake2s256;
 use sha3::{Digest, Sha3_256};
 use ssz::{BitList, Decode as _, Encode as _};
@@ -195,8 +196,8 @@ impl SnarkStatusList {
     /// Deserializes and canonicalizes the leanVM aggregate in `zk_proof`.
     ///
     /// `setup_prover()` or `setup_verifier()` must have initialized the bytecode.
-    pub fn proof(&self) -> Result<SingleMessageAggregateSignature, String> {
-        let value = SingleMessageAggregateSignature::from_bytes(&self.zk_proof)
+    pub fn proof(&self) -> Result<AggregateSignature, String> {
+        let value = AggregateSignature::from_bytes(&self.zk_proof)
             .map_err(|e| format!("proof not deserializable: {e}"))?;
         if value.to_bytes() != self.zk_proof {
             return Err("proof is not canonically encoded".to_string());

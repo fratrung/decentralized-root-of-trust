@@ -17,15 +17,11 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::Series;
-use decentralized_root_of_trust::crypto::{
-    XmssPublicKey, XmssSecretKey, XmssSignature, xmss_key_gen, xmss_sign,
-};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
-use decentralized_root_of_trust::params::{
-    KEY_SLOT_COUNT, KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T,
-};
+use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{Algorithms, SnarkStatusList, hash_any};
+use leanvm::xmss::{XmssPublicKey, XmssSecretKey, XmssSignature, key_gen, sign};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
@@ -54,13 +50,14 @@ fn make_adversarial_proof(
         unique.windows(2).all(|pair| pair[0] != pair[1]),
         "adversarial fixture must not reuse an XMSS key at one slot"
     );
+    let mut rng = leanvm::rand::rng();
     let raws = signers
         .iter()
         .map(|&index| {
             let (secret, public) = &keypairs[index];
             (
                 public.clone(),
-                xmss_sign(secret, slot, &message).expect("signing failed"),
+                sign(&mut rng, secret, &message, slot).expect("signing failed"),
             )
         })
         .collect();
@@ -103,6 +100,7 @@ fn main() {
     let rss_after_setup = rss_now_mb();
 
     let mut rng = rand::rng();
+    let mut xmss_rng = leanvm::rand::rng();
 
     // The committee: N_MEMBERS XMSS keys, each valid over a KEY_SLOTS-wide window.
     //
@@ -113,16 +111,13 @@ fn main() {
     // i.e. as if the SNARK were the cheaper of the two: the comparison inverted,
     // because the raw column was keygen and the SNARK column was not.
     //
-    // `xmss_key_gen` samples the seed from the RNG itself and
-    // returns `(public, secret)`; this crate carries `(secret, public)`, so the
-    // pair is swapped here, at the boundary. The types are distinct, so the swap
-    // is compile-checked rather than a convention to remember.
+    // leanVM's native v0.10 API takes an inclusive slot interval and returns
+    // `(secret, public)`, the ordering used throughout this crate.
     let t_keygen = Instant::now();
     let mut keypairs: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..N_MEMBERS {
-        let (pk, sk) =
-            xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("keygen failed");
-        keypairs.push((sk, pk));
+        let keypair = key_gen(&mut xmss_rng, SLOT, SLOT + KEY_SLOTS).expect("keygen failed");
+        keypairs.push(keypair);
     }
     let keygen_time = t_keygen.elapsed();
     let members: Vec<XmssPublicKey> = keypairs.iter().map(|(_, pk)| pk.clone()).collect();
@@ -165,7 +160,7 @@ fn main() {
             let (sk, pk) = &keypairs[k];
             raws.push((
                 pk.clone(),
-                xmss_sign(sk, slot, &message).expect("signing failed"),
+                sign(&mut xmss_rng, sk, &message, slot).expect("signing failed"),
             ));
         }
 
@@ -251,9 +246,8 @@ fn main() {
     //    Defeated by check 1 (membership).
     let mut outsiders: Vec<(XmssSecretKey, XmssPublicKey)> = Vec::new();
     for _ in 0..T {
-        let (pk, sk) =
-            xmss_key_gen(&mut rng, u64::from(SLOT), KEY_SLOT_COUNT).expect("outsider keygen");
-        outsiders.push((sk, pk));
+        let keypair = key_gen(&mut xmss_rng, SLOT, SLOT + KEY_SLOTS).expect("outsider keygen");
+        outsiders.push(keypair);
     }
     let out_list = vec![hash_any(rng.random::<[u8; 32]>())];
     let out_proof = make_adversarial_proof(
