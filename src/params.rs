@@ -8,11 +8,57 @@
 /// node has to be trusted to follow.
 pub const SLOT: u32 = 43;
 
+/// Default committee size `N` used outside controlled benchmark sweeps.
+pub const DEFAULT_N_MEMBERS: usize = 200;
+
+/// Default threshold `t` used outside controlled benchmark sweeps.
+pub const DEFAULT_T: usize = 128;
+
+/// Parses a positive decimal build-time benchmark parameter.
+///
+/// Keeping this parser here lets Cargo's `option_env!` dependency tracking
+/// rebuild only this crate when a scaling point changes; the pinned leanVM
+/// dependency remains compiled. Invalid values fail the build instead of
+/// silently falling back to the production/demo defaults.
+const fn benchmark_usize(value: Option<&str>, default: usize) -> usize {
+    let Some(value) = value else {
+        return default;
+    };
+    let bytes = value.as_bytes();
+    assert!(!bytes.is_empty(), "benchmark parameter must not be empty");
+    let mut result = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "benchmark parameter must be decimal"
+        );
+        result = match result.checked_mul(10) {
+            Some(value) => value,
+            None => panic!("benchmark parameter overflow"),
+        };
+        result = match result.checked_add((digit - b'0') as usize) {
+            Some(value) => value,
+            None => panic!("benchmark parameter overflow"),
+        };
+        i += 1;
+    }
+    result
+}
+
 /// Committee size `N`.
-pub const N_MEMBERS: usize = 200;
+///
+/// `DROT_BENCH_N` is a compile-time override reserved for
+/// `committee-scaling-benchmark.sh`. Ordinary builds use
+/// [`DEFAULT_N_MEMBERS`].
+pub const N_MEMBERS: usize = benchmark_usize(option_env!("DROT_BENCH_N"), DEFAULT_N_MEMBERS);
 
 /// Threshold `t`: minimum number of distinct committee members per update.
-pub const T: usize = 128;
+///
+/// `DROT_BENCH_T` is paired with `DROT_BENCH_N`; the compile-time assertion
+/// below rejects an invalid scaling point before key generation starts.
+pub const T: usize = benchmark_usize(option_env!("DROT_BENCH_T"), DEFAULT_T);
 
 /// Number of sequential updates the demo performs.
 ///

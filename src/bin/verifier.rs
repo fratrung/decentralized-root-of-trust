@@ -137,7 +137,18 @@ fn main() -> ExitCode {
     // Forgeries: every one must be rejected. A decode failure counts as a
     // rejection: refusing to parse is a valid way to refuse.
     println!("\nForgeries (expected: all REJECTED)");
-    for path in artifacts(dir, "attack-") {
+    let attacks = artifacts(dir, "attack-");
+    for required in [
+        "attack-outsider.bin",
+        "attack-tampered.bin",
+        "attack-version.bin",
+    ] {
+        if !dir.join(required).is_file() {
+            println!("  {required:<22} MISSING <- SECURITY TEST NOT RUN");
+            failures += 1;
+        }
+    }
+    for path in attacks {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let bytes = std::fs::read(&path).expect("cannot read attack artifact");
         let accepted = SnarkStatusList::from_bytes(&bytes)

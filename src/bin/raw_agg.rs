@@ -5,12 +5,15 @@
 //! signatures a quorum produces for one update, published together with a bitmap
 //! naming their signers. There is no proof to build and no proof to check.
 //!
-//! Unlike the SNARK path this runs the **real node types**: every signer is a
+//! In self-contained mode this runs the **real node types**: every signer is a
 //! `SignerNode` spending slots through its own durable `AtomicSlotCounter`, and
 //! the verifier is a `VerifierNode` checking a `StatusList` against the anchor.
-//! The `t` signatures are produced here only because a record needs them; the
-//! cost of producing one is not timed here, since in a deployment it is paid once
-//! each by `t` separate machines. That role is measured in `src/bin/signer.rs`.
+//! With `BENCH_INPUT_DIR`, signing has already happened in a separate fixture
+//! process and this binary measures only the raw relying-party verifier.
+//! In self-contained mode the `t` signatures are produced here only because a
+//! record needs them; their cost is not timed, since in a deployment it is paid
+//! once each by `t` separate machines. That role is measured in
+//! `src/bin/signer.rs`.
 //! What this binary measures is the relying party's side: verify and size.
 //!
 //! Note what this binary does **not** call: neither `setup_prover()` nor
@@ -24,7 +27,7 @@
 //!
 //! Usage: cargo run --release --bin raw_agg          (always --release)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
@@ -42,7 +45,175 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
+fn fixture_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read fixture directory {}: {e}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn load_raw(path: &Path) -> StatusList {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("cannot read raw fixture {}: {e}", path.display()));
+    StatusList::from_bytes(&bytes)
+        .unwrap_or_else(|e| panic!("malformed raw fixture {}: {e}", path.display()))
+}
+
+fn indexed_signatures(record: &StatusList) -> Vec<(usize, XmssSignature)> {
+    record
+        .signer_indices()
+        .zip(record.signatures())
+        .map(|(index, signature)| (index, signature.clone()))
+        .collect()
+}
+
+/// Measures only the raw relying-party role over records prepared by the
+/// separate committee process. No secret key or slot counter is resident here.
+fn run_fixture_verifier(fixture_dir: &Path) {
+    let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
+    let anchor_bytes =
+        std::fs::read(fixture_dir.join("anchor.bin")).expect("cannot read fixture anchor");
+    let committee = Committee::from_bytes(&anchor_bytes).expect("malformed fixture anchor");
+    assert_eq!(
+        committee.members().len(),
+        N_MEMBERS,
+        "fixture N/build N drift"
+    );
+    assert_eq!(committee.threshold(), T, "fixture t/build t drift");
+    let verifier = VerifierNode::new(committee);
+
+    let rss_after_anchor = rss_now_mb();
+    let updates = fixture_files(fixture_dir, "raw-update-");
+    assert_eq!(
+        updates.len(),
+        N_UPDATES,
+        "fixture must contain exactly N_UPDATES honest records"
+    );
+    let mut verify_ms = Vec::with_capacity(updates.len());
+    let mut aggregate_bytes = Vec::with_capacity(updates.len());
+    let mut rss_updates_max = rss_after_anchor;
+
+    for (index, path) in updates.iter().enumerate() {
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|e| panic!("cannot read raw fixture {}: {e}", path.display()));
+        let t_verify = Instant::now();
+        let accepted =
+            StatusList::from_bytes(&bytes).is_ok_and(|record| verifier.verify_status_list(&record));
+        let verify_time = t_verify.elapsed();
+        assert!(accepted, "an honest fixture failed raw verification");
+        let rss = rss_now_mb();
+        rss_updates_max = rss_updates_max.max(rss);
+        println!(
+            "  update {:2}/{}  t={}  verify={:>8.1?}  {} B  RAM={} MB",
+            index + 1,
+            updates.len(),
+            T,
+            verify_time,
+            bytes.len(),
+            rss
+        );
+        if emit_samples {
+            println!(
+                "SAMPLE target=raw_agg idx={index} verify_ms={:.3} bytes={} rss_mb={rss}",
+                ms(verify_time),
+                bytes.len()
+            );
+        }
+        verify_ms.push(ms(verify_time));
+        aggregate_bytes.push(bytes.len());
+    }
+
+    // Preserve the raw-path failure gate while keeping every negative control
+    // outside the timed update series.
+    let honest = load_raw(&fixture_dir.join("raw-attack-honest.bin"));
+    let honest_pairs = indexed_signatures(&honest);
+    let mut tampered_list = honest.list_cloned();
+    tampered_list.push(hash_any(b"FAKE-REVOCATION"));
+    let tampered = StatusList::new(
+        honest.alg,
+        tampered_list,
+        honest.version(),
+        N_MEMBERS,
+        honest_pairs.clone(),
+    )
+    .expect("tampered control must be structurally valid");
+    let tamper_rejected = !verifier.verify_status_list(&tampered);
+
+    let relabelled = StatusList::new(
+        honest.alg,
+        honest.list_cloned(),
+        honest.version() + 1,
+        N_MEMBERS,
+        honest_pairs.clone(),
+    )
+    .expect("relabelled control must be structurally valid");
+    let relabel_rejected = !verifier.verify_status_list(&relabelled);
+
+    let short = StatusList::new(
+        honest.alg,
+        honest.list_cloned(),
+        honest.version(),
+        N_MEMBERS,
+        honest_pairs.into_iter().take(T - 1).collect(),
+    )
+    .expect("short control must be structurally valid");
+    let short_rejected = !verifier.verify_status_list(&short);
+    let outsider = load_raw(&fixture_dir.join("raw-attack-outsider.bin"));
+    let outsider_rejected = !verifier.verify_status_list(&outsider);
+    let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
+
+    let verify = Series::new(verify_ms);
+    let (vf_min, vf_med, vf_max) = verify.min_med_max();
+    aggregate_bytes.sort_unstable();
+    let aggregate_med = aggregate_bytes[aggregate_bytes.len() / 2];
+    let per_signature_us = vf_med * 1000.0 / T as f64;
+
+    println!("\n{} honest updates accepted", verify.len());
+    println!(
+        "forgeries rejected (tampered / relabelled / short / outsider): \
+         {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected}"
+    );
+    println!("verify min/med/max      : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
+    println!("record size (median)    : {aggregate_med} bytes");
+    println!("\nRAM (raw verifier process; no secret keys)");
+    println!("after anchor            : {rss_after_anchor} MB");
+    println!("max during updates      : {rss_updates_max} MB");
+    println!("peak (VmHWM)            : {} MB", peak_rss_mb());
+    println!(
+        "\nRAW_AGG n_members={N_MEMBERS} t={T} n_updates={} \
+         verify_med_ms={vf_med:.3} verify_mean_ms={:.3} verify_sd_ms={:.3} \
+         verify_min_ms={vf_min:.3} verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
+         per_sig_verify_us={per_signature_us:.3} agg_med_bytes={aggregate_med} \
+         rss_keygen_mb={rss_after_anchor} rss_updates_max_mb={rss_updates_max} \
+         peak_rss_mb={} tamper_rejected={} fixture_input=1",
+        verify.len(),
+        verify.mean(),
+        verify.stddev(),
+        verify.sum(),
+        peak_rss_mb(),
+        all_rejected as u8,
+    );
+
+    if !all_rejected {
+        eprintln!("a raw-path negative control was accepted");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
+    if let Some(fixture_dir) = std::env::var_os("BENCH_INPUT_DIR") {
+        run_fixture_verifier(Path::new(&fixture_dir));
+        return;
+    }
+
     // Off by default so interactive runs stay readable; the benchmark harness
     // sets it to collect one row per update.
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();

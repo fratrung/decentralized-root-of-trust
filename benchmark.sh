@@ -23,8 +23,10 @@
 # produces t signatures: each member signs ONCE per round on its own machine and
 # broadcasts, and the aggregator receives t signatures and produces none. A `sign`
 # figure taken from a process that signs t times is the summed work of t machines
-# billed to one, and describes no process that exists. prover/raw_agg/combined
-# still produce their t signatures — a record needs them — but do not time them.
+# billed to one, and describes no process that exists. In ordinary demo mode
+# prover/raw_agg/combined create those signatures outside the timed phase. With
+# BENCH_INPUT_DIR, a separate fixture process creates them before measurement and
+# the measured prover is strictly one aggregator with no secret keys.
 #
 # Produces, in $OUTDIR:
 #   env.txt      full environment capture (reproducibility appendix)
@@ -61,10 +63,42 @@ set -euo pipefail
 # off the sorted array, the whole summary is quietly wrong with no error. Pin C.
 export LC_ALL=C
 
+cd "$(dirname "${BASH_SOURCE[0]}")"
+REPO="$PWD"
+
 RUNS="${RUNS:-20}"
 WARMUP="${WARMUP:-2}"
 TARGETS="${TARGETS:-signer prover verifier raw_agg}"
 OUTDIR="${OUTDIR:-bench-$(date +%Y%m%d-%H%M%S)}"
+BENCH_INPUT_DIR="${BENCH_INPUT_DIR:-}"
+
+# Scaling sweeps override the compile-time demo parameters without editing the
+# source tree. Both values must travel together: changing only N or only t would
+# benchmark a policy the caller did not ask for. Cargo tracks option_env! and
+# recompiles this crate (not the pinned leanVM tree) when either value changes.
+DEFAULT_N="$(sed -n 's/^pub const DEFAULT_N_MEMBERS: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+DEFAULT_T="$(sed -n 's/^pub const DEFAULT_T: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+if { [ -n "${DROT_BENCH_N:-}" ] && [ -z "${DROT_BENCH_T:-}" ]; } ||
+   { [ -z "${DROT_BENCH_N:-}" ] && [ -n "${DROT_BENCH_T:-}" ]; }; then
+  echo "DROT_BENCH_N and DROT_BENCH_T must be set together" >&2
+  exit 1
+fi
+BENCH_N="${DROT_BENCH_N:-$DEFAULT_N}"
+BENCH_T="${DROT_BENCH_T:-$DEFAULT_T}"
+case "$BENCH_N" in ''|*[!0-9]*) echo "benchmark N must be a decimal integer" >&2; exit 1 ;; esac
+case "$BENCH_T" in ''|*[!0-9]*) echo "benchmark t must be a decimal integer" >&2; exit 1 ;; esac
+if [ "$BENCH_N" -lt 1 ] || [ "$BENCH_T" -lt 1 ] || [ "$BENCH_T" -gt "$BENCH_N" ]; then
+  echo "invalid committee parameters: require N >= t >= 1, got N=$BENCH_N t=$BENCH_T" >&2
+  exit 1
+fi
+if [ "$BENCH_N" -gt 2048 ]; then
+  echo "invalid committee size: N=$BENCH_N exceeds MAX_COMMITTEE_SIZE=2048" >&2
+  exit 1
+fi
+if [ -n "$BENCH_INPUT_DIR" ] && [ ! -d "$BENCH_INPUT_DIR" ]; then
+  echo "BENCH_INPUT_DIR is not a directory: $BENCH_INPUT_DIR" >&2
+  exit 1
+fi
 
 # Run targets round-robin instead of in contiguous blocks (default: on).
 #
@@ -84,8 +118,6 @@ STRICT_ENV="${STRICT_ENV:-0}"
 # it if you intend to compare across machines.
 PIN_CPUS="${PIN_CPUS:-}"
 
-cd "$(dirname "${BASH_SOURCE[0]}")"
-REPO="$PWD"
 BIN_DIR="$REPO/target/release"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -99,7 +131,7 @@ SUMMARY_TXT="$OUTDIR/summary.txt"
 
 # ---------------------------------------------------------------- build ----
 echo "building --release ..."
-cargo build --release >/dev/null 2>&1
+cargo build --release --locked >/dev/null 2>&1
 for b in signer prover verifier decentralized-root-of-trust raw_agg; do
   [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
 done
@@ -164,6 +196,8 @@ sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
   echo
   echo "## Parameters (src/params.rs)"
   grep -E '^pub const' src/params.rs | sed 's/^/  /'
+  echo "  resolved N_MEMBERS = $BENCH_N"
+  echo "  resolved T         = $BENCH_T"
   echo
   echo "## Benchmark configuration"
   echo "runs (default)   : $RUNS measured, $WARMUP warmup(s) discarded"
@@ -172,6 +206,8 @@ sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
     echo "  $t: $tr measured, $tw warmup(s)"
   done
   echo "targets          : $TARGETS"
+  echo "committee        : N=$BENCH_N t=$BENCH_T"
+  echo "signed inputs    : ${BENCH_INPUT_DIR:-generated inside each target}"
   echo "kernel RSS probe : ${TIME_BIN:-unavailable (self-reported VmHWM only)}"
   echo
   echo "## lscpu (full)"
@@ -185,6 +221,7 @@ cat <<EOF
 $(sed -n '2,4p' "$ENV_FILE")
 runs      : $RUNS measured (+$WARMUP warmup discarded)
 targets   : $TARGETS
+committee : N=$BENCH_N t=$BENCH_T
 outdir    : $OUTDIR
 EOF
 echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'round-robin across targets' || echo 'contiguous blocks per target')"
@@ -211,7 +248,7 @@ echo
 CORPUS="$SCRATCH/corpus"
 if grep -qw verifier <<<"$TARGETS"; then
   echo "generating fixed verifier corpus ..."
-  "$BIN_DIR/prover" "$CORPUS" >/dev/null 2>&1
+  env -u BENCH_HONEST_ONLY "$BIN_DIR/prover" "$CORPUS" >/dev/null 2>&1
   echo "  $(ls "$CORPUS" | wc -l) artifacts, $(du -sh "$CORPUS" | cut -f1)"
   echo
 fi
@@ -261,7 +298,14 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
   local -a cmd
   case "$target" in
     signer)   cmd=("$BIN_DIR/signer") ;;
-    prover)   rm -rf "$SCRATCH/pout"; cmd=("$BIN_DIR/prover" "$SCRATCH/pout") ;;
+    prover)
+      rm -rf "$SCRATCH/pout"
+      if [ -n "$BENCH_INPUT_DIR" ]; then
+        cmd=(env BENCH_HONEST_ONLY=1 "$BIN_DIR/prover" "$SCRATCH/pout")
+      else
+        cmd=("$BIN_DIR/prover" "$SCRATCH/pout")
+      fi
+      ;;
     verifier) cmd=("$BIN_DIR/verifier" "$CORPUS") ;;
     combined) cmd=("$BIN_DIR/decentralized-root-of-trust") ;;
     raw_agg)  cmd=("$BIN_DIR/raw_agg") ;;
@@ -558,7 +602,9 @@ label() {
     # The first one is named after whatever fixed cost the target actually paid:
     # signer and raw_agg build no circuit, so for them the column is post-keygen.
     signer:rss_after_setup)  echo "RSS after keygen" ;;
-    raw_agg:rss_after_setup) echo "RSS after keygen" ;;
+    raw_agg:rss_after_setup)
+      [ -n "$BENCH_INPUT_DIR" ] && echo "RSS after anchor" || echo "RSS after keygen"
+      ;;
     *:rss_after_setup)       echo "RSS after setup" ;;
     *:rss_max)               echo "RSS max during work" ;;
     *:peak_rss_vmhwm)        echo "peak RSS (VmHWM)" ;;
@@ -573,6 +619,7 @@ label() {
   echo "host      : $(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1) ($(uname -m)), $(nproc) threads"
   echo "governor  : $gov"
   echo "threads   : $(nproc)${PIN_CPUS:+ (pinned to $PIN_CPUS)}"
+  echo "committee : N=$BENCH_N, t=$BENCH_T"
   echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'round-robin across targets' || echo 'contiguous blocks per target')"
   echo "runs      : n=$RUNS measured, $WARMUP warmup(s) discarded (default;"
   echo "            RUNS_<target> may override — the authoritative count is the"
@@ -667,11 +714,16 @@ label() {
   echo "    every run re-executes the binary, so each target above paid it on all"
   echo "    $((RUNS + WARMUP)) of its executions. It dominates total time; never fold it into"
   echo "    per-update figures."
-  echo "  * 'setup' is the leanVM circuit and nothing else. Keygen is a separate row"
-  echo "    because EVERY path pays it, raw_agg included — so the SNARK's extra fixed"
-  echo "    cost is the setup row alone, and raw_agg has no setup row at all. Reading"
-  echo "    raw_agg's keygen against the others' setup compares two different things"
-  echo "    and inverts the answer."
+  echo "  * 'setup' is the leanVM circuit and nothing else."
+  if [ -n "$BENCH_INPUT_DIR" ]; then
+    echo "    Committee key generation and signing ran in the separate fixture process"
+    echo "    before measurement. The prover row is one aggregator holding public keys"
+    echo "    and t ready-made signatures; the raw row is one relying-party verifier."
+  else
+    echo "    Keygen is a separate row because EVERY path pays it, raw_agg included —"
+    echo "    so the SNARK's extra fixed cost is the setup row alone, and raw_agg has no"
+    echo "    setup row. Comparing raw keygen with SNARK setup inverts the answer."
+  fi
   echo "  * Per-update samples within a run are not independent (shared allocator"
   echo "    and cache state). The table's unit is the per-run median; samples.csv"
   echo "    holds every raw observation if you need the pooled distribution."
@@ -685,13 +737,22 @@ label() {
   echo "    above n x median. Verification is near-deterministic and does match."
   echo "  * Exactly one target reports 'sign': signer, which measures ONE member"
   echo "    doing ONE signature per round, preceded by its durable slot burn (write"
-  echo "    + fsync + rename + fsync dir) through SignerNode. prover, combined and"
-  echo "    raw_agg still produce t signatures — a record needs them — but do not"
-  echo "    time them: in a deployment those t signatures come one each from t"
-  echo "    machines, so timing the loop would bill a committee's work to one node."
-  echo "  * signer's keygen and slot-state rows are for ONE key and ONE counter;"
-  echo "    prover/raw_agg report the whole committee's N. Do not read them as the"
-  echo "    same quantity — divide by N first, or compare signer against N=1."
+  echo "    + fsync + rename + fsync dir) through SignerNode."
+  if [ -n "$BENCH_INPUT_DIR" ]; then
+    echo "    The measured prover/raw verifier receive t signatures prepared by the"
+    echo "    fixture process; neither produces signatures or holds secret keys."
+  else
+    echo "    prover, combined and raw_agg create t signatures outside their timed"
+    echo "    phase. In deployment they come one each from t member machines."
+  fi
+  echo "  * signer's keygen and slot-state rows are for ONE key and ONE counter."
+  if [ -n "$BENCH_INPUT_DIR" ]; then
+    echo "    The fixture-mode prover/raw verifier report neither: the committee paid"
+    echo "    those costs outside the measured aggregator and verifier processes."
+  else
+    echo "    prover/raw_agg report the whole committee's N. Do not read them as the"
+    echo "    same quantity — divide by N first, or compare signer against N=1."
+  fi
   echo "  * A member's signing cost is IDENTICAL on both published forms: same key,"
   echo "    same 32-byte message, same derived slot. What the two paths differ in is"
   echo "    only how the quorum is evidenced (t signatures + bitmap vs one proof)"
@@ -700,7 +761,7 @@ label() {
 
   # Derived from THIS sweep, never remembered. Keeping historical figures here
   # would make them look like results of the current run.
-  t_param="$(sed -n 's/^pub const T: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+  t_param="$BENCH_T"
   pv_raw="$(col prover "$C_PROVE_MED")"
   [ -n "$pv_raw" ] || pv_raw="$(col combined "$C_PROVE_MED")"
   if [ -n "$pv_raw" ] && [ -n "$t_param" ]; then

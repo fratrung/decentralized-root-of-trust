@@ -375,11 +375,87 @@ Defaults:
 
 - `RUNS=20`;
 - `WARMUP=2`;
+- `N_UPDATES=20` rounds inside each process run;
 - `TARGETS="signer prover verifier raw_agg"`.
+
+Thus the default harness starts each target 22 times: two warm-ups whose data
+is discarded, followed by 20 measured process runs. Each measured run contains
+20 update-level observations. Those observations share one process and are not
+treated as independent replicates; the reported cross-run statistics use each
+run's median as their unit of analysis.
 
 Each run writes a `bench-<timestamp>/` directory containing environment
 metadata, raw samples, per-process rows and summary statistics. The harness
 refuses to report timings when a target reports a failed security expectation.
+
+### Committee scaling
+
+[`committee-scaling-benchmark.sh`](committee-scaling-benchmark.sh) orchestrates
+`benchmark.sh` over `N = 5, 10, 100, 500` and, when the host has enough
+available memory, `1000` and `1500`. It applies the strict two-thirds policy
+
+```text
+t = floor(2N/3) + 1
+```
+
+as an explicit committee-authorization threshold, not as a claim that this
+project implements a consensus protocol.
+
+```sh
+./committee-scaling-benchmark.sh
+PLAN_ONLY=1 ./committee-scaling-benchmark.sh
+RUNS=10 WARMUP=2 STRICT_ENV=1 PIN_CPUS=0-7 ./committee-scaling-benchmark.sh
+```
+
+Before doing any work, the script prints and records the host's physical and
+available RAM, the operating-system reserve, the enforced RSS cap and the
+largest admitted committee. Its conservative defaults admit `N=1000` only with
+at least 12 GiB of usable benchmark budget and `N=1500` with at least 20 GiB;
+otherwise the planned sweep stops at `N=500`.
+
+Every build, fixture generation and benchmark point then runs serially in its
+own process group. The active group is terminated and that point is withheld if
+its RSS exceeds the announced cap, available RAM falls below the reserve, swap
+grows by more than 64 MiB, or a stage exceeds the 90-minute default timeout.
+`MAX_RSS_MB`, `RESERVE_MB`, `MAX_SWAP_GROWTH_MB` and
+`POINT_TIMEOUT_MINUTES` can make these limits stricter. An unsafe
+`MAX_RSS_MB` request is clamped to the host-derived ceiling.
+
+Before the sweep, `benchmark.sh` measures the `signer` target once as a separate
+single-member campaign, using the same run and warm-up counts. It is not repeated
+for every `(N,t)`: one member's XMSS operation is identical for both publication
+forms and independent of committee size. The result is kept in `signer.csv` and
+reported separately rather than multiplied by `t`; those signatures are produced
+by distinct member machines and may proceed in parallel.
+
+An unmeasured `committee_fixture` process then generates the signatures once per
+point. The measured `prover` is therefore one aggregator holding public keys
+and ready-made signatures—never `N` aggregators or one process retaining all
+committee secret keys. The raw measurement likewise runs as a verifier-only
+process over the same signed records.
+
+The top-level output contains:
+
+- `memory-decision.txt` — the announced admission and runtime limits;
+- `signer.csv` and `signer/benchmark/` — the single-member campaign, measured
+  once for the complete sweep;
+- `manifest.csv` — completed, stopped and RAM-excluded points;
+- `scaling.csv` — proving/verification medians, wire size, RSS and derived ratios;
+- `report.txt` — the first observed wire-size, verification-time and joint
+  crossover;
+- `Nxxxx-tyyyy/benchmark/` — the complete `benchmark.sh` output for each point,
+  including raw observations and confidence intervals.
+
+When SNARK verification is faster, the report also computes the number of
+independent relying-party verifications needed to amortize one proof:
+
+```text
+ceil(prove_ms / (raw_verify_ms - snark_verify_ms))
+```
+
+This deliberately excludes one-time setup, signing, network transfer and
+fixture generation; those costs have different owners and must not be folded
+into one latency figure.
 
 ## Dependencies
 

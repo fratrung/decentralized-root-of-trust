@@ -38,6 +38,8 @@ cargo fmt --all -- --check                             # formatting gate used by
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked                                    # 65 unit + 10 integration tests; 74 run + 1 ignored
 ./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
+./committee-scaling-benchmark.sh                       # RAM-gated N/t sweep over benchmark.sh
+PLAN_ONLY=1 ./committee-scaling-benchmark.sh           # persist the host-derived sweep limit only
 tools/mutate.py                                        # mutation testing: 30 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
 ./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
@@ -157,7 +159,10 @@ Library:
   what keeps the unit tests to byte strings.
 - `src/params.rs` — demo parameters (`SLOT` = the genesis slot, `N_MEMBERS`, `T`,
   `N_UPDATES`, `KEY_SLOTS`, `LOG_INV_RATE`), shared by `main.rs`, `prover` and
-  `raw_agg`. The `verifier` deliberately imports none of them.
+  `raw_agg`. The `verifier` deliberately imports none of them. Ordinary builds
+  use `DEFAULT_N_MEMBERS`/`DEFAULT_T`; the scaling script sets the paired
+  compile-time overrides `DROT_BENCH_N`/`DROT_BENCH_T`. They are benchmark-only:
+  setting only one is refused, and invalid pairs fail before key generation.
 - `src/state/freshness.rs` — `HighWaterMark`, the persistent anti-rollback gate. Strict
   monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
   committee rotation resets it, persisted with a write-then-rename. Lives *outside*
@@ -197,7 +202,10 @@ Binaries:
   also the one binary that does not go through the node types end to end: it calls
   `setup_prover`/`setup_verifier` directly, to time the two phases apart, and signs
   with `leanvm::xmss::sign` rather than through `SignerNode`.
-- `src/bin/prover.rs` — holds the secret keys, writes artifacts, **never verifies**.
+- `src/bin/prover.rs` — writes artifacts and **never verifies**. Its normal demo
+  mode generates signing keys locally. With `BENCH_INPUT_DIR` it receives raw
+  signed fixtures and becomes the measured production-shaped role: one
+  aggregator, public keys plus `t` signatures, no committee secret keys.
 - `src/bin/verifier.rs` — calls **only** `setup_verifier()`; loads `anchor.bin`
   and hardcodes nothing else.
 - `src/bin/raw_agg.rs` — the no-SNARK baseline. It spends slots through
@@ -208,6 +216,10 @@ Binaries:
   durable counter, one signature per round. The only binary that reports a `sign`
   figure, because it is the only one whose process shape matches the role. Every
   round self-verifies as a failure gate.
+- `src/bin/committee_fixture.rs` — scaling support, never a measured role. It
+  generates a fresh committee and canonical raw records while preserving the
+  XMSS one-key/one-slot rule, then exits. This gives measured `prover` and
+  `raw_agg` the same ready-made signatures without either holding member secrets.
 
 Every binary goes through the node types, because there is nothing else to call:
 `prover`/`main` through `PQSNARKProverModule`, `verifier`/`main` through
@@ -617,3 +629,36 @@ Nothing in the output is extrapolated to other hardware, and nothing should be
 added that is: `target-cpu=native` makes the binaries host-specific, so the only
 honest way to get numbers for another machine is to run `benchmark.sh` there. A
 projection block existed once and was removed — do not reintroduce it.
+
+### Committee-scaling orchestrator
+
+`committee-scaling-benchmark.sh` must remain an orchestrator over
+`benchmark.sh`, not a second measurement implementation. `benchmark.sh` remains
+the authority for scheduling, raw samples, descriptive statistics, confidence
+intervals and security failure gates. The scaling layer measures the `signer`
+target once for the whole campaign, then chooses `(N,t)`, prepares unmeasured
+signatures, enforces resources, invokes one complete benchmark per point and
+joins the resulting `summary.csv` files. The signer result stays separate in
+`signer.csv`: it is a one-member cost common to both publication forms, not a
+quantity to multiply by `t` or repeat at every committee size.
+
+The requested grid is `N = 5, 10, 100, 500, 1000, 1500`, with
+`t = floor(2N/3) + 1`. This is a strict two-thirds authorization policy, not PBFT
+or another consensus protocol. `N=5..500` is the base grid. At startup the script
+derives a usable process budget as the smaller of 70% of physical RAM and
+`MemAvailable - host reserve`; it admits `N=1000` at 12 GiB and `N=1500` at
+20 GiB. It prints and persists that decision before building anything.
+
+Admission never disables the live guard. Build, fixture and benchmark stages run
+serially in separate process groups. A point is terminated and withheld when
+RSS crosses the announced cap, `MemAvailable` crosses the reserve, swap grows
+beyond the allowance, or the timeout expires. After such a stop no larger point
+runs. Keep this explicit in `manifest.csv`; never turn a resource abort into a
+partial timing row.
+
+The combined report may derive only quantities supported by completed
+`benchmark.sh` summaries: wire-size ratio, raw/SNARK verification ratio, first
+observed crossover and the verifier-consumer amortization count
+`ceil(prove / (raw_verify - snark_verify))`. That count excludes process setup,
+networking, signing and fixture generation. Do not call it end-to-end latency or
+extrapolate a crossover between measured grid points.

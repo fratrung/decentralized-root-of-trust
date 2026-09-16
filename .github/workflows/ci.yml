@@ -50,6 +50,9 @@ jobs:
       - name: Validate mutation catalogue
         run: tools/mutate.py check
 
+      - name: Check benchmark shell syntax
+        run: bash -n benchmark.sh committee-scaling-benchmark.sh
+
       - name: Lint
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
