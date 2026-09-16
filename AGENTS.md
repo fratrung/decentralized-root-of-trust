@@ -34,7 +34,9 @@ cargo run --release --bin raw_agg                      # the same protocol with 
 cargo run --release --bin prover   -- [outdir]         # split: aggregate, writes artifacts (default ./artifacts)
 cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
-cargo test                                             # 65 unit + 10 integration tests; 74 run + 1 ignored
+cargo fmt --all -- --check                             # formatting gate used by CI
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked                                    # 65 unit + 10 integration tests; 74 run + 1 ignored
 ./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
 tools/mutate.py                                        # mutation testing: 30 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
@@ -65,6 +67,10 @@ timings if any run reports a failure.
 deeply) and `target-cpu=native`. Both are required — don't run the binary in a
 context that bypasses that config. Note `target-cpu=native` makes builds
 host-specific: benchmark numbers are not portable across machines.
+`rust-toolchain.toml` pins Rust 1.90.0 plus `rustfmt` and `clippy`. CI uses one
+Linux job for both crates and caches Cargo sources only: sharing `target/`
+between hosted runners would be unsafe because those artifacts were compiled
+for the previous runner's native CPU.
 
 ## Architecture
 
@@ -225,7 +231,7 @@ Tests (`cargo test`, 75 registered: 74 run plus one `#[ignore]`d):
   `status_list_message` is BLAKE2s-256 of the exact domain/version/count/entries
   framing, that it moves with both list and version — the content of check 2 —,
   that it stays order-sensitive, and that retired wire tag `0` is
-  rejected. `crypto.rs` pins the count-to-inclusive-range conversion. `stats.rs`'s
+  rejected. `stats.rs`'s
   are worth a note: they are the only guard on the numbers that reach the paper,
   and they pin the two choices a "simplification" would silently undo — the
   median over a lone mean, and the Bessel-corrected (`n-1`) standard deviation

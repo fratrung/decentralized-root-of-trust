@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Cache Cargo sources
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # target-cpu=native makes target artifacts specific to one runner CPU.
+          cache-targets: false
+          cache-on-failure: false
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check demo formatting
+        working-directory: demo
+        run: cargo fmt --all -- --check
+
+      - name: Validate mutation catalogue
+        run: tools/mutate.py check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Lint demo
+        working-directory: demo
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Test demo
+        working-directory: demo
+        run: cargo test --locked

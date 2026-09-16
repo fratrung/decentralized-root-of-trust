@@ -228,8 +228,9 @@ silently upgraded.
 
 ## Build
 
-The project requires a Rust toolchain capable of building the pinned leanVM
-revision.
+The repository pins Rust 1.90.0, with `rustfmt` and `clippy`, in
+[`rust-toolchain.toml`](rust-toolchain.toml). Rustup selects and installs that
+toolchain automatically.
 
 ```sh
 cargo build --release
@@ -351,6 +352,13 @@ tools/mutate.py
 
 The current catalog contains 30 mutations. Each removes or weakens one
 security-relevant check and must be detected by the test suite.
+
+GitHub Actions runs formatting, Clippy with warnings denied, the mutation
+catalog consistency check, and the complete tests for both the root crate and
+the independent `demo/` crate. It uses one Linux job so the expensive leanVM
+build is shared by all checks in that run. Benchmarks, container scenarios and
+the full mutation campaign remain explicit local jobs; they are intentionally
+excluded from pull-request CI.
 
 ## Benchmark
 
