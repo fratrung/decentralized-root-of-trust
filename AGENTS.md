@@ -36,7 +36,7 @@ cargo run --release --bin verifier -- [dir]            # split: verify-only, exi
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
 cargo fmt --all -- --check                             # formatting gate used by CI
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --locked                                    # 65 unit + 10 integration tests; 74 run + 1 ignored
+cargo test --locked                                    # 67 unit + 10 integration tests; 75 run + 1 ignored
 ./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
 ./committee-scaling-benchmark.sh                       # RAM-gated N/t sweep over benchmark.sh
 PLAN_ONLY=1 ./committee-scaling-benchmark.sh           # persist the host-derived sweep limit only
@@ -237,7 +237,7 @@ committee of one, and the raw path with a real `t`-of-`N` quorum. They write slo
 state into the working directory (`next_slot`, `signers/`), which `.gitignore`
 covers.
 
-Tests (`cargo test`, 75 registered: 74 run plus one `#[ignore]`d):
+Tests (`cargo test`, 76 registered: 75 run plus one `#[ignore]`d):
 - `src/*.rs` unit tests cover each module against its own contract.
   `status_list.rs`'s pin the seam this crate has with leanVM: that
   `status_list_message` is BLAKE2s-256 of the exact domain/version/count/entries
@@ -599,7 +599,7 @@ process**, and no target is charged for another role's work:
 | target | role | reports |
 |---|---|---|
 | `signer` | one committee member | `sign` per round (incl. its durable slot burn), 1 key, 1 counter |
-| `prover` | the aggregator | `prove` per update, `setup`, `N` keys |
+| `prover` | the aggregator | `prove` per update, `setup`, complete `SnarkStatusList` size |
 | `verifier` | a relying party | `verify` per record, `setup` |
 | `raw_agg` | the no-SNARK baseline | `verify` per record + record size |
 
@@ -613,17 +613,37 @@ nobody produces `t` signatures: each member signs *once* per round on its own
 machine and broadcasts, and the aggregator receives `t` and produces none. Timing
 a loop that signs `t` times sums the work of `t` machines and bills it to one —
 which is what the `sign / update` column used to do for a process that does not
-exist. `prover`, `combined` and `raw_agg` still *produce*
-their `t` signatures, because a record needs them; they just do not time them.
+exist. By default, one unmeasured `committee_fixture` produces the signed raw
+records before the sweep. `raw_agg` verifies those `StatusList` records, while
+`prover` consumes the same logical signed inputs and writes
+`SnarkStatusList` records. Neither measured process holds committee secret keys.
+`BENCH_SELF_CONTAINED=1` retains the former all-in-one process shape only for
+diagnostic back-comparison; in that mode `prover`, `combined` and `raw_agg`
+produce signatures outside their timed phase.
 
 A member's signing cost is identical on both published forms — same key, same
 32-byte message, same derived slot — so the `signer` row applies unchanged to the
 SNARK and the raw path, and what separates the two paths is only how the quorum is
 evidenced and what a relying party pays to check it.
 
-`signer`'s `keygen` and `slot_state` are for **one** key and **one** counter,
-where `prover`/`raw_agg` report the whole committee's `N`. Do not read them as the
-same quantity.
+`signer`'s `keygen` and `slot_state` are for **one** key and **one** counter.
+In the default fixture-shaped benchmark, `prover` and `raw_agg` report neither
+cost because the measured aggregator and verifier do not own signer state. The
+self-contained diagnostic mode reports the whole committee's `N`; do not read
+those figures as the same quantity as the signer row.
+
+The default schedule uses a Williams-style balanced target order and an idle
+`COOLDOWN_SECONDS=2` before every process. This balances position and immediate
+predecessor across complete blocks and reduces thermal carry-over. It does not
+prove equal temperature, so retain `t_start` and inspect drift before publishing.
+`INTERLEAVE=0` remains the contiguous legacy order.
+
+`runs.csv` calls its shared size column `artifact_med_bytes`. In
+`summary.csv`, the public metric name is `signature_size`, `record_size` or
+`proof_size` according to the actual serialized object. `prover` and
+`raw_agg` measure the complete published record; only `combined` measures the
+proof body. All even-sized byte samples use the arithmetic mean of their two
+central observations.
 
 Nothing in the output is extrapolated to other hardware, and nothing should be
 added that is: `target-cpu=native` makes the binaries host-specific, so the only

@@ -376,13 +376,38 @@ Defaults:
 - `RUNS=20`;
 - `WARMUP=2`;
 - `N_UPDATES=20` rounds inside each process run;
-- `TARGETS="signer prover verifier raw_agg"`.
+- `TARGETS="signer prover verifier raw_agg"`;
+- `COOLDOWN_SECONDS=2` before every target process;
+- balanced target ordering (`INTERLEAVE=1`).
 
 Thus the default harness starts each target 22 times: two warm-ups whose data
 is discarded, followed by 20 measured process runs. Each measured run contains
 20 update-level observations. Those observations share one process and are not
 treated as independent replicates; the reported cross-run statistics use each
 run's median as their unit of analysis.
+
+Before measurement, the default harness runs `committee_fixture` once. That
+unmeasured process creates the committee, the raw `StatusList` records and their
+XMSS signatures. `raw_agg` verifies those records directly. `prover` consumes
+the same signed inputs and emits `SnarkStatusList` records; the fixed verifier
+corpus is generated from them once and reused by every verifier run. Consequently
+the measured raw process is a relying-party verifier and the measured prover is
+one aggregator, not a hidden committee signer. `BENCH_SELF_CONTAINED=1` retains
+the older diagnostic mode in which each target generates its own keys and
+signatures.
+
+The default order is a Williams-style balanced crossover sequence rather than a
+fixed round-robin: across a complete block, target position and immediate
+predecessor are balanced. The cooldown reduces thermal carry-over between
+processes; it does not assert equal package temperature, so `runs.csv` retains
+each start time for drift analysis.
+
+Size rows name the serialized object they measure: `signature_size` for one
+XMSS signature and `record_size` for the complete `StatusList` or
+`SnarkStatusList`. The optional `combined` target alone reports
+`proof_size`, because it measures `SnarkStatusList::proof_bytes()` rather than
+the whole record. Even-sized samples use the conventional median, the arithmetic
+mean of the two central observations.
 
 Each run writes a `bench-<timestamp>/` directory containing environment
 metadata, raw samples, per-process rows and summary statistics. The harness

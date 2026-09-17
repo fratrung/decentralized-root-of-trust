@@ -26,6 +26,7 @@ STRICT_ENV="${STRICT_ENV:-0}"
 PLAN_ONLY="${PLAN_ONLY:-0}"
 PIN_CPUS="${PIN_CPUS:-}"
 INTERLEAVE="${INTERLEAVE:-1}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-2}"
 POINT_TIMEOUT_MINUTES="${POINT_TIMEOUT_MINUTES:-90}"
 MONITOR_INTERVAL_SECONDS="${MONITOR_INTERVAL_SECONDS:-2}"
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-15}"
@@ -57,6 +58,7 @@ positive_integer() {
 }
 positive_integer RUNS "$RUNS"
 case "$WARMUP" in ''|*[!0-9]*) echo "WARMUP must be a non-negative integer" >&2; exit 1 ;; esac
+case "$COOLDOWN_SECONDS" in ''|*[!0-9]*) echo "COOLDOWN_SECONDS must be a non-negative integer" >&2; exit 1 ;; esac
 case "$PLAN_ONLY" in 0|1) ;; *) echo "PLAN_ONLY must be 0 or 1" >&2; exit 1 ;; esac
 positive_integer POINT_TIMEOUT_MINUTES "$POINT_TIMEOUT_MINUTES"
 positive_integer MONITOR_INTERVAL_SECONDS "$MONITOR_INTERVAL_SECONDS"
@@ -133,6 +135,7 @@ SIGNER_CSV="$OUTDIR/signer.csv"
   echo "enforced process-group cap: $MEMORY_LIMIT_MB MB"
   echo "allowed swap growth       : $MAX_SWAP_GROWTH_MB MB"
   echo "timeout per stage         : $POINT_TIMEOUT_MINUTES minutes"
+  echo "cooldown per target       : $COOLDOWN_SECONDS seconds"
   echo "N=1000 admission threshold: $RAM_FOR_N1000_MB MB -> $N1000_REASON"
   echo "N=1500 admission threshold: $RAM_FOR_N1500_MB MB -> $N1500_REASON"
   echo "selected committee sizes  : ${SELECTED_SIZES[*]}"
@@ -279,6 +282,7 @@ elif run_guarded "single-member signer benchmark" "$SIGNER_DIR/benchmark.log" \
     env DROT_BENCH_N=5 DROT_BENCH_T=4 \
     RUNS="$RUNS" WARMUP="$WARMUP" TARGETS="signer" \
     STRICT_ENV="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
+    COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
     OUTDIR="$SIGNER_BENCHMARK_DIR" "$REPO/benchmark.sh"; then
   if [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
     write_status "$SIGNER_DIR" "complete" "single-member benchmark.sh failure gates passed"
@@ -343,6 +347,7 @@ for n in "${SELECTED_SIZES[@]}"; do
       env DROT_BENCH_N="$n" DROT_BENCH_T="$t" BENCH_INPUT_DIR="$fixture_dir" \
       RUNS="$RUNS" WARMUP="$WARMUP" TARGETS="prover verifier raw_agg" \
       STRICT_ENV="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
+      COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
       OUTDIR="$benchmark_dir" "$REPO/benchmark.sh"; then
     write_status "$point_dir" "benchmark_failed" "$GUARD_REASON"
     STOP_FURTHER=1
@@ -411,8 +416,8 @@ for n in "${SELECTED_SIZES[@]}"; do
   prove="$(summary_value "$summary" prover prove_per_item)"
   snark_verify="$(summary_value "$summary" verifier verify_per_item)"
   raw_verify="$(summary_value "$summary" raw_agg verify_per_item)"
-  snark_bytes="$(summary_value "$summary" prover proof_size)"
-  raw_bytes="$(summary_value "$summary" raw_agg proof_size)"
+  snark_bytes="$(summary_value "$summary" prover record_size)"
+  raw_bytes="$(summary_value "$summary" raw_agg record_size)"
   prover_rss="$(summary_rss "$summary" prover)"
   snark_verifier_rss="$(summary_rss "$summary" verifier)"
   raw_verifier_rss="$(summary_rss "$summary" raw_agg)"
@@ -433,6 +438,7 @@ done
   echo "host      : $(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
   echo "policy    : t=floor(2N/3)+1 (strict two-thirds supermajority)"
   echo "runs      : $RUNS measured + $WARMUP warmup per target campaign"
+  echo "cooldown  : $COOLDOWN_SECONDS seconds before every measured process"
   echo "roles     : one signer campaign; per point, one aggregator, one SNARK verifier and one raw verifier"
   echo "RAM plan  : ${AVAILABLE_MB} MB initially available; ${MEMORY_LIMIT_MB} MB process cap; selected N<=${MAX_SELECTED_N}"
   echo
@@ -442,7 +448,7 @@ done
     signer_keygen="$(summary_value "$SIGNER_CSV" signer keygen)"
     signer_slot_state="$(summary_value "$SIGNER_CSV" signer slot_state)"
     signer_sign="$(summary_value "$SIGNER_CSV" signer sign_per_item)"
-    signer_bytes="$(summary_value "$SIGNER_CSV" signer proof_size)"
+    signer_bytes="$(summary_value "$SIGNER_CSV" signer signature_size)"
     signer_rss="$(summary_rss "$SIGNER_CSV" signer)"
     printf "  key generation (one key) : %.2f ms\n" "$signer_keygen"
     printf "  durable slot state       : %.2f ms\n" "$signer_slot_state"

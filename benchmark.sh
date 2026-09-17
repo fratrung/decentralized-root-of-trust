@@ -11,8 +11,7 @@
 # plus the baseline the SNARK has to beat:
 #   raw_agg   crude multisig, NO SNARK              (src/bin/raw_agg.rs)
 #             verify scales with t, unlike the constant-time SNARK verify, and
-#             proof_size is the raw aggregate size (t signatures + bitmap on the
-#             wire) rather than a proof
+#             record_size is the complete StatusList on the wire
 #
 # `combined` (src/main.rs, the single-process demo) is NOT in the defaults. It
 # measures a process that proves and verifies at once, which is not a role anyone
@@ -23,10 +22,11 @@
 # produces t signatures: each member signs ONCE per round on its own machine and
 # broadcasts, and the aggregator receives t signatures and produces none. A `sign`
 # figure taken from a process that signs t times is the summed work of t machines
-# billed to one, and describes no process that exists. In ordinary demo mode
-# prover/raw_agg/combined create those signatures outside the timed phase. With
-# BENCH_INPUT_DIR, a separate fixture process creates them before measurement and
-# the measured prover is strictly one aggregator with no secret keys.
+# billed to one, and describes no process that exists. By default a separate,
+# unmeasured fixture process creates the signed inputs once; the measured prover
+# is then strictly one aggregator with no secret keys and raw_agg is strictly one
+# relying-party verifier. BENCH_SELF_CONTAINED=1 retains the older all-in-one
+# process shape for diagnostic back-comparison.
 #
 # Produces, in $OUTDIR:
 #   env.txt      full environment capture (reproducibility appendix)
@@ -40,10 +40,10 @@
 # state and are not independent. samples.csv keeps every raw observation so the
 # pooled distribution can be re-analysed if that is what you want to report.
 #
-# Targets are run ROUND-ROBIN by default, not in contiguous blocks, so that a
-# thermal ramp or a background job during the sweep perturbs every target rather
-# than biasing whichever one happened to be running. runs.csv records the epoch
-# timestamp of each run so the assumption can be checked rather than trusted.
+# Targets use a balanced Williams-style order by default and cool down before
+# each process. Across a complete block, each target occupies each position and
+# precedes every other target equally often. runs.csv records the epoch timestamp
+# of each run so residual drift can be inspected rather than assumed away.
 #
 #   ./benchmark.sh
 #   RUNS=30 WARMUP=3 ./benchmark.sh
@@ -71,6 +71,8 @@ WARMUP="${WARMUP:-2}"
 TARGETS="${TARGETS:-signer prover verifier raw_agg}"
 OUTDIR="${OUTDIR:-bench-$(date +%Y%m%d-%H%M%S)}"
 BENCH_INPUT_DIR="${BENCH_INPUT_DIR:-}"
+BENCH_SELF_CONTAINED="${BENCH_SELF_CONTAINED:-0}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-2}"
 
 # Scaling sweeps override the compile-time demo parameters without editing the
 # source tree. Both values must travel together: changing only N or only t would
@@ -100,7 +102,16 @@ if [ -n "$BENCH_INPUT_DIR" ] && [ ! -d "$BENCH_INPUT_DIR" ]; then
   exit 1
 fi
 
-# Run targets round-robin instead of in contiguous blocks (default: on).
+case "$RUNS" in ''|*[!0-9]*|0) echo "RUNS must be a positive integer" >&2; exit 1 ;; esac
+case "$WARMUP" in ''|*[!0-9]*) echo "WARMUP must be a non-negative integer" >&2; exit 1 ;; esac
+case "$COOLDOWN_SECONDS" in ''|*[!0-9]*) echo "COOLDOWN_SECONDS must be a non-negative integer" >&2; exit 1 ;; esac
+case "$BENCH_SELF_CONTAINED" in 0|1) ;; *) echo "BENCH_SELF_CONTAINED must be 0 or 1" >&2; exit 1 ;; esac
+if [ "$BENCH_SELF_CONTAINED" = 1 ] && [ -n "$BENCH_INPUT_DIR" ]; then
+  echo "BENCH_SELF_CONTAINED=1 conflicts with BENCH_INPUT_DIR" >&2
+  exit 1
+fi
+
+# Run targets in balanced blocks instead of target-sized contiguous blocks.
 #
 # Blocks confound target identity with time: a thermal ramp or a background job
 # that lands during the prover block is indistinguishable, in the data, from the
@@ -108,15 +119,35 @@ fi
 # targets, so it inflates variance instead of biasing one mean. Set 0 to restore
 # block order (only useful when comparing against an older block-ordered run).
 INTERLEAVE="${INTERLEAVE:-1}"
+case "$INTERLEAVE" in 0|1) ;; *) echo "INTERLEAVE must be 0 or 1" >&2; exit 1 ;; esac
 
 # Refuse to measure unless the governor is 'performance'. Off by default because
 # it needs root to fix, on for anything whose numbers get published.
 STRICT_ENV="${STRICT_ENV:-0}"
+case "$STRICT_ENV" in 0|1) ;; *) echo "STRICT_ENV must be 0 or 1" >&2; exit 1 ;; esac
 
 # Optional CPU pinning, e.g. PIN_CPUS=0-7. leanVM's pool is sized from the
 # affinity mask at startup, so this also fixes the thread count — pin and record
 # it if you intend to compare across machines.
 PIN_CPUS="${PIN_CPUS:-}"
+
+read -r -a TARGET_LIST <<<"$TARGETS"
+[ "${#TARGET_LIST[@]}" -gt 0 ] || { echo "TARGETS must not be empty" >&2; exit 1; }
+declare -A SEEN_TARGETS=()
+for target in "${TARGET_LIST[@]}"; do
+  case "$target" in signer|prover|verifier|raw_agg|combined) ;; *) echo "unknown target: $target" >&2; exit 1 ;; esac
+  [ -z "${SEEN_TARGETS[$target]:-}" ] || { echo "duplicate target: $target" >&2; exit 1; }
+  SEEN_TARGETS[$target]=1
+done
+
+if [ -n "$PIN_CPUS" ]; then
+  taskset -c "$PIN_CPUS" true >/dev/null 2>&1 || { echo "invalid/unavailable PIN_CPUS=$PIN_CPUS" >&2; exit 1; }
+  EFFECTIVE_THREADS="$(taskset -c "$PIN_CPUS" nproc)"
+  TARGET_AFFINITY="$(taskset -c "$PIN_CPUS" sh -c "sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status")"
+else
+  EFFECTIVE_THREADS="$(nproc)"
+  TARGET_AFFINITY="$(taskset -cp $$ 2>/dev/null | sed 's/.*: //' || echo n/a)"
+fi
 
 BIN_DIR="$REPO/target/release"
 SCRATCH="$(mktemp -d)"
@@ -132,15 +163,54 @@ SUMMARY_TXT="$OUTDIR/summary.txt"
 # ---------------------------------------------------------------- build ----
 echo "building --release ..."
 cargo build --release --locked >/dev/null 2>&1
-for b in signer prover verifier decentralized-root-of-trust raw_agg; do
+for b in signer prover verifier decentralized-root-of-trust raw_agg committee_fixture; do
   [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
 done
+
+AUTO_FIXTURE=0
+if [ "$BENCH_SELF_CONTAINED" = 0 ] && [ -z "$BENCH_INPUT_DIR" ]; then
+  for target in "${TARGET_LIST[@]}"; do
+    case "$target" in prover|verifier|raw_agg)
+      BENCH_INPUT_DIR="$SCRATCH/committee-fixture"
+      AUTO_FIXTURE=1
+      export BENCH_INPUT_DIR
+      break
+      ;;
+    esac
+  done
+fi
+if [ -n "$BENCH_INPUT_DIR" ]; then
+  INPUT_MODE=fixture
+elif [ "$BENCH_SELF_CONTAINED" = 1 ]; then
+  INPUT_MODE=self-contained
+else
+  INPUT_MODE=target-native
+fi
 
 TIME_BIN=""
 [ -x /usr/bin/time ] && TIME_BIN=/usr/bin/time
 
 # ------------------------------------------------------ environment ----
 sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
+
+TARGET_CPU_IDS="$(awk -v list="$TARGET_AFFINITY" 'BEGIN {
+  count=split(list, parts, ",")
+  for (i=1; i<=count; i++) {
+    if (index(parts[i], "-")) {
+      split(parts[i], bounds, "-")
+      for (cpu=bounds[1]; cpu<=bounds[2]; cpu++) print cpu
+    } else if (parts[i] ~ /^[0-9]+$/) {
+      print parts[i]
+    }
+  }
+}')"
+GOVERNORS="$({
+  for cpu in $TARGET_CPU_IDS; do
+    path="/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor"
+    [ -r "$path" ] && cat "$path"
+  done
+} | sort -u | paste -sd, -)"
+[ -n "$GOVERNORS" ] || GOVERNORS=n/a
 
 {
   echo "# Environment capture — benchmark of $(basename "$REPO")"
@@ -151,8 +221,9 @@ sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
   echo "## CPU"
   echo "model            : $(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
   echo "arch             : $(uname -m)"
-  echo "online cpus      : $(nproc)"
-  echo "governor         : $(sysread /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+  echo "system CPUs      : $(nproc --all)"
+  echo "harness CPUs     : $(nproc)"
+  echo "target governors : $GOVERNORS"
   echo "scaling driver   : $(sysread /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver)"
   echo "boost            : $(sysread /sys/devices/system/cpu/cpufreq/boost)"
   echo "intel no_turbo   : $(sysread /sys/devices/system/cpu/intel_pstate/no_turbo)"
@@ -161,8 +232,9 @@ sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
   # in a OnceLock, with no environment override. So the thread count is whatever
   # the CPU affinity mask allows at startup — a first-class independent variable
   # that nothing else in this file would otherwise record.
-  echo "cpu affinity     : $(taskset -cp $$ 2>/dev/null | sed 's/.*: //' || echo 'n/a')"
-  echo "effective threads: $(nproc)  <- leanVM worker pool size"
+  echo "harness affinity : $(taskset -cp $$ 2>/dev/null | sed 's/.*: //' || echo 'n/a')"
+  echo "target affinity  : $TARGET_AFFINITY"
+  echo "effective threads: $EFFECTIVE_THREADS  <- leanVM worker pool size"
   echo "pinned to        : ${PIN_CPUS:-<not pinned>}"
   echo
   echo "## Memory"
@@ -201,20 +273,23 @@ sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
   echo
   echo "## Benchmark configuration"
   echo "runs (default)   : $RUNS measured, $WARMUP warmup(s) discarded"
-  for t in $TARGETS; do
-    eval "tr=\${RUNS_$t:-$RUNS}; tw=\${WARMUP_$t:-$WARMUP}"
+  for t in "${TARGET_LIST[@]}"; do
+    runs_var="RUNS_$t"; warmup_var="WARMUP_$t"
+    tr="${!runs_var:-$RUNS}"; tw="${!warmup_var:-$WARMUP}"
     echo "  $t: $tr measured, $tw warmup(s)"
   done
   echo "targets          : $TARGETS"
   echo "committee        : N=$BENCH_N t=$BENCH_T"
   echo "signed inputs    : ${BENCH_INPUT_DIR:-generated inside each target}"
+  echo "input mode       : $INPUT_MODE"
+  echo "cooldown         : ${COOLDOWN_SECONDS}s before every target process"
   echo "kernel RSS probe : ${TIME_BIN:-unavailable (self-reported VmHWM only)}"
   echo
   echo "## lscpu (full)"
   lscpu 2>/dev/null | sed 's/^/  /'
 } > "$ENV_FILE"
 
-gov="$(sysread /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+gov="$GOVERNORS"
 
 cat <<EOF
 
@@ -224,9 +299,10 @@ targets   : $TARGETS
 committee : N=$BENCH_N t=$BENCH_T
 outdir    : $OUTDIR
 EOF
-echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'round-robin across targets' || echo 'contiguous blocks per target')"
+echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'balanced across targets' || echo 'contiguous blocks per target')"
+echo "cooldown  : ${COOLDOWN_SECONDS}s before each target process"
 [ -n "$PIN_CPUS" ] && echo "pinned    : $PIN_CPUS"
-[ "$gov" = performance ] || echo "WARNING   : governor '$gov' != performance -> inflated variance"
+[ "$gov" = performance ] || echo "WARNING   : target CPU governors '$gov' are not uniformly performance -> inflated variance"
 [ -n "$TIME_BIN" ] || echo "WARNING   : /usr/bin/time absent -> no independent kernel RSS cross-check"
 [ -f Cargo.lock ] || echo "WARNING   : Cargo.lock missing -> dependency resolution is not reproducible"
 
@@ -234,12 +310,24 @@ echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'round-robin across targets' |
 # numbers nobody can reproduce, this author included.
 if [ "$STRICT_ENV" = 1 ]; then
   fatal=0
-  [ "$gov" = performance ] || { echo "STRICT: governor is '$gov', need 'performance'" >&2; fatal=1; }
+  [ "$gov" = performance ] || { echo "STRICT: every target CPU governor must be 'performance', got '$gov'" >&2; fatal=1; }
   [ -n "$TIME_BIN" ]       || { echo "STRICT: /usr/bin/time -v required for the RSS cross-check" >&2; fatal=1; }
   [ -f Cargo.lock ]        || { echo "STRICT: Cargo.lock required for a reproducible dependency set" >&2; fatal=1; }
   [ "$fatal" = 0 ] || { echo "refusing to produce publishable numbers on this configuration" >&2; exit 1; }
 fi
 echo
+
+# The default workload separates the roles faithfully: one unmeasured process
+# creates the committee, raw StatusList fixtures and signed inputs once. The raw
+# target verifies those StatusList records; the prover turns the same logical
+# inputs into SnarkStatusList records. BENCH_SELF_CONTAINED=1 is retained only
+# for diagnostic comparison with older runs.
+if [ "$AUTO_FIXTURE" = 1 ]; then
+  echo "generating one unmeasured signed committee fixture ..."
+  "$BIN_DIR/committee_fixture" "$BENCH_INPUT_DIR" >/dev/null
+  echo "  raw StatusList inputs: $BENCH_INPUT_DIR"
+  echo
+fi
 
 # ----------------------------------------------------- fixed corpus ----
 # The verifier must see the SAME workload on every run, so its input is
@@ -278,7 +366,7 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
 # the fixed-cost columns comparable across targets: `raw_agg` leaves `setup_ms`
 # empty because it has no circuit, which is the result, rather than borrowing the
 # column for its keygen and making the SNARK look like the cheaper setup.
-echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,proof_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures' > "$RUNS_CSV"
+echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures' > "$RUNS_CSV"
 
 # Column indices into runs.csv, named once. Every awk gate and every summary row
 # below addresses columns through these, so inserting a column is one edit here
@@ -288,7 +376,7 @@ C_SETUP=4;       C_KEYGEN=5;      C_SLOTSTATE=6;  C_ITEMS=7
 C_SIGN_MED=8;    C_SIGN_TOT=13
 C_PROVE_MED=14;  C_PROVE_TOT=19
 C_VERIFY_MED=20; C_VERIFY_TOT=25
-C_PROOF=26;      C_RSS_SETUP=27;  C_RSS_MAX=28
+C_ARTIFACT=26;   C_RSS_SETUP=27;  C_RSS_MAX=28
 C_PEAK=29;       C_KERNEL=30;     C_FAIL=31
 
 RUN_T_START=""
@@ -348,7 +436,7 @@ emit_run_row() { # $1 target  $2 run index
     if (t=="signer") {
       # The only target that reports `sign`, and the only one whose keygen and
       # slot state are ONE key and ONE counter rather than the whole committee.
-      # `setup` stays empty: a member builds no circuit. proof_size carries the
+      # setup stays empty: a member builds no circuit. The artifact column carries the
       # signature size, which is what one member actually puts on the wire.
       keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_rounds"]
       sg_med=v["sign_med_ms"]; sg_mean=v["sign_mean_ms"]; sg_sd=v["sign_sd_ms"]
@@ -362,7 +450,7 @@ emit_run_row() { # $1 target  $2 run index
       setup=v["setup_ms"]; keygen=v["keygen_ms"]; n=v["n_updates"]
       pv_med=v["prove_med_ms"]; pv_mean=v["prove_mean_ms"]; pv_sd=v["prove_sd_ms"]
       pv_lo=v["prove_min_ms"]; pv_hi=v["prove_max_ms"]; pv_tot=v["prove_total_ms"]
-      pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]; f=0
+      pb=v["record_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]; f=0
     } else if (t=="verifier") {
       # No keygen and no signing: this process only ever holds public keys.
       setup=v["setup_ms"]; n=v["n_verified"]
@@ -378,12 +466,12 @@ emit_run_row() { # $1 target  $2 run index
       # that absence is the headline result. It used to carry keygen instead, which
       # put a cost both paths pay into the column that means "what the SNARK costs
       # extra" — and made the SNARK setup look cheaper than a keygen it was not
-      # being compared against. proof_size = the raw aggregate; the tamper sanity
-      # check drives the failure gate.
+      # being compared against. The artifact column is the complete serialized
+      # StatusList record; the tamper sanity check drives the failure gate.
       keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_updates"]
       vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
       vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
-      pb=v["agg_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+      pb=v["record_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["tamper_rejected"]=="1")?0:1
     } else {
       # `updates_total_ms` is the whole loop (sign + prove + verify + printing);
@@ -451,9 +539,11 @@ count_bad_item_counts() {
 # One measured run of one target, plus the gates. Shared by both schedules.
 do_one() { # $1 target  $2 1-based index within that target's schedule
   local target="$1" i="$2" tw tr
-  eval "tw=\${WARMUP_$target:-$WARMUP}"
-  eval "tr=\${RUNS_$target:-$RUNS}"
+  local runs_var="RUNS_$target" warmup_var="WARMUP_$target"
+  tw="${!warmup_var:-$WARMUP}"
+  tr="${!runs_var:-$RUNS}"
 
+  [ "$COOLDOWN_SECONDS" -eq 0 ] || sleep "$COOLDOWN_SECONDS"
   if ! run_once "$target"; then
     echo "  $target run $i FAILED (exit != 0) — see below" >&2
     # stderr first: a Rust panic lands there, and $SCRATCH is wiped on exit.
@@ -491,30 +581,56 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
 
 # Per-target run counts accommodate roles with different run costs without
 # forcing one global sample count. RUNS_<target> overrides; RUNS is the default.
+for target in "${TARGET_LIST[@]}"; do
+  runs_var="RUNS_$target"; warmup_var="WARMUP_$target"
+  tr="${!runs_var:-$RUNS}"; tw="${!warmup_var:-$WARMUP}"
+  case "$tr" in ''|*[!0-9]*|0) echo "$runs_var must be a positive integer" >&2; exit 1 ;; esac
+  case "$tw" in ''|*[!0-9]*) echo "$warmup_var must be a non-negative integer" >&2; exit 1 ;; esac
+done
+
+# Print one row of a Williams-style balanced order. With an odd number of
+# targets, build the next even design and drop its virtual target. This avoids
+# the fixed-predecessor bias of a simple round-robin rotation.
+balanced_row() { # $1 zero-based row
+  local row="$1" n="${#TARGET_LIST[@]}" design_n pos base index
+  design_n="$n"
+  [ $((design_n % 2)) -eq 0 ] || design_n=$((design_n + 1))
+  for ((pos=0; pos<design_n; pos++)); do
+    if [ "$pos" -eq 0 ]; then
+      base=0
+    elif [ $((pos % 2)) -eq 1 ]; then
+      base=$(((pos + 1) / 2))
+    else
+      base=$((design_n - pos / 2))
+    fi
+    index=$(((base + row) % design_n))
+    [ "$index" -lt "$n" ] && printf '%s\n' "${TARGET_LIST[$index]}"
+  done
+}
+
 if [ "$INTERLEAVE" = 1 ]; then
-  # Round-robin. Targets have different schedule lengths, so each one is stepped
-  # only while it still has runs left; the longest simply finishes alone at the
-  # end. Warmups stay at the front of each target's own schedule, where they
-  # belong — they exist to fill caches for that binary, not for the sweep.
-  echo "== interleaved sweep =="
+  echo "== balanced interleaved sweep =="
   total=0
-  for t in $TARGETS; do
-    eval "tw=\${WARMUP_$t:-$WARMUP}; tr=\${RUNS_$t:-$RUNS}"
-    eval "sched_$t=$((tw + tr))"
+  declare -A SCHEDULE_LENGTH=()
+  for target in "${TARGET_LIST[@]}"; do
+    runs_var="RUNS_$target"; warmup_var="WARMUP_$target"
+    tr="${!runs_var:-$RUNS}"; tw="${!warmup_var:-$WARMUP}"
+    SCHEDULE_LENGTH[$target]=$((tw + tr))
     [ "$((tw + tr))" -gt "$total" ] && total=$((tw + tr))
   done
-  for step in $(seq 1 "$total"); do
-    for target in $TARGETS; do
-      eval "len=\$sched_$target"
+  for ((step=1; step<=total; step++)); do
+    while IFS= read -r target; do
+      len="${SCHEDULE_LENGTH[$target]}"
       [ "$step" -le "$len" ] || continue
       do_one "$target" "$step"
-    done
+    done < <(balanced_row "$((step - 1))")
   done
 else
-  for target in $TARGETS; do
+  for target in "${TARGET_LIST[@]}"; do
     echo "== $target =="
-    eval "tw=\${WARMUP_$target:-$WARMUP}; tr=\${RUNS_$target:-$RUNS}"
-    for i in $(seq 1 $((tw + tr))); do
+    runs_var="RUNS_$target"; warmup_var="WARMUP_$target"
+    tr="${!runs_var:-$RUNS}"; tw="${!warmup_var:-$WARMUP}"
+    for ((i=1; i<=tw+tr; i++)); do
       do_one "$target" "$i"
     done
   done
@@ -559,7 +675,7 @@ emit() { # target metric unit column
 # The metric id in summary.csv now names the phase, so the file is readable on its
 # own: `prove_per_item` and `verify_per_item` are different rows rather than the
 # same `work_per_item` meaning different things on different lines.
-for target in $TARGETS; do
+for target in "${TARGET_LIST[@]}"; do
   emit "$target" setup            ms    "$C_SETUP"
   emit "$target" keygen           ms    "$C_KEYGEN"
   emit "$target" slot_state       ms    "$C_SLOTSTATE"
@@ -569,7 +685,12 @@ for target in $TARGETS; do
   emit "$target" prove_total      ms    "$C_PROVE_TOT"
   emit "$target" verify_per_item  ms    "$C_VERIFY_MED"
   emit "$target" verify_total     ms    "$C_VERIFY_TOT"
-  emit "$target" proof_size       bytes "$C_PROOF"
+  case "$target" in
+    signer)   emit "$target" signature_size bytes "$C_ARTIFACT" ;;
+    prover)   emit "$target" record_size    bytes "$C_ARTIFACT" ;;
+    raw_agg)  emit "$target" record_size    bytes "$C_ARTIFACT" ;;
+    combined) emit "$target" proof_size     bytes "$C_ARTIFACT" ;;
+  esac
   emit "$target" rss_after_setup  MB    "$C_RSS_SETUP"
   emit "$target" rss_max          MB    "$C_RSS_MAX"
   emit "$target" peak_rss_vmhwm   MB    "$C_PEAK"
@@ -584,9 +705,10 @@ label() {
     signer:slot_state)       echo "slot state (1 counter)" ;;
     signer:sign_per_item)    echo "sign / round (1 member)" ;;
     signer:sign_total)       echo "sign total / run" ;;
-    signer:proof_size)       echo "signature size" ;;
+    signer:signature_size)   echo "signature size" ;;
     raw_agg:verify_per_item) echo "verify / update (raw)" ;;
-    raw_agg:proof_size)      echo "aggregate size (t sigs)" ;;
+    raw_agg:record_size)     echo "StatusList size" ;;
+    prover:record_size)      echo "SnarkStatusList size" ;;
     *:setup)                 echo "setup (circuit, once)" ;;
     *:keygen)                echo "keygen (N keys, once)" ;;
     *:slot_state)            echo "slot state (counters)" ;;
@@ -616,11 +738,13 @@ label() {
 {
   echo "BENCHMARK SUMMARY"
   echo "generated : $(date -Is)"
-  echo "host      : $(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1) ($(uname -m)), $(nproc) threads"
+  echo "host      : $(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1) ($(uname -m)), $EFFECTIVE_THREADS effective threads"
   echo "governor  : $gov"
-  echo "threads   : $(nproc)${PIN_CPUS:+ (pinned to $PIN_CPUS)}"
+  echo "threads   : $EFFECTIVE_THREADS${PIN_CPUS:+ (pinned to $PIN_CPUS)}"
   echo "committee : N=$BENCH_N, t=$BENCH_T"
-  echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'round-robin across targets' || echo 'contiguous blocks per target')"
+  echo "input     : $INPUT_MODE"
+  echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'Williams-style balanced across targets' || echo 'contiguous blocks per target')"
+  echo "cooldown  : ${COOLDOWN_SECONDS}s before each target process"
   echo "runs      : n=$RUNS measured, $WARMUP warmup(s) discarded (default;"
   echo "            RUNS_<target> may override — the authoritative count is the"
   echo "            per-row 'n' column below)"
@@ -679,7 +803,7 @@ label() {
   # /usr/bin/time -v. They should agree; VmHWM can under-report, because the
   # kernel only refreshes mm->hiwater_rss at certain points. Printing both and
   # never comparing them is not a cross-check, so compare them here.
-  for target in $TARGETS; do
+  for target in "${TARGET_LIST[@]}"; do
     self_raw="$(col "$target" "$C_PEAK")"; kern_raw="$(col "$target" "$C_KERNEL")"
     [ -n "$self_raw" ] && [ -n "$kern_raw" ] || continue
     s="$(printf '%s\n' "$self_raw" | stats | awk '{print $4}')"
@@ -699,10 +823,13 @@ label() {
   [ "$gov" = performance ] || echo "  * CPU governor was '$gov', not 'performance': variance is inflated,"
   [ "$gov" = performance ] || echo "    and absolute timings are NOT comparable with a 'performance' run."
   echo "  * leanVM sizes its worker pool from available_parallelism() at startup and"
-  echo "    offers no override, so every timing here is a $(nproc)-thread figure."
+  echo "    offers no override, so every timing here is a $EFFECTIVE_THREADS-thread figure."
   [ -n "$PIN_CPUS" ] || echo "    Nothing was pinned: set PIN_CPUS to fix it across machines."
   [ "$INTERLEAVE" = 1 ] || echo "  * Targets ran in contiguous blocks: any drift over the sweep is confounded"
   [ "$INTERLEAVE" = 1 ] || echo "    with target identity. Use the t_start column in runs.csv to check."
+  echo "  * A ${COOLDOWN_SECONDS}s idle cooldown preceded every target process. The balanced"
+  echo "    order reduces positional and predecessor bias but cannot guarantee equal"
+  echo "    package temperature; inspect t_start and host telemetry when publishing."
   echo "  * runs.csv carries t_start (epoch s) per run. Plot the metric against it"
   echo "    before reporting: a thermal ramp or a stray background job shows up"
   echo "    there and nowhere else."
@@ -715,14 +842,17 @@ label() {
   echo "    $((RUNS + WARMUP)) of its executions. It dominates total time; never fold it into"
   echo "    per-update figures."
   echo "  * 'setup' is the leanVM circuit and nothing else."
-  if [ -n "$BENCH_INPUT_DIR" ]; then
+  if [ "$INPUT_MODE" = fixture ]; then
     echo "    Committee key generation and signing ran in the separate fixture process"
     echo "    before measurement. The prover row is one aggregator holding public keys"
     echo "    and t ready-made signatures; the raw row is one relying-party verifier."
-  else
+  elif [ "$INPUT_MODE" = self-contained ]; then
     echo "    Keygen is a separate row because EVERY path pays it, raw_agg included —"
     echo "    so the SNARK's extra fixed cost is the setup row alone, and raw_agg has no"
     echo "    setup row. Comparing raw keygen with SNARK setup inverts the answer."
+  else
+    echo "    No fixture-capable target was selected; signer and combined use their"
+    echo "    native process shape."
   fi
   echo "  * Per-update samples within a run are not independent (shared allocator"
   echo "    and cache state). The table's unit is the per-run median; samples.csv"
@@ -738,20 +868,24 @@ label() {
   echo "  * Exactly one target reports 'sign': signer, which measures ONE member"
   echo "    doing ONE signature per round, preceded by its durable slot burn (write"
   echo "    + fsync + rename + fsync dir) through SignerNode."
-  if [ -n "$BENCH_INPUT_DIR" ]; then
+  if [ "$INPUT_MODE" = fixture ]; then
     echo "    The measured prover/raw verifier receive t signatures prepared by the"
     echo "    fixture process; neither produces signatures or holds secret keys."
-  else
+  elif [ "$INPUT_MODE" = self-contained ]; then
     echo "    prover, combined and raw_agg create t signatures outside their timed"
     echo "    phase. In deployment they come one each from t member machines."
+  else
+    echo "    No measured aggregator or raw verifier was selected in this campaign."
   fi
   echo "  * signer's keygen and slot-state rows are for ONE key and ONE counter."
-  if [ -n "$BENCH_INPUT_DIR" ]; then
+  if [ "$INPUT_MODE" = fixture ]; then
     echo "    The fixture-mode prover/raw verifier report neither: the committee paid"
     echo "    those costs outside the measured aggregator and verifier processes."
-  else
+  elif [ "$INPUT_MODE" = self-contained ]; then
     echo "    prover/raw_agg report the whole committee's N. Do not read them as the"
     echo "    same quantity — divide by N first, or compare signer against N=1."
+  else
+    echo "    No committee-wide keygen or slot-state row is present in this campaign."
   fi
   echo "  * A member's signing cost is IDENTICAL on both published forms: same key,"
   echo "    same 32-byte message, same derived slot. What the two paths differ in is"

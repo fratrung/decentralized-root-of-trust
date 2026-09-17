@@ -8,6 +8,22 @@
 /// A series of millisecond measurements.
 pub struct Series(Vec<f64>);
 
+/// Conventional median of discrete byte/count observations.
+///
+/// Returning `f64` preserves the half-unit value possible for an even-length
+/// sample instead of selecting the upper middle observation.
+pub fn median_usize(samples: &[usize]) -> f64 {
+    assert!(!samples.is_empty(), "cannot take the median of no samples");
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[middle] as f64
+    } else {
+        sorted[middle - 1] as f64 / 2.0 + sorted[middle] as f64 / 2.0
+    }
+}
+
 impl Series {
     pub fn new(samples: impl IntoIterator<Item = f64>) -> Self {
         let mut v: Vec<f64> = samples.into_iter().collect();
@@ -211,5 +227,21 @@ mod tests {
         assert_eq!(s.min(), f64::NEG_INFINITY);
         assert_eq!(s.max(), f64::INFINITY);
         assert!(close(s.median(), 2.0));
+    }
+
+    #[test]
+    fn usize_median_averages_the_two_middle_observations() {
+        assert!(close(median_usize(&[40, 10, 30, 20]), 25.0));
+        assert!(close(median_usize(&[30, 10, 20]), 20.0));
+        assert!(close(
+            median_usize(&[usize::MAX, usize::MAX]),
+            usize::MAX as f64
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot take the median of no samples")]
+    fn usize_median_refuses_an_empty_series() {
+        let _ = median_usize(&[]);
     }
 }

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
-use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::bench::stats::{Series, median_usize};
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::protocol::committee::Committee;
@@ -116,7 +116,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
         "fixture must contain exactly N_UPDATES honest records"
     );
     let mut prove_ms = Vec::with_capacity(updates.len());
-    let mut proof_bytes = Vec::with_capacity(updates.len());
+    let mut record_bytes = Vec::with_capacity(updates.len());
     let mut rss_updates_max = rss_after_setup;
 
     for (index, path) in updates.iter().enumerate() {
@@ -160,7 +160,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
             );
         }
         prove_ms.push(ms(prove_time));
-        proof_bytes.push(bytes.len());
+        record_bytes.push(bytes.len());
     }
 
     if !honest_only {
@@ -230,8 +230,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
 
     let prove = Series::new(prove_ms);
     let (pv_min, pv_med, pv_max) = prove.min_med_max();
-    proof_bytes.sort_unstable();
-    let proof_med = proof_bytes[proof_bytes.len() / 2];
+    let record_med = median_usize(&record_bytes);
 
     if honest_only {
         println!("\n{} honest updates written", prove.len());
@@ -240,7 +239,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
     }
     println!("setup_prover           : {setup_time:.2?}");
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
-    println!("proof size (median)    : {proof_med} bytes");
+    println!("published record size (median): {record_med:.1} bytes");
     println!("\nRAM (aggregator process; no secret keys)");
     println!("baseline (pre-setup)   : {rss_baseline} MB");
     println!("after setup (resident) : {rss_after_setup} MB");
@@ -249,7 +248,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
     println!(
         "\nPROVER setup_ms={:.3} n_members={N_MEMBERS} t={T} n_updates={} \
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
-         prove_max_ms={pv_max:.3} prove_total_ms={:.3} proof_med_bytes={proof_med} \
+         prove_max_ms={pv_max:.3} prove_total_ms={:.3} record_med_bytes={record_med:.3} \
          rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
          fixture_input=1",
         ms(setup_time),
@@ -368,7 +367,7 @@ fn main() {
     // must never sign twice.
     let mut list: Vec<[u8; 32]> = Vec::new();
     let mut prove_ms = Vec::new();
-    let mut proof_bytes = Vec::new();
+    let mut record_bytes = Vec::new();
     let mut rss_updates_max = rss_after_setup;
 
     for i in 0..N_UPDATES {
@@ -440,7 +439,7 @@ fn main() {
             );
         }
         prove_ms.push(ms(prove_time));
-        proof_bytes.push(bytes.len());
+        record_bytes.push(bytes.len());
     }
     let prove = Series::new(prove_ms);
 
@@ -535,20 +534,16 @@ fn main() {
     // Same reasoning as `main.rs::dur_stats`: an empty series means no update was
     // ever produced, and a silent 0 would be reported as a measurement.
     assert!(
-        !proof_bytes.is_empty(),
-        "no proofs were produced (N_UPDATES = 0?); refusing to report a size"
+        !record_bytes.is_empty(),
+        "no records were produced (N_UPDATES = 0?); refusing to report a size"
     );
-    let proof_med = {
-        let mut b = proof_bytes.clone();
-        b.sort_unstable();
-        b[b.len() / 2]
-    };
+    let record_med = median_usize(&record_bytes);
 
     println!("\n{N_UPDATES} updates + 3 forgeries written");
     println!("setup_prover           : {setup_time:.2?}");
     println!("keygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
-    println!("proof size (median)    : {proof_med} bytes");
+    println!("published record size (median): {record_med:.1} bytes");
     println!("\nRAM (prover process)");
     println!("baseline (pre-setup)   : {rss_baseline} MB");
     println!("after setup (resident) : {rss_after_setup} MB");
@@ -559,7 +554,7 @@ fn main() {
     println!(
         "\nPROVER setup_ms={:.3} keygen_ms={:.3} n_updates={} \
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
-         prove_max_ms={pv_max:.3} prove_total_ms={:.3} proof_med_bytes={proof_med} \
+         prove_max_ms={pv_max:.3} prove_total_ms={:.3} record_med_bytes={record_med:.3} \
          rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={}",
         ms(setup_time),
         ms(keygen_time),

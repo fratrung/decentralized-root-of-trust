@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::stats::median_usize;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
@@ -45,12 +46,6 @@ fn dur_stats(v: &[Duration]) -> (f64, f64, f64) {
         (xs[n / 2 - 1] + xs[n / 2]) / 2.0
     };
     (xs[0], median, xs[n - 1])
-}
-
-fn usize_median(v: &[usize]) -> usize {
-    let mut xs = v.to_vec();
-    xs.sort_unstable();
-    xs[xs.len() / 2]
 }
 
 /// One round: the `signers` sign the root of `list` at the slot the anchor assigns
@@ -321,7 +316,7 @@ fn main() {
     let rss_peak = peak_rss_mb();
     let (pv_min, pv_med, pv_max) = dur_stats(&prove_ts);
     let (vf_min, vf_med, vf_max) = dur_stats(&verify_ts);
-    let proof_med = usize_median(&proof_sizes);
+    let proof_med = median_usize(&proof_sizes);
 
     println!("\n Security (expected: all REJECTED)");
     println!("A) tampered list + valid proof : rejected = {tamper_rejected}");
@@ -338,7 +333,7 @@ fn main() {
     println!("--- {N_UPDATES} updates: min / median / max ---");
     println!("prove    : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
     println!("verify   : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
-    println!("proof size (median) : {proof_med} bytes");
+    println!("proof size (median) : {proof_med:.1} bytes");
     println!("total {N_UPDATES} updates : {updates_total:.2?}");
 
     println!(" RAM ");
@@ -369,7 +364,7 @@ fn main() {
         format!("upd_verify_med_ms={vf_med:.3}"),
         format!("upd_verify_total_ms={:.3}", sum_ms(&verify_ts)),
         format!("updates_total_ms={:.3}", ms(updates_total)),
-        format!("proof_med_bytes={proof_med}"),
+        format!("proof_med_bytes={proof_med:.3}"),
         format!("rss_setup_mb={rss_after_setup}"),
         format!("rss_updates_max_mb={rss_updates_max}"),
         format!("peak_rss_mb={rss_peak}"),

@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
-use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::bench::stats::{Series, median_usize};
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::params::{KEY_SLOTS, N_MEMBERS, N_UPDATES, SLOT, T};
@@ -98,7 +98,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         "fixture must contain exactly N_UPDATES honest records"
     );
     let mut verify_ms = Vec::with_capacity(updates.len());
-    let mut aggregate_bytes = Vec::with_capacity(updates.len());
+    let mut record_bytes = Vec::with_capacity(updates.len());
     let mut rss_updates_max = rss_after_anchor;
 
     for (index, path) in updates.iter().enumerate() {
@@ -128,7 +128,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
             );
         }
         verify_ms.push(ms(verify_time));
-        aggregate_bytes.push(bytes.len());
+        record_bytes.push(bytes.len());
     }
 
     // Preserve the raw-path failure gate while keeping every negative control
@@ -172,8 +172,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
 
     let verify = Series::new(verify_ms);
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
-    aggregate_bytes.sort_unstable();
-    let aggregate_med = aggregate_bytes[aggregate_bytes.len() / 2];
+    let record_med = median_usize(&record_bytes);
     let per_signature_us = vf_med * 1000.0 / T as f64;
 
     println!("\n{} honest updates accepted", verify.len());
@@ -182,7 +181,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
          {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected}"
     );
     println!("verify min/med/max      : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
-    println!("record size (median)    : {aggregate_med} bytes");
+    println!("published record size (median): {record_med:.1} bytes");
     println!("\nRAM (raw verifier process; no secret keys)");
     println!("after anchor            : {rss_after_anchor} MB");
     println!("max during updates      : {rss_updates_max} MB");
@@ -191,7 +190,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         "\nRAW_AGG n_members={N_MEMBERS} t={T} n_updates={} \
          verify_med_ms={vf_med:.3} verify_mean_ms={:.3} verify_sd_ms={:.3} \
          verify_min_ms={vf_min:.3} verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
-         per_sig_verify_us={per_signature_us:.3} agg_med_bytes={aggregate_med} \
+         per_sig_verify_us={per_signature_us:.3} record_med_bytes={record_med:.3} \
          rss_keygen_mb={rss_after_anchor} rss_updates_max_mb={rss_updates_max} \
          peak_rss_mb={} tamper_rejected={} fixture_input=1",
         verify.len(),
@@ -275,7 +274,7 @@ fn main() {
     //      the signatures plus their bitmap ARE the record, then it is verified. ----
     let mut list: Vec<[u8; 32]> = Vec::new();
     let mut verify_ms = Vec::new();
-    let mut agg_bytes = Vec::new();
+    let mut record_bytes = Vec::new();
     let mut accepted = 0usize;
     let mut rss_updates_max = rss_after_keygen;
 
@@ -338,7 +337,7 @@ fn main() {
             );
         }
         verify_ms.push(ms(verify_time));
-        agg_bytes.push(wire.len());
+        record_bytes.push(wire.len());
     }
 
     // ---- Sanity checks: verification is not a no-op. ----
@@ -423,11 +422,7 @@ fn main() {
     // ---- Summary ----
     let verify = Series::new(verify_ms);
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
-    let agg_med = {
-        let mut b = agg_bytes.clone();
-        b.sort_unstable();
-        b[b.len() / 2]
-    };
+    let record_med = median_usize(&record_bytes);
     // Per-signature figure, derived from the median: what checking one signature
     // costs, which is what makes the number projectable to other values of t.
     let per_sig_verify_us = vf_med * 1000.0 / T as f64;
@@ -442,7 +437,7 @@ fn main() {
     println!("--- per update (t={T}): min / median / max ---");
     println!("verify   : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms   (incl. wire decode)");
     println!("per signature : verify {per_sig_verify_us:.1} us");
-    println!("record size (median) : {agg_med} bytes  ({T} signatures + bitmap)");
+    println!("published record size (median): {record_med:.1} bytes  ({T} signatures + bitmap)");
 
     println!("\nRAM (raw-multisig process, no SNARK)");
     println!("baseline (pre-keygen)  : {rss_baseline} MB");
@@ -461,7 +456,7 @@ fn main() {
          verify_mean_ms={:.3} verify_sd_ms={:.3} verify_min_ms={vf_min:.3} \
          verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
          per_sig_verify_us={per_sig_verify_us:.3} \
-         agg_med_bytes={agg_med} rss_keygen_mb={rss_after_keygen} \
+         record_med_bytes={record_med:.3} rss_keygen_mb={rss_after_keygen} \
          rss_updates_max_mb={rss_updates_max} peak_rss_mb={} tamper_rejected={}",
         ms(keygen_time),
         ms(slot_state_time),

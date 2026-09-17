@@ -3,8 +3,10 @@
 .claude/
 .agents/
 artifacts/
-bench-*/
-committee-scaling-*/
+
+# Timestamped output directories created by the benchmark harnesses.
+/bench-*/
+/committee-scaling-*/
 
 # Local scratch binaries: hand-run walkthroughs kept for development, not part of
 # the published surface and not covered by the test suite.
