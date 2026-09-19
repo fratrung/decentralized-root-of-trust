@@ -34,6 +34,8 @@
 #   runs.csv     one row per process run
 #   summary.csv  aggregate statistics, machine-readable
 #   summary.txt  the same table, human-readable
+#   drift.csv    early/late regime diagnostic; observations are never removed
+#   source.patch / source-status.txt  exact dirty-tree disclosure, when present
 #
 # The unit of analysis for per-update metrics is the PER-RUN MEDIAN (n = RUNS),
 # not the pooled sample: updates within one process share allocator and cache
@@ -41,9 +43,10 @@
 # pooled distribution can be re-analysed if that is what you want to report.
 #
 # Targets use a balanced Williams-style order by default and cool down before
-# each process. Across a complete block, each target occupies each position and
-# precedes every other target equally often. runs.csv records the epoch timestamp
-# of each run so residual drift can be inspected rather than assumed away.
+# each process. Odd designs use rotations plus reversals; warm-ups are scheduled
+# separately from measured runs. Across a complete design, each target occupies
+# each position and precedes every other target equally often. runs.csv records
+# time, load, frequency and temperature so residual drift can be inspected.
 #
 #   ./benchmark.sh
 #   RUNS=30 WARMUP=3 ./benchmark.sh
@@ -125,6 +128,8 @@ case "$INTERLEAVE" in 0|1) ;; *) echo "INTERLEAVE must be 0 or 1" >&2; exit 1 ;;
 # it needs root to fix, on for anything whose numbers get published.
 STRICT_ENV="${STRICT_ENV:-0}"
 case "$STRICT_ENV" in 0|1) ;; *) echo "STRICT_ENV must be 0 or 1" >&2; exit 1 ;; esac
+REQUIRE_CLEAN_TREE="${REQUIRE_CLEAN_TREE:-$STRICT_ENV}"
+case "$REQUIRE_CLEAN_TREE" in 0|1) ;; *) echo "REQUIRE_CLEAN_TREE must be 0 or 1" >&2; exit 1 ;; esac
 
 # Optional CPU pinning, e.g. PIN_CPUS=0-7. leanVM's pool is sized from the
 # affinity mask at startup, so this also fixes the thread count — pin and record
@@ -149,6 +154,47 @@ else
   TARGET_AFFINITY="$(taskset -cp $$ 2>/dev/null | sed 's/.*: //' || echo n/a)"
 fi
 
+TIME_BIN=""
+[ -x /usr/bin/time ] && TIME_BIN=/usr/bin/time
+
+TARGET_CPU_IDS="$(awk -v list="$TARGET_AFFINITY" 'BEGIN {
+  count=split(list, parts, ",")
+  for (i=1; i<=count; i++) {
+    if (index(parts[i], "-")) {
+      split(parts[i], bounds, "-")
+      for (cpu=bounds[1]; cpu<=bounds[2]; cpu++) print cpu
+    } else if (parts[i] ~ /^[0-9]+$/) {
+      print parts[i]
+    }
+  }
+}')"
+GOVERNORS="$({
+  for cpu in $TARGET_CPU_IDS; do
+    path="/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor"
+    [ -r "$path" ] && cat "$path"
+  done
+} | sort -u | paste -sd, -)"
+[ -n "$GOVERNORS" ] || GOVERNORS=n/a
+
+GIT_DIRTY=no
+[ -n "$(git status --porcelain 2>/dev/null)" ] && GIT_DIRTY=yes
+
+# Publication mode is a preflight, not a warning printed after an expensive
+# build. A dirty tree cannot be reconstructed from the commit recorded in the
+# report, so strict runs refuse it unless the caller explicitly separates the
+# exploratory policy with REQUIRE_CLEAN_TREE=0.
+if [ "$STRICT_ENV" = 1 ]; then
+  fatal=0
+  [ "$GOVERNORS" = performance ] || { echo "STRICT: every target CPU governor must be 'performance', got '$GOVERNORS'" >&2; fatal=1; }
+  [ -n "$TIME_BIN" ]             || { echo "STRICT: /usr/bin/time -v required for the RSS cross-check" >&2; fatal=1; }
+  [ -f Cargo.lock ]               || { echo "STRICT: Cargo.lock required for a reproducible dependency set" >&2; fatal=1; }
+  [ "$REQUIRE_CLEAN_TREE" = 0 ] || [ "$GIT_DIRTY" = no ] || {
+    echo "STRICT: the Git working tree is dirty; commit the benchmark candidate first" >&2
+    fatal=1
+  }
+  [ "$fatal" = 0 ] || { echo "refusing to produce publishable numbers on this configuration" >&2; exit 1; }
+fi
+
 BIN_DIR="$REPO/target/release"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -159,6 +205,14 @@ SAMPLES="$OUTDIR/samples.csv"
 RUNS_CSV="$OUTDIR/runs.csv"
 SUMMARY_CSV="$OUTDIR/summary.csv"
 SUMMARY_TXT="$OUTDIR/summary.txt"
+DRIFT_CSV="$OUTDIR/drift.csv"
+SOURCE_STATUS="$OUTDIR/source-status.txt"
+SOURCE_PATCH="$OUTDIR/source.patch"
+
+git status --porcelain=v1 > "$SOURCE_STATUS" 2>/dev/null || true
+git diff --binary HEAD > "$SOURCE_PATCH" 2>/dev/null || true
+SOURCE_PATCH_SHA256="$(sha256sum "$SOURCE_PATCH" 2>/dev/null | awk '{print $1}')"
+[ -n "$SOURCE_PATCH_SHA256" ] || SOURCE_PATCH_SHA256=n/a
 
 # ---------------------------------------------------------------- build ----
 echo "building --release ..."
@@ -187,30 +241,29 @@ else
   INPUT_MODE=target-native
 fi
 
-TIME_BIN=""
-[ -x /usr/bin/time ] && TIME_BIN=/usr/bin/time
-
 # ------------------------------------------------------ environment ----
 sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
 
-TARGET_CPU_IDS="$(awk -v list="$TARGET_AFFINITY" 'BEGIN {
-  count=split(list, parts, ",")
-  for (i=1; i<=count; i++) {
-    if (index(parts[i], "-")) {
-      split(parts[i], bounds, "-")
-      for (cpu=bounds[1]; cpu<=bounds[2]; cpu++) print cpu
-    } else if (parts[i] ~ /^[0-9]+$/) {
-      print parts[i]
-    }
-  }
-}')"
-GOVERNORS="$({
+load1_now() {
+  awk '{print $1}' /proc/loadavg 2>/dev/null || echo ""
+}
+
+freq_now_mhz() {
+  local cpu path values=""
   for cpu in $TARGET_CPU_IDS; do
-    path="/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor"
-    [ -r "$path" ] && cat "$path"
+    path="/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_cur_freq"
+    [ -r "$path" ] && values="$values $(cat "$path" 2>/dev/null)"
   done
-} | sort -u | paste -sd, -)"
-[ -n "$GOVERNORS" ] || GOVERNORS=n/a
+  awk 'BEGIN{n=0;s=0} {for(i=1;i<=NF;i++){s+=$i;n++}} END{if(n) printf "%.1f", s/n/1000}' <<<"$values"
+}
+
+temp_now_c() {
+  local path values=""
+  for path in /sys/class/thermal/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp*_input; do
+    [ -r "$path" ] && values="$values $(cat "$path" 2>/dev/null)"
+  done
+  awk 'BEGIN{m=""} {for(i=1;i<=NF;i++){v=$i+0;if(v>1000)v/=1000;if(m==""||v>m)m=v}} END{if(m!="") printf "%.1f",m}' <<<"$values"
+}
 
 {
   echo "# Environment capture — benchmark of $(basename "$REPO")"
@@ -262,7 +315,10 @@ GOVERNORS="$({
   echo
   echo "## Code under test"
   echo "git commit       : $(git rev-parse HEAD 2>/dev/null || echo n/a)"
-  echo "git dirty        : $(test -n "$(git status --porcelain 2>/dev/null)" && echo yes || echo no)"
+  echo "git dirty        : $GIT_DIRTY"
+  echo "source patch sha : $SOURCE_PATCH_SHA256"
+  echo "source status    : $(basename "$SOURCE_STATUS")"
+  echo "source patch     : $(basename "$SOURCE_PATCH")"
   echo "leanVM rev       : $(sed -n 's/.*leanEthereum\/leanVM.git", rev = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
   echo "Cargo.lock       : $(test -f Cargo.lock && echo present || echo MISSING)"
   echo
@@ -305,16 +361,7 @@ echo "cooldown  : ${COOLDOWN_SECONDS}s before each target process"
 [ "$gov" = performance ] || echo "WARNING   : target CPU governors '$gov' are not uniformly performance -> inflated variance"
 [ -n "$TIME_BIN" ] || echo "WARNING   : /usr/bin/time absent -> no independent kernel RSS cross-check"
 [ -f Cargo.lock ] || echo "WARNING   : Cargo.lock missing -> dependency resolution is not reproducible"
-
-# A publishable run should not silently proceed on a machine that will produce
-# numbers nobody can reproduce, this author included.
-if [ "$STRICT_ENV" = 1 ]; then
-  fatal=0
-  [ "$gov" = performance ] || { echo "STRICT: every target CPU governor must be 'performance', got '$gov'" >&2; fatal=1; }
-  [ -n "$TIME_BIN" ]       || { echo "STRICT: /usr/bin/time -v required for the RSS cross-check" >&2; fatal=1; }
-  [ -f Cargo.lock ]        || { echo "STRICT: Cargo.lock required for a reproducible dependency set" >&2; fatal=1; }
-  [ "$fatal" = 0 ] || { echo "refusing to produce publishable numbers on this configuration" >&2; exit 1; }
-fi
+[ "$GIT_DIRTY" = no ] || echo "WARNING   : dirty source tree; source.patch is required to reconstruct this run"
 echo
 
 # The default workload separates the roles faithfully: one unmeasured process
@@ -337,6 +384,7 @@ CORPUS="$SCRATCH/corpus"
 if grep -qw verifier <<<"$TARGETS"; then
   echo "generating fixed verifier corpus ..."
   env -u BENCH_HONEST_ONLY "$BIN_DIR/prover" "$CORPUS" >/dev/null 2>&1
+  "$BIN_DIR/verifier" --init-state "$CORPUS" >/dev/null
   echo "  $(ls "$CORPUS" | wc -l) artifacts, $(du -sh "$CORPUS" | cut -f1)"
   echo
 fi
@@ -366,7 +414,7 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
 # the fixed-cost columns comparable across targets: `raw_agg` leaves `setup_ms`
 # empty because it has no circuit, which is the result, rather than borrowing the
 # column for its keygen and making the SNARK look like the cheaper setup.
-echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures' > "$RUNS_CSV"
+echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures,load1_start,load1_end,freq_start_mhz,freq_end_mhz,temp_start_c,temp_end_c' > "$RUNS_CSV"
 
 # Column indices into runs.csv, named once. Every awk gate and every summary row
 # below addresses columns through these, so inserting a column is one edit here
@@ -380,6 +428,9 @@ C_ARTIFACT=26;   C_RSS_SETUP=27;  C_RSS_MAX=28
 C_PEAK=29;       C_KERNEL=30;     C_FAIL=31
 
 RUN_T_START=""
+RUN_LOAD_START=""; RUN_LOAD_END=""
+RUN_FREQ_START=""; RUN_FREQ_END=""
+RUN_TEMP_START=""; RUN_TEMP_END=""
 
 run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
   local target="$1" rc=0
@@ -405,7 +456,13 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
   [ -n "$TIME_BIN" ] && cmd=("$TIME_BIN" -v "${cmd[@]}")
 
   RUN_T_START="$(date +%s)"
+  RUN_LOAD_START="$(load1_now)"
+  RUN_FREQ_START="$(freq_now_mhz)"
+  RUN_TEMP_START="$(temp_now_c)"
   EMIT_SAMPLES=1 "${cmd[@]}" >"$SCRATCH/out.txt" 2>"$SCRATCH/err.txt" || rc=$?
+  RUN_LOAD_END="$(load1_now)"
+  RUN_FREQ_END="$(freq_now_mhz)"
+  RUN_TEMP_END="$(temp_now_c)"
   return $rc
 }
 
@@ -424,7 +481,10 @@ emit_run_row() { # $1 target  $2 run index
   esac
   local line; line="$(grep "$tag" "$SCRATCH/out.txt" || true)"
   [ -n "$line" ] || { echo "run $run ($target): record line missing" >&2; exit 1; }
-  awk -v t="$target" -v r="$run" -v k="$kmax" -v ts="$RUN_T_START" '{
+  awk -v t="$target" -v r="$run" -v k="$kmax" -v ts="$RUN_T_START" \
+      -v ls="$RUN_LOAD_START" -v le="$RUN_LOAD_END" \
+      -v fs="$RUN_FREQ_START" -v fe="$RUN_FREQ_END" \
+      -v cs="$RUN_TEMP_START" -v ce="$RUN_TEMP_END" '{
     for (i=2;i<=NF;i++){ split($i,kv,"="); v[kv[1]]=kv[2] }
     # Every phase field starts empty, and a target fills only the phases it ran.
     # `col()` drops empty cells, so an absent phase yields no summary row at all —
@@ -485,12 +545,12 @@ emit_run_row() { # $1 target  $2 run index
       pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["sec_ok"]=="1")?0:1
     }
-    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
       t,r,ts,setup,keygen,slotstate,n,
       sg_med,sg_mean,sg_sd,sg_lo,sg_hi,sg_tot,
       pv_med,pv_mean,pv_sd,pv_lo,pv_hi,pv_tot,
       vf_med,vf_mean,vf_sd,vf_lo,vf_hi,vf_tot,
-      pb,rs,rm,pk,k,f
+      pb,rs,rm,pk,k,f,ls,le,fs,fe,cs,ce
   }' <<<"$line" >> "$RUNS_CSV"
 
   # Raw per-update samples.
@@ -588,41 +648,59 @@ for target in "${TARGET_LIST[@]}"; do
   case "$tw" in ''|*[!0-9]*) echo "$warmup_var must be a non-negative integer" >&2; exit 1 ;; esac
 done
 
-# Print one row of a Williams-style balanced order. With an odd number of
-# targets, build the next even design and drop its virtual target. This avoids
-# the fixed-predecessor bias of a simple round-robin rotation.
+# Print one row of a Williams-style balanced order. An even design has N rows;
+# an odd design needs the N rotations plus their reversals (2N rows). Dropping a
+# virtual fourth target from an even design is not balanced for three real
+# targets: one role never occupies the middle position and directed predecessor
+# pairs occur at different rates.
 balanced_row() { # $1 zero-based row
-  local row="$1" n="${#TARGET_LIST[@]}" design_n pos base index
-  design_n="$n"
-  [ $((design_n % 2)) -eq 0 ] || design_n=$((design_n + 1))
-  for ((pos=0; pos<design_n; pos++)); do
-    if [ "$pos" -eq 0 ]; then
+  local row="$1" n="${#TARGET_LIST[@]}" reverse=0 pos sequence_pos base index
+  if [ $((n % 2)) -eq 1 ] && [ "$row" -ge "$n" ]; then
+    reverse=1
+  fi
+  row=$((row % n))
+  for ((pos=0; pos<n; pos++)); do
+    sequence_pos="$pos"
+    [ "$reverse" -eq 1 ] && sequence_pos=$((n - 1 - pos))
+    if [ "$sequence_pos" -eq 0 ]; then
       base=0
-    elif [ $((pos % 2)) -eq 1 ]; then
-      base=$(((pos + 1) / 2))
+    elif [ $((sequence_pos % 2)) -eq 1 ]; then
+      base=$(((sequence_pos + 1) / 2))
     else
-      base=$((design_n - pos / 2))
+      base=$((n - sequence_pos / 2))
     fi
-    index=$(((base + row) % design_n))
-    [ "$index" -lt "$n" ] && printf '%s\n' "${TARGET_LIST[$index]}"
+    index=$(((base + row) % n))
+    printf '%s\n' "${TARGET_LIST[$index]}"
   done
 }
 
 if [ "$INTERLEAVE" = 1 ]; then
   echo "== balanced interleaved sweep =="
-  total=0
-  declare -A SCHEDULE_LENGTH=()
+  max_warmup=0
+  max_runs=0
+  declare -A WARMUP_LENGTH=() RUN_LENGTH=()
   for target in "${TARGET_LIST[@]}"; do
     runs_var="RUNS_$target"; warmup_var="WARMUP_$target"
     tr="${!runs_var:-$RUNS}"; tw="${!warmup_var:-$WARMUP}"
-    SCHEDULE_LENGTH[$target]=$((tw + tr))
-    [ "$((tw + tr))" -gt "$total" ] && total=$((tw + tr))
+    WARMUP_LENGTH[$target]="$tw"
+    RUN_LENGTH[$target]="$tr"
+    [ "$tw" -gt "$max_warmup" ] && max_warmup="$tw"
+    [ "$tr" -gt "$max_runs" ] && max_runs="$tr"
   done
-  for ((step=1; step<=total; step++)); do
+
+  # Warm-ups are a separate phase. Starting the measured design again at row 0
+  # prevents the warm-up count from changing which target gets each measured
+  # position or predecessor.
+  for ((step=1; step<=max_warmup; step++)); do
     while IFS= read -r target; do
-      len="${SCHEDULE_LENGTH[$target]}"
-      [ "$step" -le "$len" ] || continue
+      [ "$step" -le "${WARMUP_LENGTH[$target]}" ] || continue
       do_one "$target" "$step"
+    done < <(balanced_row "$((step - 1))")
+  done
+  for ((step=1; step<=max_runs; step++)); do
+    while IFS= read -r target; do
+      [ "$step" -le "${RUN_LENGTH[$target]}" ] || continue
+      do_one "$target" "$((WARMUP_LENGTH[$target] + step))"
     done < <(balanced_row "$((step - 1))")
   done
 else
@@ -697,6 +775,38 @@ for target in "${TARGET_LIST[@]}"; do
   emit "$target" peak_rss_kernel  MB    "$C_KERNEL"
 done
 
+# Detect a coarse early/late regime change without deleting or rewriting any
+# observation. The first and last quarter medians are deliberately diagnostic,
+# not an outlier rule: a warning means the session was not stationary enough for
+# the t interval below to be interpreted as if runs were IID.
+echo 'target,metric,n,window,early_median,late_median,change_pct,status' > "$DRIFT_CSV"
+drift_metric() { # target metric column
+  local target="$1" metric="$2" column="$3" n window early late change status
+  n="$(col "$target" "$column" | awk 'END{print NR+0}')"
+  if [ "$n" -lt 8 ]; then
+    printf '%s,%s,%d,0,,,,insufficient_runs\n' "$target" "$metric" "$n" >> "$DRIFT_CSV"
+    return
+  fi
+  window=$(((n + 3) / 4))
+  [ "$window" -lt 3 ] && window=3
+  early="$(awk -F, -v t="$target" -v c="$column" -v w="$window" 'NR>1 && $1==t && $2<=w && $c!="" {print $c}' "$RUNS_CSV" | stats | awk '{print $4}')"
+  late="$(awk -F, -v t="$target" -v c="$column" -v lo="$((n - window))" 'NR>1 && $1==t && $2>lo && $c!="" {print $c}' "$RUNS_CSV" | stats | awk '{print $4}')"
+  change="$(awk -v a="$early" -v b="$late" 'BEGIN{if(a==0){print 0}else{printf "%.3f",100*(b-a)/a}}')"
+  status="$(awk -v d="$change" 'BEGIN{if(d<0)d=-d; print (d>15)?"warning":"ok"}')"
+  printf '%s,%s,%d,%d,%s,%s,%s,%s\n' "$target" "$metric" "$n" "$window" "$early" "$late" "$change" "$status" >> "$DRIFT_CSV"
+}
+for target in "${TARGET_LIST[@]}"; do
+  case "$target" in
+    signer) drift_metric "$target" sign_per_item "$C_SIGN_MED" ;;
+    prover) drift_metric "$target" prove_per_item "$C_PROVE_MED" ;;
+    verifier|raw_agg) drift_metric "$target" verify_per_item "$C_VERIFY_MED" ;;
+    combined)
+      drift_metric "$target" prove_per_item "$C_PROVE_MED"
+      drift_metric "$target" verify_per_item "$C_VERIFY_MED"
+      ;;
+  esac
+done
+
 # Human labels. Only `raw_agg` needs its own cases now — everything else follows
 # from the metric name, which is the point of naming metrics after phases.
 label() {
@@ -761,6 +871,11 @@ label() {
   echo "            the whole run, read two independent ways: VmHWM is the"
   echo "            process's own /proc/self/status, kernel is ru_maxrss from"
   echo "            /usr/bin/time -v."
+  if awk -F, 'NR>1 && $8=="warning" {found=1} END{exit !found}' "$DRIFT_CSV"; then
+    echo "WARNING   : early/late regime change detected; do not treat this session"
+    echo "            as stationary or publish its confidence intervals unchanged:"
+    awk -F, 'NR>1 && $8=="warning" {printf "            %s %s: early %s ms, late %s ms (%+.1f%%)\n",$1,$2,$5,$6,$7}' "$DRIFT_CSV"
+  fi
   echo
   printf '%-9s %-23s %-6s %3s %10s %10s %10s %10s %10s %8s %7s\n' \
     target metric unit n min median max mean sd 'cv%' 'ci95±'
@@ -831,8 +946,12 @@ label() {
   echo "    order reduces positional and predecessor bias but cannot guarantee equal"
   echo "    package temperature; inspect t_start and host telemetry when publishing."
   echo "  * runs.csv carries t_start (epoch s) per run. Plot the metric against it"
-  echo "    before reporting: a thermal ramp or a stray background job shows up"
-  echo "    there and nowhere else."
+  echo "    before reporting. It also records load, selected-CPU frequency and the"
+  echo "    highest readable host temperature before and after every process. Empty"
+  echo "    telemetry fields mean the kernel exposed no portable sensor. drift.csv"
+  echo "    flags >15% early/late shifts but never removes observations."
+  [ "$GIT_DIRTY" = no ] || echo "  * The tree was dirty. source.patch and source-status.txt are part of the result;"
+  [ "$GIT_DIRTY" = no ] || echo "    without them the commit id does not reconstruct the measured source."
   echo "  * A prover process calls zk_alloc::enable_arena(), which sets"
   echo "    M_TRIM_THRESHOLD=-1: its RSS never decreases, so 'peak' means"
   echo "    'high-water mark of a monotonic curve'. A verify-only process keeps"
@@ -921,3 +1040,6 @@ echo "  $SAMPLES      ($(( $(wc -l < "$SAMPLES") - 1 )) raw observations)"
 echo "  $RUNS_CSV"
 echo "  $SUMMARY_CSV"
 echo "  $SUMMARY_TXT"
+echo "  $DRIFT_CSV"
+echo "  $SOURCE_STATUS"
+echo "  $SOURCE_PATCH"

@@ -29,7 +29,9 @@
 //!
 //! Configured by environment: `DEMO_MODE`, `SUBJECT`, `TARGET_MEMBER` (must be
 //! one of the configured SNARK aggregators in SNARK mode),
-//! `VERIFY_ONLY`, `HOLDER_SERVE`, `HOLDER_TRIGGER`.
+//! `VERIFY_ONLY`, `HOLDER_SERVE`, `HOLDER_TRIGGER`. `HOLDER_STATE_MODE=create`
+//! is reserved for explicit first provisioning by `demo.sh up`; normal startup
+//! defaults to `open` and fails closed if the durable mark is unavailable.
 
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -116,10 +118,20 @@ impl Node {
     /// Pays the fixed cost and reports it. Everything after this is per-record
     /// work, which is the number the two demos are being compared on.
     fn build(mode: Mode, committee: Committee) -> Self {
-        let mark = HighWaterMark::load(
-            storage::state_dir().join("highwater"),
-            &committee.to_bytes(),
-        );
+        let mark_path = storage::state_dir().join("highwater");
+        let anchor = committee.to_bytes();
+        let state_mode = std::env::var("HOLDER_STATE_MODE").unwrap_or_else(|_| "open".into());
+        let mark = match state_mode.as_str() {
+            "create" => HighWaterMark::create(&mark_path, &anchor),
+            "open" => HighWaterMark::open(&mark_path, &anchor),
+            value => panic!("invalid HOLDER_STATE_MODE={value:?}; expected create or open"),
+        }
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot {state_mode} high-water mark {}: {e}",
+                mark_path.display()
+            )
+        });
         if let Some(version) = mark.current() {
             println!("node A: resuming, nothing below v{version} will be accepted again");
         }
@@ -393,9 +405,9 @@ fn run_round(node: &mut Node, action: Action) -> Result<String, String> {
         }
     };
 
-    let (version, bytes) = storage::latest_record().ok_or("nothing is published")?;
+    let bytes = storage::current_record().ok_or("nothing is published")?;
     println!(
-        "\nnode A: fetched the freshest published record, v{version}, {} B",
+        "\nnode A: fetched the canonical published record, {} B",
         bytes.len()
     );
 
@@ -406,18 +418,21 @@ fn run_round(node: &mut Node, action: Action) -> Result<String, String> {
     let list = node.report(&bytes, elapsed);
 
     report::rule("freshness");
-    let note = match outcome {
+    let (version, note) = match outcome {
         Outcome::Accepted { version } => {
             println!("  accepted: the mark advanced to v{version}");
-            format!("high-water now v{version}")
+            (version, format!("high-water now v{version}"))
         }
         Outcome::Stale { version, mark } => {
             println!("  refused: v{version} is not newer than the mark at v{mark}");
-            format!("already seen, high-water stays at v{mark}")
+            (
+                version,
+                format!("already seen, high-water stays at v{mark}"),
+            )
         }
         Outcome::Refused => {
             println!("  not reached: the record did not verify under this anchor");
-            return Err(format!("v{version} did not verify, refusing it"));
+            return Err("the canonical record did not verify, refusing it".into());
         }
     };
 

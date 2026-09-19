@@ -117,22 +117,6 @@ MUTANTS = {
     # two mutants above already cover. Add the mutant together with the second
     # algorithm, not before it.
 
-    # --- resource budget on selection -------------------------------------
-    #
-    # Not a correctness check: removing these still verifies every record
-    # correctly. What it removes is the *bound* on how many verifications an
-    # unauthenticated peer can buy, which no assertion about a verdict would
-    # notice.
-    "budget-snark": (
-        "src/node/snark_verifier.rs",
-        "            .take(Self::MAX_VERIFICATIONS_PER_SELECTION)\n",
-        "",
-    ),
-    "budget-raw": (
-        "src/node/raw_node.rs",
-        "        for record in decoded.iter().take(Self::MAX_VERIFICATIONS_PER_SELECTION) {",
-        "        for record in decoded.iter() {",
-    ),
     "snark-3-slot": ("src/node/snark_verifier.rs", """        if self.committee.slot_for(status_list.version()) != Some(*slot) {
             return false;
         }""", "        if false { return false; }"),
@@ -192,24 +176,6 @@ MUTANTS = {
     ),
 
     # --- freshness --------------------------------------------------------
-    "freshness-floor-strict": (
-        "src/node/snark_verifier.rs",
-        "            .filter(|sl| floor.is_none_or(|f| sl.version() > f))",
-        "            .filter(|sl| floor.is_none_or(|f| sl.version() >= f))",
-    ),
-    "freshness-floor-off": (
-        "src/node/snark_verifier.rs",
-        "            .filter(|sl| floor.is_none_or(|f| sl.version() > f))\n",
-        "",
-    ),
-    # The selection is the DHT layer choosing which record to trust. Returning the
-    # newest *declared* version without verifying it hands the choice to whichever
-    # peer lies hardest.
-    "freshness-select-unverified": (
-        "src/node/snark_verifier.rs",
-        "            .find(|sl| self.verify(sl))",
-        "            .next()",
-    ),
     "hwm-strict": (
         "src/state/freshness.rs",
         "        if self.have && version <= self.current {",

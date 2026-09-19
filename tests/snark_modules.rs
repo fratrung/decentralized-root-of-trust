@@ -9,10 +9,8 @@
 //!      checked against the slot recorded inside the finished proof;
 //!   2. the verifier module accepts an honest record and refuses a tampered list
 //!      and a relabelled version, so it is really running the five checks;
-//!   3. the freshness selection on the same module runs those checks too, and is
-//!      not fooled by a forgery that merely *declares* a higher version;
-//!   4. `is_newer` is strict, and is not a substitute for `freshness::HighWaterMark`;
-//!   5. a version with no slot under the anchor panics instead of proving something
+//!   3. `is_newer` is strict, and is not a substitute for `freshness::HighWaterMark`;
+//!   4. a version with no slot under the anchor panics instead of proving something
 //!      unverifiable.
 //!
 //! One aggregation is reused by every negative case here because each is about a
@@ -145,31 +143,7 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
         "a relabelled version was accepted"
     );
 
-    // (3) The DHT freshness selection is a method on this same module, so it runs
-    // the same five checks rather than a second opinion. Handed the honest record
-    // and the relabelled forgery (which *declares* the higher version and is
-    // therefore tried first), it must skip the forgery and return the honest one.
-    // A selection that trusted the declared version instead would return version 1.
-    let liar = SnarkStatusList::new(
-        Algorithms::WotsXmss,
-        list.clone(),
-        version + 1,
-        honest.proof_bytes().to_vec(),
-    );
-    let picked = verifier
-        .select_freshest(&[honest.to_bytes(), liar.to_bytes()])
-        .expect("the honest record must survive the selection");
-    assert_eq!(
-        picked.version(),
-        version,
-        "the selection returned a record whose proof does not verify"
-    );
-    assert!(
-        verifier.select_freshest(&[liar.to_bytes()]).is_none(),
-        "a lookup that returned only forgeries must select nothing"
-    );
-
-    // (4) `is_newer` is strict. Accepting an equal version would let a peer replay
+    // (3) `is_newer` is strict. Accepting an equal version would let a peer replay
     // the record it already served, which is the whole reason it is not `>=`.
     //
     // Note what it is *not*: nothing here advances, and nothing survives a restart.
@@ -193,7 +167,7 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
     // relabelled forgery refused above.
     assert!(!at_zero.verify(&later));
 
-    // (5) A version with no slot under this anchor: `genesis + version` overflows
+    // (4) A version with no slot under this anchor: `genesis + version` overflows
     // `u32`, so there is nothing to sign at. The module panics rather than proving
     // something no verifier could ever accept. Nothing is aggregated on this path
     // (the derivation fails first), so catching the unwind costs nothing.

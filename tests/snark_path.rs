@@ -44,8 +44,7 @@ const WINDOW: u32 = 8;
 /// Matches `params::LOG_INV_RATE`, so this exercises the deployed configuration.
 const LOG_INV_RATE: usize = 2;
 
-/// The round the honest quorum signs. Not 0, so the freshness floor can be tested
-/// from *below* as well as at and above it.
+/// The round the honest quorum signs.
 const ROUND: u32 = 2;
 
 // The (signer, slot) budget, laid out once so a reused pair would be visible:
@@ -145,7 +144,7 @@ fn each_of_the_five_checks_rejects_on_its_own() {
         "an honest quorum must verify, or every rejection below is vacuous"
     );
 
-    // ...and it survives the wire encoding the DHT would store it under.
+    // ...and it survives the wire encoding an external registry would store.
     let back = SnarkStatusList::from_bytes(&valid.to_bytes()).expect("record decodes");
     assert!(verifier.verify(&back));
 
@@ -381,8 +380,8 @@ fn each_of_the_five_checks_rejects_on_its_own() {
 
     // ------------------------------------------------ the decoding boundary --
     // Padding a length-prefixed field is free and repeatable, so without this the
-    // same logical update would have unboundedly many wire forms: distinct keys
-    // in a content-addressed DHT.
+    // same logical update would have unboundedly many wire forms in an external
+    // content-addressed registry.
     let mut padded = proof.clone();
     padded.push(0);
     assert!(
@@ -392,57 +391,5 @@ fn each_of_the_five_checks_rejects_on_its_own() {
     assert!(
         !verifier.verify(&record(list.clone(), ROUND, Vec::new())),
         "an empty proof must not verify"
-    );
-
-    // ----------------------------------------------------- freshness layer --
-    // `select_freshest` orders candidates by their *declared* version, which is
-    // attacker-controlled until check 2 has run. A peer that inflates it is tried
-    // first and costs one wasted verification; it cannot win.
-    let liar = record(list.clone(), 999, proof).to_bytes();
-    let honest = valid.to_bytes();
-
-    let picked = verifier
-        .select_freshest(&[honest.clone(), liar.clone()])
-        .expect("the honest record is still there behind the liar");
-    assert_eq!(picked.version(), ROUND);
-    // Order of arrival must not matter.
-    let picked = verifier
-        .select_freshest(&[liar.clone(), honest.clone()])
-        .expect("same set, reversed order");
-    assert_eq!(picked.version(), ROUND);
-    // With nothing valid in hand it selects nothing, rather than falling back to
-    // the best-looking candidate.
-    assert!(
-        verifier
-            .select_freshest(std::slice::from_ref(&liar))
-            .is_none()
-    );
-    assert!(verifier.select_freshest(&[]).is_none());
-
-    // The floor prunes on the declared version *before* verifying anything. It is
-    // not a security check: it can only discard records the caller was already
-    // committed to refusing as stale. Two cases separate a correct floor from a
-    // broken one: strictly below the honest record (must not prune it) and exactly
-    // at it (must prune it, because the gate's rule is `>` and not `>=`). A floor
-    // above the record is not a third case: it is indistinguishable from `at`.
-    let both = vec![honest, liar];
-    assert_eq!(
-        verifier
-            .select_freshest_above(&both, None)
-            .map(|sl| sl.version()),
-        Some(ROUND),
-        "no floor must behave exactly as select_freshest"
-    );
-    assert_eq!(
-        verifier
-            .select_freshest_above(&both, Some(ROUND - 1))
-            .map(|sl| sl.version()),
-        Some(ROUND),
-        "a floor below the record must not prune it"
-    );
-    assert!(
-        verifier.select_freshest_above(&both, Some(ROUND)).is_none(),
-        "the floor is strict: a record AT the mark is not newer, and the liar \
-         above it does not verify"
     );
 }

@@ -3,10 +3,10 @@
 //! * **committee/** is the bootstrap channel: the run identifier, one file per
 //!   member public key, and the anchor assembled from them. Written once at
 //!   network start, then read-only.
-//! * **storage/** stands in for the DHT the records are published to. Anyone can
-//!   read it, and in the demo anyone could write to it; that is deliberate,
-//!   because a record's authority comes from the committee signatures inside it
-//!   and never from where it was found.
+//! * **storage/** is a one-file fixture for the external secure VDR interface.
+//!   It models only the VDR's output — one canonical current record — and does
+//!   not implement distributed storage, consensus, replication, or canonicality.
+//!   The relying party still authenticates the record locally.
 //! * **state/** is private to one node: its slot counter, or the holder's
 //!   anti-rollback mark. It is a separate volume per container precisely because
 //!   sharing it would break the property it exists to provide.
@@ -33,6 +33,9 @@ pub const RUN_ID: &str = "run-id";
 
 /// The assembled trust anchor, and the only file a verifier needs a priori.
 pub const ANCHOR: &str = "anchor.bin";
+
+/// The single canonical-current record exposed by the demo storage fixture.
+pub const CURRENT_RECORD: &str = "status-current.ssz";
 
 pub fn committee_dir() -> PathBuf {
     dir_from_env("COMMITTEE_DIR", "/shared/committee")
@@ -131,51 +134,14 @@ pub fn member_seed(secret: &str, run_id: &[u8], index: usize) -> [u8; 32] {
     out
 }
 
-/// The published record for `version`. Sorting by name sorts by version, which
-/// is what lets a reader find the freshest one without an index.
-pub fn record_name(version: u32) -> String {
-    format!("status-{version:05}.ssz")
-}
-
-fn version_of(name: &str) -> Option<u32> {
-    name.strip_prefix("status-")?
-        .strip_suffix(".ssz")?
-        .parse()
-        .ok()
-}
-
-/// Publishes a record to the shared storage volume.
-pub fn publish(version: u32, bytes: &[u8]) -> io::Result<PathBuf> {
-    let path = storage_dir().join(record_name(version));
+/// Atomically replaces the demo fixture's canonical-current record.
+pub fn publish(bytes: &[u8]) -> io::Result<PathBuf> {
+    let path = storage_dir().join(CURRENT_RECORD);
     write_atomic(&path, bytes)?;
     Ok(path)
 }
 
-/// Every published record, newest declared version first.
-///
-/// The version here is only the *filename*, which nobody has authenticated: it
-/// orders the candidates and decides nothing. Both verification paths bind the
-/// version into the signed message, so a record whose name overstates it fails
-/// verification like any other forgery.
-pub fn published_records() -> Vec<(u32, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(storage_dir()) else {
-        return Vec::new();
-    };
-    let mut found: Vec<(u32, PathBuf)> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let path = e.path();
-            let version = version_of(path.file_name()?.to_str()?)?;
-            Some((version, path))
-        })
-        .collect();
-    found.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
-    found
-}
-
-/// The newest published record, or `None` on an empty storage volume.
-pub fn latest_record() -> Option<(u32, Vec<u8>)> {
-    published_records()
-        .into_iter()
-        .find_map(|(v, p)| std::fs::read(p).ok().map(|b| (v, b)))
+/// Returns the one record supplied by the demo fixture, if one is published.
+pub fn current_record() -> Option<Vec<u8>> {
+    std::fs::read(storage_dir().join(CURRENT_RECORD)).ok()
 }

@@ -13,8 +13,13 @@ BLAKE2s-256. The quorum can be published in either of two forms:
 - `StatusList`: the raw XMSS signatures and a bitmap identifying their signers;
 - `SnarkStatusList`: one leanVM aggregate proof over the same signatures.
 
-A verifier needs only a fixed committee anchor. It does not need a live
-certificate authority or status service.
+A verifier needs a fixed committee anchor and one published record. Storage and
+distribution are outside this project: deployment assumes a secure distributed
+Verifiable Data Registry (VDR) that establishes one canonical current record for
+the status list and returns that single record. This library independently
+authenticates the returned record against its anchor and applies local persistent
+anti-rollback protection. It does not implement the VDR, discover replicas,
+rank competing responses, or choose among candidate records.
 
 > This is a research prototype. Committee rotation is not implemented.
 
@@ -43,6 +48,10 @@ Status-list entries + version + domain
             +-- StatusList      (bitmap + raw signatures)
             |
             +-- SnarkStatusList (leanVM aggregate proof)
+                        |
+                        +-- secure distributed VDR (external, one canonical record)
+                                    |
+                                    +-- local authentication + anti-rollback
 ```
 
 ## Trust anchor
@@ -192,7 +201,7 @@ The raw verifier enforces the equivalent policy:
 
 Verification authenticates a record but does not establish freshness.
 
-## Freshness and selection
+## Freshness and external storage boundary
 
 `HighWaterMark` stores the highest accepted version for one anchor fingerprint.
 A verified record is accepted only when its version is strictly greater than the
@@ -201,15 +210,28 @@ stored mark.
 The mark is updated only after successful cryptographic verification. A hostile
 record cannot advance it by declaring a large version.
 
-`RawNode::accept_best` and `SnarkNode::accept_best`:
+Its lifecycle is deliberately explicit and fail-closed:
 
-1. discard candidates at or below the current mark;
-2. order the remaining candidates by declared version;
-3. verify them from newest to oldest;
-4. accept the first valid record;
-5. verify at most `MAX_VERIFICATIONS_PER_SELECTION` candidates.
+- `HighWaterMark::create` is only for first provisioning and refuses every
+  existing state-file entry;
+- `HighWaterMark::open` is the normal startup path and refuses missing,
+  unreadable, malformed, or foreign-anchor state;
+- `HighWaterMark::load_from_trusted_source` is an explicit recovery path for a
+  lost or invalid local mark. It writes the version of an already authenticated
+  canonical-latest record obtained from the trusted Verifiable Data Registry,
+  and refuses to replace valid state for the same anchor.
 
-The verification budget is currently four candidates per selection.
+The VDR contract is an external deployment assumption, not an implementation in
+this crate. Normal intake is exactly one record through `RawNode::accept` or
+`SnarkNode::accept`: decode, authenticate the committee evidence, then offer the
+authenticated version to the mark. An invalid record is refused without moving
+the mark, and the library never falls back to another candidate.
+
+Recovery has a stronger precondition than ordinary authentication. Before
+calling `load_from_trusted_source`, the integration layer must establish that
+the record is the VDR's canonical latest value and verify its raw quorum or
+SNARK against the exact anchor. Merely finding an old record whose signatures
+still verify is not sufficient for recovery.
 
 ## Wire format
 
@@ -277,6 +299,7 @@ The prover and verifier can run as separate processes:
 
 ```sh
 cargo run --release --bin prover -- ./artifacts
+cargo run --release --bin verifier -- --init-state ./artifacts  # once
 cargo run --release --bin verifier -- ./artifacts
 ```
 
@@ -286,16 +309,21 @@ The prover writes:
 artifacts/
   anchor.bin
   update-NN.bin
+  canonical.bin
   attack-tampered.bin
   attack-outsider.bin
   attack-version.bin
 ```
 
-`update-*` records must be accepted. `attack-*` records must be rejected. The
-verifier exits with a non-zero status when either expectation is violated.
+`update-*` records form the measured verification corpus, `canonical.bin` is the
+single current-record fixture supplied to the anti-rollback flow, and
+`attack-*` records must be rejected. The verifier exits with a non-zero status
+when any expectation is violated.
 
-`verifier-highwater.state` is local verifier state and must not be published or
-shared between nodes.
+`--init-state` is an explicit first-provisioning operation and fails if the
+state already exists. Normal verifier startup only opens existing state and
+fails closed if it cannot be used. `verifier-highwater.state` is local verifier
+state and must not be published or shared between nodes.
 
 Each prover run creates a fresh committee, so artifacts from different runs are
 not interchangeable.
@@ -350,7 +378,7 @@ tools/mutate.py check
 tools/mutate.py
 ```
 
-The current catalog contains 30 mutations. Each removes or weakens one
+The current catalog contains 25 mutations. Each removes or weakens one
 security-relevant check and must be detected by the test suite.
 
 GitHub Actions runs formatting, Clippy with warnings denied, the mutation
@@ -412,12 +440,20 @@ mean of the two central observations.
 Each run writes a `bench-<timestamp>/` directory containing environment
 metadata, raw samples, per-process rows and summary statistics. The harness
 refuses to report timings when a target reports a failed security expectation.
+`runs.csv` also records load average, mean frequency over the selected CPUs and
+the highest readable temperature immediately before and after every target
+process. `drift.csv` compares the first and last quarter of run medians and
+flags a change above 15%; it never removes or rewrites samples. A strict run
+also requires a clean Git tree. Exploratory dirty-tree runs preserve
+`source.patch` and `source-status.txt`, so the recorded commit is not presented
+as sufficient to reconstruct uncommitted code.
 
 ### Committee scaling
 
 [`committee-scaling-benchmark.sh`](committee-scaling-benchmark.sh) orchestrates
-`benchmark.sh` over `N = 5, 10, 100, 500` and, when the host has enough
-available memory, `1000` and `1500`. It applies the strict two-thirds policy
+`benchmark.sh` over the requested grid `N = 5, 10, 100, 500, 1000, 1500`.
+Only `5, 10, 100` are unconditional; the larger points require enough available
+memory. It applies the strict two-thirds policy
 
 ```text
 t = floor(2N/3) + 1
@@ -429,22 +465,48 @@ project implements a consensus protocol.
 ```sh
 ./committee-scaling-benchmark.sh
 PLAN_ONLY=1 ./committee-scaling-benchmark.sh
-RUNS=10 WARMUP=2 STRICT_ENV=1 PIN_CPUS=0-7 ./committee-scaling-benchmark.sh
+STUDY_MODE=publication PIN_CPUS=0-7 ./committee-scaling-benchmark.sh
+RESUME=1 OUTDIR=committee-scaling-<timestamp> ./committee-scaling-benchmark.sh
 ```
 
-Before doing any work, the script prints and records the host's physical and
-available RAM, the operating-system reserve, the enforced RSS cap and the
-largest admitted committee. Its conservative defaults admit `N=1000` only with
-at least 12 GiB of usable benchmark budget and `N=1500` with at least 20 GiB;
-otherwise the planned sweep stops at `N=500`.
+The default `STUDY_MODE=pilot` uses three measured runs, one warm-up and one
+ascending sweep. It is intentionally labelled exploratory and is useful for
+resource discovery, not for paper results. `STUDY_MODE=publication` defaults to
+24 measured runs, two warm-ups, ten seconds of cooldown and two complete
+sweeps. The second sweep reverses the committee-size order, so host-time and
+committee size are not perfectly confounded. Publication mode requires
+`STRICT_ENV=1`, a clean committed tree, an explicit CPU mask, at least ten runs
+and at least two sweeps. Its run count must be a multiple of six, completing the
+Williams design for the three per-point targets. Any session whose early/late
+medians differ by more than 15% is marked unstable and withheld; no outlier is
+discarded.
 
-Every build, fixture generation and benchmark point then runs serially in its
-own process group. The active group is terminated and that point is withheld if
-its RSS exceeds the announced cap, available RAM falls below the reserve, swap
-grows by more than 64 MiB, or a stage exceeds the 90-minute default timeout.
-`MAX_RSS_MB`, `RESERVE_MB`, `MAX_SWAP_GROWTH_MB` and
-`POINT_TIMEOUT_MINUTES` can make these limits stricter. An unsafe
-`MAX_RSS_MB` request is clamped to the host-derived ceiling.
+Before doing any work, the script prints and records the host's physical and
+available RAM, the operating-system reserve, the process cap, free-disk reserve
+and largest admitted committee. `N=500`, `N=1000` and `N=1500` require at least
+8, 12 and 20 GiB respectively of usable benchmark budget; a smaller host stops
+at `N=100`. The thresholds are admission policy, not a fitted leanVM memory
+curve.
+
+Every build, fixture generation and benchmark point runs serially in its own
+process group and, by default, in a systemd user scope with kernel-enforced
+`MemoryMax` and `MemorySwapMax`. The polling guard remains a second line of
+defence: it terminates and withholds a stage if group RSS exceeds the cap,
+available RAM falls below the reserve, free disk falls below 8 GiB, global swap
+growth exceeds 64 MiB, or the 90-minute timeout expires. If user scopes are not
+available, the default `HARD_MEMORY_LIMIT=required` refuses to execute;
+`HARD_MEMORY_LIMIT=auto` explicitly opts a pilot into the weaker polling
+fallback. Publication mode always requires the kernel-enforced backend.
+`MAX_RSS_MB`, `RESERVE_MB`, `MIN_FREE_DISK_MB`, `MAX_SWAP_GROWTH_MB` and
+`POINT_TIMEOUT_MINUTES` can make the limits stricter. An unsafe `MAX_RSS_MB`
+request is clamped to the host-derived ceiling.
+
+An output directory is never silently reused. `RESUME=1` requires the stored
+campaign fingerprint to match source patch, Cargo lockfile, scripts, host,
+measurement parameters and CPU policy. It also reuses the original N set and
+recalculates the hard cap from current availability. It refuses to resume only
+when the current usable cap has fallen below the admission threshold of the
+largest recorded N.
 
 Before the sweep, `benchmark.sh` measures the `signer` target once as a separate
 single-member campaign, using the same run and warm-up counts. It is not repeated
@@ -465,14 +527,18 @@ The top-level output contains:
 - `signer.csv` and `signer/benchmark/` — the single-member campaign, measured
   once for the complete sweep;
 - `manifest.csv` — completed, stopped and RAM-excluded points;
-- `scaling.csv` — proving/verification medians, wire size, RSS and derived ratios;
+- `scaling.csv` — run-level medians combined across sweeps, wire size, RSS,
+  paired verification deltas, confidence bounds and derived ratios;
 - `report.txt` — the first observed wire-size, verification-time and joint
   crossover;
-- `Nxxxx-tyyyy/benchmark/` — the complete `benchmark.sh` output for each point,
-  including raw observations and confidence intervals.
+- `Nxxxx-tyyyy/session-XX/benchmark/` — the complete `benchmark.sh` output for
+  every sweep session at each point, including raw observations and confidence
+  intervals.
 
-When SNARK verification is faster, the report also computes the number of
-independent relying-party verifications needed to amortize one proof:
+The report calls SNARK verification faster only when the paired 95% confidence
+interval for `raw_verify - snark_verify` is wholly above zero. Only then does it
+report the number of independent relying-party verifications needed to amortize
+one proof:
 
 ```text
 ceil(prove_ms / (raw_verify_ms - snark_verify_ms))
@@ -480,7 +546,11 @@ ceil(prove_ms / (raw_verify_ms - snark_verify_ms))
 
 This deliberately excludes one-time setup, signing, network transfer and
 fixture generation; those costs have different owners and must not be folded
-into one latency figure.
+into one latency figure. Break-even is withheld if any paired run has no
+positive verification-time saving; that run is not silently discarded.
+Speedup and break-even Q1/Q3 remain in `scaling.csv`.
+The first favorable N is only the first observed grid point: a final study must
+refine the interval around it rather than call it the exact crossover.
 
 ## Dependencies
 
@@ -507,8 +577,9 @@ The main direct dependencies are:
 - The verifier predicate is stateless; rollback protection depends on the
   persistent high-water mark.
 - The SNARK record carries the participating XMSS public keys.
-- Selection bounds verification work per lookup but does not provide network
-  admission control.
+- Secure distributed storage, consensus, replication, availability and the
+  canonical-current lookup are VDR responsibilities assumed by this library and
+  not implemented here.
 - The project implements only XMSS with BLAKE2s-256. Other signature families
   supported by leanVM are outside the protocol and are rejected.
 

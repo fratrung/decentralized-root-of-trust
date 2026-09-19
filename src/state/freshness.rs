@@ -1,8 +1,8 @@
 //! Persistent anti-rollback state for a status-list verifier.
 //!
 //! The gate accepts only versions strictly above its mark. It is scoped to an
-//! anchor fingerprint, so an anchor change begins a new trust domain. This state
-//! is local and must not be published.
+//! anchor fingerprint, so a state file can never be reused silently under a
+//! different anchor. This state is local and must not be published.
 
 use std::fs::File;
 use std::io::Write;
@@ -21,6 +21,8 @@ pub enum Decision {
 /// Why the freshness gate could not be used safely.
 #[derive(Debug)]
 pub enum HighWaterMarkError {
+    /// The state is missing, malformed, foreign, or would be overwritten.
+    State(String),
     /// Another process already holds the mark for this status list.
     Busy,
     /// The mark could not be locked or durably written.
@@ -30,6 +32,7 @@ pub enum HighWaterMarkError {
 impl std::fmt::Display for HighWaterMarkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::State(m) => write!(f, "unusable high-water mark: {m}"),
             Self::Busy => write!(f, "another process holds this high-water mark"),
             Self::Io(e) => write!(f, "high-water mark I/O failed: {e}"),
         }
@@ -56,29 +59,54 @@ pub struct HighWaterMark {
 }
 
 impl HighWaterMark {
-    /// Loads the mark for the trust domain identified by `anchor` and panics if
-    /// the state file cannot be locked.
+    /// Initialises a mark for a verifier that has never accepted a record.
     ///
-    /// Existing callers use this convenience constructor. Code that wants to
-    /// report lock/I/O failures cleanly should call [`Self::try_load`] instead.
-    pub fn load(path: impl Into<PathBuf>, anchor: &[u8]) -> Self {
-        Self::try_load(path, anchor).expect("high-water mark is unavailable")
-    }
-
-    /// Loads the mark for the trust domain identified by `anchor`.
-    ///
-    /// If the file is missing, unreadable, corrupt, or was written for a different
-    /// anchor, the mark starts empty: a rotated committee legitimately resets the
-    /// counter. The lock is fail-closed, because two live verifiers advancing the
-    /// same file can otherwise overwrite each other's accepted version.
-    pub fn try_load(path: impl Into<PathBuf>, anchor: &[u8]) -> Result<Self, HighWaterMarkError> {
+    /// The empty state is persisted before this returns. Any existing filesystem
+    /// entry is refused, including malformed or foreign state: initialization is
+    /// not recovery, and overwriting here would silently discard rollback
+    /// protection.
+    pub fn create(path: impl Into<PathBuf>, anchor: &[u8]) -> Result<Self, HighWaterMarkError> {
         let path = path.into();
         let lock = acquire_lock(&path)?;
         let fingerprint = fingerprint(anchor);
-        let (current, have) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| parse(&s, &fingerprint))
-            .unwrap_or((0, false));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(HighWaterMarkError::State(format!(
+                    "{} already exists; refusing to reset freshness state",
+                    path.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(HighWaterMarkError::Io(e)),
+        }
+        let mark = Self {
+            path,
+            fingerprint,
+            current: 0,
+            have: false,
+            _lock: lock,
+        };
+        mark.persist(None)?;
+        Ok(mark)
+    }
+
+    /// Opens existing state for the trust domain identified by `anchor`.
+    ///
+    /// Missing, unreadable, malformed, and foreign-anchor state are all errors.
+    /// None can be distinguished safely from loss of an established mark, so
+    /// callers must either repair it or use [`Self::load_from_trusted_source`]
+    /// after authenticating the VDR's canonical-latest record.
+    pub fn open(path: impl Into<PathBuf>, anchor: &[u8]) -> Result<Self, HighWaterMarkError> {
+        let path = path.into();
+        let lock = acquire_lock(&path)?;
+        let fingerprint = fingerprint(anchor);
+        let bytes = std::fs::read(&path).map_err(|e| {
+            HighWaterMarkError::State(format!("cannot read {}: {e}", path.display()))
+        })?;
+        let raw = std::str::from_utf8(&bytes).map_err(|e| {
+            HighWaterMarkError::State(format!("{} is not UTF-8: {e}", path.display()))
+        })?;
+        let (current, have) = parse(raw, &fingerprint).map_err(HighWaterMarkError::State)?;
         Ok(Self {
             path,
             fingerprint,
@@ -86,6 +114,53 @@ impl HighWaterMark {
             have,
             _lock: lock,
         })
+    }
+
+    /// Reconstructs missing or invalid local state from a trusted freshness
+    /// source, such as the deployment's Verifiable Data Registry.
+    ///
+    /// `authenticated_latest_version` must come from the registry's
+    /// canonical-latest record *after* that raw or SNARK record has verified
+    /// under exactly `anchor`. Cryptographic validity alone is insufficient: an
+    /// old signed record is valid but is not a safe recovery checkpoint.
+    ///
+    /// This is an explicit recovery operation, not an alternate open path. It
+    /// writes the recovered version directly, with no durable empty-state window,
+    /// and refuses to overwrite any valid state for this anchor. A caller that
+    /// can open a valid mark must use normal monotonic advancement instead.
+    pub fn load_from_trusted_source(
+        path: impl Into<PathBuf>,
+        anchor: &[u8],
+        authenticated_latest_version: u32,
+    ) -> Result<Self, HighWaterMarkError> {
+        let path = path.into();
+        let lock = acquire_lock(&path)?;
+        let fingerprint = fingerprint(anchor);
+
+        match std::fs::read(&path) {
+            Ok(bytes)
+                if std::str::from_utf8(&bytes)
+                    .is_ok_and(|raw| parse(raw, &fingerprint).is_ok()) =>
+            {
+                return Err(HighWaterMarkError::State(format!(
+                    "{} contains valid state; refusing trusted-source recovery",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(HighWaterMarkError::Io(e)),
+        }
+
+        let mark = Self {
+            path,
+            fingerprint,
+            current: authenticated_latest_version,
+            have: true,
+            _lock: lock,
+        };
+        mark.persist(Some(authenticated_latest_version))?;
+        Ok(mark)
     }
 
     /// The current mark, or `None` if nothing has been accepted for this domain.
@@ -101,15 +176,16 @@ impl HighWaterMark {
         if self.have && version <= self.current {
             return Ok(Decision::Stale(self.current));
         }
-        self.persist(version)?;
+        self.persist(Some(version))?;
         self.current = version;
         self.have = true;
         Ok(Decision::Accepted)
     }
 
     /// Persists with write + fsync, atomic rename, and a directory fsync.
-    fn persist(&self, version: u32) -> Result<(), HighWaterMarkError> {
-        let line = format!("{} {}\n", self.fingerprint, version);
+    fn persist(&self, version: Option<u32>) -> Result<(), HighWaterMarkError> {
+        let value = version.map_or_else(|| "none".to_owned(), |v| v.to_string());
+        let line = format!("{} {value}\n", self.fingerprint);
         // Appending avoids colliding dotted state-file names.
         let tmp = crate::state::slot_counter::sibling(&self.path, "tmp");
 
@@ -148,12 +224,26 @@ fn fingerprint(anchor: &[u8]) -> String {
     s
 }
 
-/// Parses a mark only when it belongs to this anchor fingerprint.
-fn parse(s: &str, fingerprint: &str) -> Option<(u32, bool)> {
+/// Parses exactly one canonical mark for this anchor fingerprint.
+fn parse(s: &str, fingerprint: &str) -> Result<(u32, bool), String> {
     let mut it = s.split_whitespace();
-    let fp = it.next()?;
-    let version: u32 = it.next()?.parse().ok()?;
-    (fp == fingerprint).then_some((version, true))
+    let fp = it.next().ok_or_else(|| "empty state file".to_owned())?;
+    let value = it
+        .next()
+        .ok_or_else(|| "missing freshness value".to_owned())?;
+    if it.next().is_some() {
+        return Err("trailing data in state file".to_owned());
+    }
+    if fp != fingerprint {
+        return Err("state file belongs to a different anchor".to_owned());
+    }
+    if value == "none" {
+        return Ok((0, false));
+    }
+    let version = value
+        .parse::<u32>()
+        .map_err(|e| format!("unparseable freshness value: {e}"))?;
+    Ok((version, true))
 }
 
 #[cfg(test)]
@@ -163,7 +253,9 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("hwm-{name}-{}", std::process::id()));
         let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(crate::state::slot_counter::sibling(&p, "tmp"));
+        let _ = std::fs::remove_dir_all(crate::state::slot_counter::sibling(&p, "tmp"));
         let _ = std::fs::remove_file(crate::state::slot_counter::sibling(&p, "lock"));
         p
     }
@@ -177,7 +269,7 @@ mod tests {
     /// window at all below the mark reopens the rollback it exists to close.
     #[test]
     fn only_strictly_newer_versions_advance_the_mark() {
-        let mut hwm = HighWaterMark::load(scratch("strict"), b"anchor-A");
+        let mut hwm = HighWaterMark::create(scratch("strict"), b"anchor-A").unwrap();
 
         // Nothing accepted yet, so version 0 is still a real advance: this is why
         // the type carries `have` instead of treating 0 as "empty".
@@ -206,75 +298,161 @@ mod tests {
         let path = scratch("restart");
         let anchor = b"anchor-A";
 
-        let mut hwm = HighWaterMark::load(&path, anchor);
+        let mut hwm = HighWaterMark::create(&path, anchor).unwrap();
         assert!(accepted(hwm.try_advance(42)));
         drop(hwm);
 
-        let mut reloaded = HighWaterMark::load(&path, anchor);
+        let mut reloaded = HighWaterMark::open(&path, anchor).unwrap();
         assert_eq!(reloaded.current(), Some(42));
         assert!(matches!(reloaded.try_advance(42), Ok(Decision::Stale(42))));
         assert!(accepted(reloaded.try_advance(43)));
     }
 
-    /// The mark is scoped to a trust domain. A version counter only totally-orders
-    /// records under one committee, so a rotation must reset it rather than carry a
-    /// number that now means something else, and the old domain's mark must not be
-    /// destroyed in the process.
+    /// Reusing one state path under another anchor is ambiguous: it could be a
+    /// legitimate rotation, a configuration error, or an attack. Opening it must
+    /// therefore fail rather than silently reset rollback protection.
     #[test]
-    fn a_different_anchor_is_a_different_domain() {
+    fn a_different_anchor_is_refused() {
         let path = scratch("domain");
 
-        let mut a = HighWaterMark::load(&path, b"anchor-A");
+        let mut a = HighWaterMark::create(&path, b"anchor-A").unwrap();
         assert!(accepted(a.try_advance(500)));
         drop(a);
 
-        // Same file, rotated committee: the stored mark is not ours, so we start
-        // empty and a low version is legitimately accepted.
-        let mut b = HighWaterMark::load(&path, b"anchor-B");
-        assert_eq!(b.current(), None);
-        assert!(accepted(b.try_advance(1)));
-        assert_eq!(b.current(), Some(1));
+        assert!(matches!(
+            HighWaterMark::open(&path, b"anchor-B"),
+            Err(HighWaterMarkError::State(_))
+        ));
+
+        let reopened = HighWaterMark::open(&path, b"anchor-A").unwrap();
+        assert_eq!(reopened.current(), Some(500));
     }
 
-    /// An unreadable or corrupt file must not be guessed at. Fail-open is the
-    /// documented choice here (losing the mark costs one stale record accepted
-    /// once); what matters is that it does not silently inherit a number it cannot
-    /// authenticate.
+    /// A corrupt mark is indistinguishable from lost anti-rollback state. It must
+    /// stop normal startup rather than turn an old authentic record into a first
+    /// acceptance again.
     #[test]
-    fn a_corrupt_file_starts_empty() {
+    fn a_corrupt_file_is_refused() {
         let path = scratch("corrupt");
         std::fs::write(&path, "not-a-fingerprint\n").unwrap();
-        let mut hwm = HighWaterMark::load(&path, b"anchor-A");
-        assert_eq!(hwm.current(), None);
-        assert!(accepted(hwm.try_advance(0)));
+        assert!(matches!(
+            HighWaterMark::open(&path, b"anchor-A"),
+            Err(HighWaterMarkError::State(_))
+        ));
     }
 
     #[test]
     fn a_live_mark_locks_its_state_file() {
         let path = scratch("lock");
 
-        let held = HighWaterMark::try_load(&path, b"anchor-A").expect("first mark");
+        let held = HighWaterMark::create(&path, b"anchor-A").expect("first mark");
         assert!(matches!(
-            HighWaterMark::try_load(&path, b"anchor-A"),
+            HighWaterMark::open(&path, b"anchor-A"),
             Err(HighWaterMarkError::Busy)
         ));
         drop(held);
-        assert!(HighWaterMark::try_load(&path, b"anchor-A").is_ok());
+        assert!(HighWaterMark::open(&path, b"anchor-A").is_ok());
     }
 
     #[test]
     fn a_persistence_failure_does_not_advance_memory() {
-        let dir = std::env::temp_dir().join(format!("hwm-persist-failure-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("state");
-        std::fs::create_dir(&path).unwrap();
+        let path = scratch("persist-failure");
+        let mut hwm = HighWaterMark::create(&path, b"anchor-A").unwrap();
+        let tmp = crate::state::slot_counter::sibling(&path, "tmp");
+        std::fs::create_dir(&tmp).unwrap();
 
-        let mut hwm = HighWaterMark::load(&path, b"anchor-A");
         assert!(matches!(hwm.try_advance(1), Err(HighWaterMarkError::Io(_))));
         assert_eq!(hwm.current(), None);
 
         drop(hwm);
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(
+            HighWaterMark::open(&path, b"anchor-A").unwrap().current(),
+            None
+        );
+    }
+
+    #[test]
+    fn create_is_explicit_and_never_overwrites_state() {
+        let path = scratch("create");
+        let created = HighWaterMark::create(&path, b"anchor-A").unwrap();
+        assert_eq!(created.current(), None);
+        drop(created);
+
+        assert_eq!(
+            HighWaterMark::open(&path, b"anchor-A").unwrap().current(),
+            None
+        );
+        assert!(matches!(
+            HighWaterMark::create(&path, b"anchor-A"),
+            Err(HighWaterMarkError::State(_))
+        ));
+        assert!(matches!(
+            HighWaterMark::open(scratch("missing"), b"anchor-A"),
+            Err(HighWaterMarkError::State(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_numeric_state_remains_compatible_but_trailing_data_is_rejected() {
+        let path = scratch("legacy");
+        std::fs::write(&path, format!("{} 17\n", fingerprint(b"anchor-A"))).unwrap();
+        assert_eq!(
+            HighWaterMark::open(&path, b"anchor-A").unwrap().current(),
+            Some(17)
+        );
+
+        std::fs::write(
+            &path,
+            format!("{} 17 unexpected\n", fingerprint(b"anchor-A")),
+        )
+        .unwrap();
+        assert!(matches!(
+            HighWaterMark::open(&path, b"anchor-A"),
+            Err(HighWaterMarkError::State(_))
+        ));
+    }
+
+    #[test]
+    fn trusted_source_recovery_persists_the_authenticated_latest_version() {
+        let path = scratch("trusted-source");
+        let mut recovered =
+            HighWaterMark::load_from_trusted_source(&path, b"anchor-A", 42).unwrap();
+        assert_eq!(recovered.current(), Some(42));
+        assert!(matches!(recovered.try_advance(42), Ok(Decision::Stale(42))));
+        drop(recovered);
+
+        let mut reopened = HighWaterMark::open(&path, b"anchor-A").unwrap();
+        assert_eq!(reopened.current(), Some(42));
+        assert!(matches!(reopened.try_advance(7), Ok(Decision::Stale(42))));
+        assert!(accepted(reopened.try_advance(43)));
+    }
+
+    #[test]
+    fn trusted_source_recovery_replaces_invalid_but_never_valid_state() {
+        let corrupt = scratch("recover-corrupt");
+        std::fs::write(&corrupt, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            HighWaterMark::load_from_trusted_source(&corrupt, b"anchor-A", 9)
+                .unwrap()
+                .current(),
+            Some(9)
+        );
+
+        let foreign = scratch("recover-foreign");
+        drop(HighWaterMark::create(&foreign, b"anchor-B").unwrap());
+        assert_eq!(
+            HighWaterMark::load_from_trusted_source(&foreign, b"anchor-A", 10)
+                .unwrap()
+                .current(),
+            Some(10)
+        );
+
+        let valid = scratch("recover-valid");
+        drop(HighWaterMark::create(&valid, b"anchor-A").unwrap());
+        assert!(matches!(
+            HighWaterMark::load_from_trusted_source(&valid, b"anchor-A", 11),
+            Err(HighWaterMarkError::State(_))
+        ));
     }
 }

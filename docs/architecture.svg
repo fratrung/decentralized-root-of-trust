@@ -71,7 +71,7 @@
 
   <!-- ============ PUBLISH ============ -->
   <rect x="30" y="570" width="620" height="40" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5"/>
-  <text x="340" y="595" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#0f172a">published — DHT · freshness by version · anti-rollback high-water mark</text>
+  <text x="340" y="595" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#0f172a">external secure VDR → one canonical record → local anti-rollback</text>
 
   <line x1="180" y1="610" x2="180" y2="628" stroke="#94a3b8" stroke-width="1.8"/>
   <path d="M 180 636 L 175 626 L 185 626 Z" fill="#94a3b8"/>

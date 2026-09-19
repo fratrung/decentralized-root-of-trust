@@ -45,42 +45,6 @@ impl RawNode {
         self.accept_record(&record)
     }
 
-    /// How many records one selection will verify before giving up.
-    ///
-    /// The same budget, and for the same reason, as
-    /// [`crate::node::snark_verifier::PQSNARKVerifierModule::MAX_VERIFICATIONS_PER_SELECTION`]:
-    /// the floor drops records at or below the mark, which is not what a hostile
-    /// peer sends, so without a cap the number of verifications is the attacker's
-    /// to choose. A raw verification is `t` signature checks rather than a SNARK,
-    /// so the unit is cheaper — but it is still linear in what a peer hands over,
-    /// and the two paths should not differ in how much work they can be made to
-    /// do.
-    pub const MAX_VERIFICATIONS_PER_SELECTION: usize =
-        crate::node::snark_verifier::PQSNARKVerifierModule::MAX_VERIFICATIONS_PER_SELECTION;
-
-    /// Tries candidates newest first and accepts the first valid record above the
-    /// current mark.
-    ///
-    /// Versions at or below the mark are skipped before signature verification,
-    /// and at most [`Self::MAX_VERIFICATIONS_PER_SELECTION`] of the rest are
-    /// verified at all.
-    pub fn accept_best(&mut self, candidates: &[Vec<u8>]) -> Outcome {
-        let floor = self.mark.current();
-        let mut decoded: Vec<StatusList> = candidates
-            .iter()
-            .filter_map(|bytes| StatusList::from_bytes(bytes).ok())
-            .filter(|record| floor.is_none_or(|f| record.version() > f))
-            .collect();
-        decoded.sort_by_key(|record| std::cmp::Reverse(record.version()));
-
-        for record in decoded.iter().take(Self::MAX_VERIFICATIONS_PER_SELECTION) {
-            if let outcome @ Outcome::Accepted { .. } = self.accept_record(record) {
-                return outcome;
-            }
-        }
-        Outcome::Refused
-    }
-
     fn accept_record(&mut self, record: &StatusList) -> Outcome {
         if !self.verifier.verify_status_list(record) {
             return Outcome::Refused;
@@ -132,7 +96,8 @@ mod tests {
         let keys = keys_in(ns);
         let members: Vec<XmssPublicKey> = keys.iter().map(|(_, pk)| pk.clone()).collect();
         let committee = Committee::new(members, T, GENESIS);
-        let mark = HighWaterMark::load(scratch(name), &committee.to_bytes());
+        let mark = HighWaterMark::create(scratch(name), &committee.to_bytes())
+            .expect("create freshness state");
         (keys, RawNode::new(committee, mark))
     }
 
@@ -207,79 +172,5 @@ mod tests {
         assert_eq!(node.accept(&[]), Outcome::Refused);
         assert_eq!(node.accept(&[0xff; 64]), Outcome::Refused);
         assert_eq!(node.high_water(), None);
-    }
-
-    /// A hostile peer picks how many records it serves and what versions they
-    /// declare. Declaring them *above* the mark is free, so the floor removes
-    /// none of them and every one would be verified — which makes the number of
-    /// signature checks the attacker's to choose. The budget is what makes it the
-    /// node's.
-    ///
-    /// The genuine record is placed last and at the *lowest* version on purpose:
-    /// this asserts the cap really stops the walk rather than being masked by a
-    /// candidate that happens to verify early.
-    #[test]
-    fn a_flood_of_junk_candidates_cannot_buy_unbounded_verification() {
-        let (keys, mut node) = node_in(5, "budget");
-        let committee = node.committee().clone();
-
-        let honest = record(&keys, &committee, &[hash_any(b"a")], 0, &[0, 1, 2]);
-
-        // Junk that survives the floor: real structure, real signatures, but one
-        // signer short of the threshold, each declaring a version above the honest
-        // one so it sorts first. The versions stay inside the key window — these
-        // are records a real peer could actually have produced, not ones the
-        // signer would refuse to make.
-        let mut candidates: Vec<Vec<u8>> = (1..=MAX_VERSION)
-            .map(|v| record(&keys, &committee, &[hash_any(b"junk")], v, &[0, 1]))
-            .collect();
-        candidates.push(honest.clone());
-
-        // Everything the budget reaches is junk, so nothing is accepted — and,
-        // crucially, the honest record below the junk was never even looked at.
-        assert_eq!(node.accept_best(&candidates), Outcome::Refused);
-        assert_eq!(node.high_water(), None, "nothing may have moved the gate");
-        assert!(
-            RawNode::MAX_VERIFICATIONS_PER_SELECTION < candidates.len(),
-            "the budget must be the binding constraint, or this test is vacuous"
-        );
-
-        // The same node still accepts that record when it is not buried: the cap
-        // bounds work, it does not blacklist anything.
-        assert_eq!(node.accept(&honest), Outcome::Accepted { version: 0 });
-    }
-
-    #[test]
-    fn the_freshest_candidate_wins_and_a_second_lookup_finds_nothing_new() {
-        let (keys, mut node) = node_in(4, "select");
-        let committee = node.committee().clone();
-
-        let v0 = record(&keys, &committee, &[hash_any(b"a")], 0, &[0, 1, 2]);
-        let v1 = record(
-            &keys,
-            &committee,
-            &[hash_any(b"a"), hash_any(b"b")],
-            1,
-            &[0, 1, 3],
-        );
-        let v2 = record(
-            &keys,
-            &committee,
-            &[hash_any(b"a"), hash_any(b"b"), hash_any(b"c")],
-            2,
-            &[1, 2, 4],
-        );
-
-        // Offered out of order, and with one candidate that is not a record at all.
-        let candidates = vec![v1.clone(), vec![0u8; 3], v2.clone(), v0.clone()];
-        assert_eq!(
-            node.accept_best(&candidates),
-            Outcome::Accepted { version: 2 }
-        );
-
-        // The same peers, the same answers, one round later: everything is now at
-        // or below the mark, so nothing is verified and nothing is accepted.
-        assert_eq!(node.accept_best(&candidates), Outcome::Refused);
-        assert_eq!(node.high_water(), Some(2));
     }
 }

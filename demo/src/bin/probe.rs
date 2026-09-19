@@ -47,8 +47,8 @@ fn main() {
     // Start from the published snapshot and change one entry. The first request
     // spends the derived slot; a second request at that same version changes the
     // message and must be refused by the durable counter.
-    let (published, mut list) = match storage::latest_record() {
-        Some((_, bytes)) => decode(mode, &bytes),
+    let (published, mut list) = match storage::current_record() {
+        Some(bytes) => decode(mode, &bytes),
         None => panic!("nothing is published yet; run a normal round first"),
     };
     let version = version.unwrap_or(published + 1);

@@ -53,7 +53,7 @@ wait_for_anchor() {
 }
 
 published_count() {
-  in_volumes 'ls /shared/storage/status-*.ssz 2>/dev/null | wc -l' | tr -dc '0-9'
+  in_volumes '[ -s /shared/storage/status-current.ssz ] && echo 1 || echo 0' | tr -dc '0-9'
 }
 
 member_log() { docker logs "drot-$MODE-signer-$1" 2>&1; }
@@ -125,6 +125,13 @@ case "$CMD" in
   up)
     say "clearing the $OTHER demo, which shares this subnet"
     "${OTHER_COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
+    if docker volume inspect "drot-${MODE}_holder-state" >/dev/null 2>&1; then
+      export HOLDER_STATE_MODE=open
+      say "opening node A's existing anti-rollback state"
+    else
+      export HOLDER_STATE_MODE=create
+      say "provisioning node A's anti-rollback state for the first time"
+    fi
     say "starting the $MODE network: 1 bootstrap + 10 members, threshold $THRESHOLD"
     "${COMPOSE[@]}" up -d --build
     wait_for_anchor

@@ -22,7 +22,10 @@ verifier accepts either:
   and verifier setup.
 
 The verifier embeds one fixed anchor — the committee (`N` public keys, threshold
-`t`, genesis slot) — and needs no live data fetch.
+`t`, genesis slot). Secure distributed storage is an external assumption: a VDR
+establishes and returns one canonical current record. This repository does not
+implement storage, replica discovery, conflict resolution, or candidate
+selection; it authenticates that one record and applies local anti-rollback.
 `README.md` holds the design rationale, benchmark method and the architecture
 diagram; the per-module reasoning lives in the doc comments themselves.
 
@@ -32,15 +35,17 @@ diagram; the per-module reasoning lives in the doc comments themselves.
 cargo run --release --bin decentralized-root-of-trust  # combined SNARK demo: setup, N updates, 3 security tests
 cargo run --release --bin raw_agg                      # the same protocol with no SNARK, through SignerNode/VerifierNode
 cargo run --release --bin prover   -- [outdir]         # split: aggregate, writes artifacts (default ./artifacts)
-cargo run --release --bin verifier -- [dir]            # split: verify-only, exits non-zero on any violated expectation
+cargo run --release --bin verifier -- --init-state [dir] # split: explicit first provisioning, run once per state path
+cargo run --release --bin verifier -- [dir]            # split: verify-only, opens existing state and fails closed
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
 cargo fmt --all -- --check                             # formatting gate used by CI
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --locked                                    # 67 unit + 10 integration tests; 75 run + 1 ignored
+cargo test --locked                                    # 69 unit + 10 integration tests; 78 run + 1 ignored
 ./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
-./committee-scaling-benchmark.sh                       # RAM-gated N/t sweep over benchmark.sh
+./committee-scaling-benchmark.sh                       # exploratory pilot; hard RAM/disk-gated N/t sweep
+STUDY_MODE=publication PIN_CPUS=0-7 ./committee-scaling-benchmark.sh # clean-tree, repeated counterbalanced sweep
 PLAN_ONLY=1 ./committee-scaling-benchmark.sh           # persist the host-derived sweep limit only
-tools/mutate.py                                        # mutation testing: 30 checks, each must be caught by a test
+tools/mutate.py                                        # mutation testing: 25 checks, each must be caught by a test
 ./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
 ./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
 ./demo/docker/demo.sh {raw|snark} revoke               # remove that credential's fingerprint, then verify its absence
@@ -151,12 +156,12 @@ Library:
   against the SNARK path.
 - `src/node/raw_node.rs` — the raw-path **relying party**: a `VerifierNode` and a
   `HighWaterMark` in one type. `accept` decodes, verifies, and only then offers the
-  version to the gate; `accept_best` takes what several peers returned, drops
-  everything at or below the mark, and tries the rest newest-first. The ordering is
-  the reason the type exists: a mark that advanced on an unauthenticated record
-  could be pushed to `u32::MAX` by any peer, locking the node out of every genuine
-  update. No I/O beyond the mark's own file — transport lives above it, which is
-  what keeps the unit tests to byte strings.
+  authenticated version to the gate. It accepts exactly one record, matching the
+  external VDR contract; it never ranks or falls back across candidates. The
+  ordering is the reason the type exists: a mark that advanced on an
+  unauthenticated record could be pushed to `u32::MAX`, locking the node out of
+  every genuine update. No I/O beyond the mark's own file — transport lives above
+  it, which is what keeps the unit tests to byte strings.
 - `src/params.rs` — demo parameters (`SLOT` = the genesis slot, `N_MEMBERS`, `T`,
   `N_UPDATES`, `KEY_SLOTS`, `LOG_INV_RATE`), shared by `main.rs`, `prover` and
   `raw_agg`. The `verifier` deliberately imports none of them. Ordinary builds
@@ -164,9 +169,14 @@ Library:
   compile-time overrides `DROT_BENCH_N`/`DROT_BENCH_T`. They are benchmark-only:
   setting only one is refused, and invalid pairs fail before key generation.
 - `src/state/freshness.rs` — `HighWaterMark`, the persistent anti-rollback gate. Strict
-  monotonic rule (`version > mark`), keyed to a fingerprint of the anchor so a
-  committee rotation resets it, persisted with a write-then-rename. Lives *outside*
-  the verification predicate, which stays pure.
+  monotonic rule (`version > mark`), keyed to a fingerprint of the anchor and
+  persisted with a write-then-rename. `create` is first provisioning only;
+  `open` refuses missing, corrupt, unreadable, or foreign state rather than
+  resetting it. `load_from_trusted_source` is the explicit recovery operation:
+  its version must come from the VDR's authenticated canonical-latest record,
+  and it never replaces valid same-anchor state. Lives *outside* the verification
+  predicate, which stays pure; `RawNode` and `SnarkNode` continue to receive it
+  by dependency injection.
 - `src/bench/mem.rs`, `src/bench/stats.rs` — RSS (resident set size) probes and descriptive
   statistics shared by every binary.
 - `src/node/snark_prover.rs` — the prover. Holding the value *is* the proof that
@@ -176,20 +186,17 @@ Library:
   module deliberately has no signing API: production signatures must come from
   `SignerNode`, whose durable counter burns an XMSS slot before signing.
 - `src/node/snark_verifier.rs` — the SNARK path's predicate, paired with
-  `setup_verifier()`. Owns the five checks, `is_newer`, and `select_freshest` (the
-  DHT-layer selection: newest declared version first, verify, fall back on
-  failure). `select_freshest_above` is the same with a floor — the caller's
-  high-water mark — applied before any proof is verified. That is a work saver,
-  not a check: the floor can only drop records the caller was already going to
-  refuse as stale. There is exactly **one** copy of each predicate and it lives
-  here; an earlier second copy had drifted and silently lost the slot check.
+  `setup_verifier()`. Owns the five checks and `is_newer`. It authenticates one
+  record and performs no storage-layer selection. There is exactly **one** copy
+  of each predicate and it lives here; an earlier second copy had drifted and
+  silently lost the slot check.
 
 - `src/node/snark_node.rs` — the same composition over the aggregated form, and
   the only thing the two paths differ in once a form is chosen. Owns a
   `PQSNARKVerifierModule`, so holding one also means `setup_verifier()` has run;
-  `accept_best` delegates selection to `select_freshest_above` with the mark as the
-  floor. `tests/snark_node.rs` is the seam test: a genuine proof carrying a lying
-  version must not move the gate.
+  `accept` authenticates one VDR-supplied record before offering its version to
+  the mark. `tests/snark_node.rs` is the seam test: a genuine proof carrying a
+  lying version must not move the gate.
 - `src/node/mod.rs` — `Outcome` (`Accepted` / `Stale` / `Refused`) and
   `Outcome::advance`, the single place a mark is moved. `Refused` deliberately does
   not carry the version the record claimed: an unverified version is a peer's
@@ -237,7 +244,7 @@ committee of one, and the raw path with a real `t`-of-`N` quorum. They write slo
 state into the working directory (`next_slot`, `signers/`), which `.gitignore`
 covers.
 
-Tests (`cargo test`, 76 registered: 75 run plus one `#[ignore]`d):
+Tests (`cargo test`, 79 registered: 78 run plus one `#[ignore]`d):
 - `src/*.rs` unit tests cover each module against its own contract.
   `status_list.rs`'s pin the seam this crate has with leanVM: that
   `status_list_message` is BLAKE2s-256 of the exact domain/version/count/entries
@@ -275,17 +282,15 @@ Tests (`cargo test`, 76 registered: 75 run plus one `#[ignore]`d):
   slot from the **anchor** rather than from its caller — asserted against the slot
   recorded inside the finished proof — that the verifier module accepts an honest
   record and refuses a tampered list and a relabelled version, that
-  `select_freshest` runs those same checks and is not fooled by a candidate that
-  merely *declares* a higher version, that `is_newer` is strict, and that a version
-  with no slot under the anchor panics instead of proving something unverifiable.
+  `is_newer` is strict, and that a version with no slot under the anchor panics
+  instead of proving something unverifiable.
   One aggregation and one `#[test]`, for the arena reason above.
 - `tests/snark_node.rs` covers the *seam* the other two do not: that `SnarkNode`
   never lets a record which failed the predicate reach the gate. A genuine proof
   relabelled to version 9 is refused and leaves the mark untouched, which is the
   case that matters — a mark an unauthenticated peer can advance locks the node
   out of every honest update below it. Then the honest record is accepted, the
-  same bytes replayed are `Stale`, and a selection whose candidates are all at or
-  below the mark verifies nothing. One aggregation; one `#[test]`, for the arena
+  same bytes replayed are `Stale`. One aggregation; one `#[test]`, for the arena
   reason above. The raw half of the same seam is unit-tested in
   `src/node/raw_node.rs`, where it costs nothing.
 - `tests/lock_two_processes.rs` checks the cross-process lock with two **real**
@@ -298,7 +303,8 @@ Tests (`cargo test`, 76 registered: 75 run plus one `#[ignore]`d):
   gets the lock *and* resumes from the slot the first durably burned.
 - `tests/hostile_bytes.rs` is the only test whose input this crate did not
   produce, which is the shape the threat model actually has: records arrive from a
-  DHT, so every byte is attacker-chosen. It mutates all three wire formats —
+  repository-external registry, so every byte remains untrusted until local
+  authentication succeeds. It mutates all three wire formats —
   truncation, bit flips, insertions, deletions, plus an offset-shaped pattern
   spliced at every early position — and asserts three properties in increasing
   order of importance: the decoders never panic, never treat a malformed length as
@@ -417,10 +423,14 @@ quorum check.
 
 - Verification is **stateless**: an old but legitimate (list, proof) pair verifies
   forever. Rollback is stopped one layer up, not by the predicate:
-  `select_freshest` picks the newest valid record, then `HighWaterMark`
-  (`freshness.rs`) refuses anything not strictly newer than the last accepted
-  version, persisted across restarts. The mark is per-object; the demo carries a
-  single status list so it keeps a single mark in the artifact dir. Committee
+  the external VDR supplies one canonical current record, the node authenticates
+  it, then `HighWaterMark` (`freshness.rs`) refuses anything not strictly newer
+  than the last accepted version, persisted across restarts. The mark is
+  per-object; the demo carries a single status list so it keeps a single mark in
+  the artifact dir. Missing,
+  invalid, or foreign state stops normal startup. Recovery requires a record
+  independently established as both cryptographically valid and canonical-latest
+  by the trusted VDR; an old signed record is not a safe checkpoint. Committee
   rotation (the anchor changing) is a separate, deferred protocol.
 - `version` **is** verified: it is framed into the signed message (Option B), so
   verification recomputes `status_list_message(domain, list, version())` and a
@@ -467,16 +477,10 @@ quorum check.
 - Both paths' checks now have tests: `raw_agg` forgeries plus `cargo test` for the
   raw path, `tests/snark_path.rs` for all five SNARK checks including the
   sub-threshold quorum.
-- **Selection is budgeted, not unbounded.** `select_freshest_above` and
-  `RawNode::accept_best` verify at most `MAX_VERIFICATIONS_PER_SELECTION` (4)
-  candidates. The floor is a work saver and *not* the defence it reads as: it
-  drops records at or below the mark, which is precisely what a hostile peer never
-  sends. Records claiming versions above the mark pass it untouched, and each one
-  costs a full verification — a SNARK on one path, `t` signature checks on the
-  other. Candidates are tried newest first, so reaching the cap means the four
-  freshest records a lookup returned all failed; an honest lookup succeeds on the
-  first. What is bounded is deliberately the *expensive* half: decoding stays
-  unbounded because it is cheap and already limited by the input size.
+- **Secure distributed storage is not implemented here.** The VDR is assumed to
+  establish global canonicality and latestness and to return one record. This
+  library independently authenticates that record and applies local
+  anti-rollback; it provides no replica discovery, candidate ranking or fallback.
 
 ## leanVM constraints that shape this code
 
@@ -572,6 +576,7 @@ a `0.000 ms` that reads as "instant".
 ```
 anchor.bin       the committee (N public keys + threshold t)
 update-NN.bin    legitimate updates — MUST verify
+canonical.bin    the one current record used by the anti-rollback flow
 attack-*.bin     forgeries — MUST be rejected (a decode failure counts as rejection)
 ```
 
@@ -581,10 +586,14 @@ interchangeable — start from a clean directory.
 
 ## Benchmarking
 
-`benchmark.sh` is built for numbers that go into a write-up: it captures the full
+`benchmark.sh` is built for numbers that can be audited before a write-up: it captures the full
 environment (`env.txt`), emits tidy raw data (`samples.csv`), per-run rows
 (`runs.csv`) and aggregates with quartiles, sd, CV and t-based CI95
-(`summary.csv` / `summary.txt`).
+(`summary.csv` / `summary.txt`). `runs.csv` also records load, selected-CPU
+frequency and the highest readable temperature before and after each process.
+`drift.csv` flags an early/late median shift above 15% without deleting data.
+Strict runs require a clean tree; exploratory dirty runs preserve
+`source.patch` and `source-status.txt`.
 
 The unit of analysis for per-update metrics is the **per-run median** (n = RUNS),
 not the pooled sample: updates inside one process share allocator and cache state
@@ -633,9 +642,12 @@ self-contained diagnostic mode reports the whole committee's `N`; do not read
 those figures as the same quantity as the signer row.
 
 The default schedule uses a Williams-style balanced target order and an idle
-`COOLDOWN_SECONDS=2` before every process. This balances position and immediate
-predecessor across complete blocks and reduces thermal carry-over. It does not
-prove equal temperature, so retain `t_start` and inspect drift before publishing.
+`COOLDOWN_SECONDS=2` before every process. Warm-ups form a separate phase, so
+their count does not shift the measured design. Even target counts use N rows;
+odd counts use N rotations plus their reversals. This balances position and
+directed predecessor across complete designs and reduces thermal carry-over. It
+does not prove equal temperature, so retain the telemetry and inspect
+`drift.csv` before publishing.
 `INTERLEAVE=0` remains the contiguous legacy order.
 
 `runs.csv` calls its shared size column `artifact_med_bytes`. In
@@ -655,30 +667,43 @@ projection block existed once and was removed — do not reintroduce it.
 `committee-scaling-benchmark.sh` must remain an orchestrator over
 `benchmark.sh`, not a second measurement implementation. `benchmark.sh` remains
 the authority for scheduling, raw samples, descriptive statistics, confidence
-intervals and security failure gates. The scaling layer measures the `signer`
+intervals, drift diagnostics and security failure gates. The scaling layer measures the `signer`
 target once for the whole campaign, then chooses `(N,t)`, prepares unmeasured
-signatures, enforces resources, invokes one complete benchmark per point and
-joins the resulting `summary.csv` files. The signer result stays separate in
+signatures, enforces resources, invokes complete benchmark sessions and
+aggregates their run-level medians. The signer result stays separate in
 `signer.csv`: it is a one-member cost common to both publication forms, not a
 quantity to multiply by `t` or repeat at every committee size.
 
 The requested grid is `N = 5, 10, 100, 500, 1000, 1500`, with
 `t = floor(2N/3) + 1`. This is a strict two-thirds authorization policy, not PBFT
-or another consensus protocol. `N=5..500` is the base grid. At startup the script
+or another consensus protocol. `N=5,10,100` is the base grid. At startup the script
 derives a usable process budget as the smaller of 70% of physical RAM and
-`MemAvailable - host reserve`; it admits `N=1000` at 12 GiB and `N=1500` at
-20 GiB. It prints and persists that decision before building anything.
+`MemAvailable - host reserve`; it admits `N=500`, `N=1000` and `N=1500` at 8,
+12 and 20 GiB respectively. It prints and persists that decision before building
+anything.
 
 Admission never disables the live guard. Build, fixture and benchmark stages run
-serially in separate process groups. A point is terminated and withheld when
-RSS crosses the announced cap, `MemAvailable` crosses the reserve, swap grows
-beyond the allowance, or the timeout expires. After such a stop no larger point
-runs. Keep this explicit in `manifest.csv`; never turn a resource abort into a
-partial timing row.
+serially in separate process groups and, by default, systemd user scopes with
+kernel-enforced `MemoryMax`/`MemorySwapMax`. Polling separately checks group RSS,
+`MemAvailable`, swap, free disk and timeout. If a hard scope is unavailable,
+`HARD_MEMORY_LIMIT=required` refuses to run; `auto` is the explicit weaker
+fallback. After a stop no later point runs. Keep it explicit in `manifest.csv`;
+never turn a resource abort into a partial timing row.
 
-The combined report may derive only quantities supported by completed
-`benchmark.sh` summaries: wire-size ratio, raw/SNARK verification ratio, first
-observed crossover and the verifier-consumer amortization count
-`ceil(prove / (raw_verify - snark_verify))`. That count excludes process setup,
-networking, signing and fixture generation. Do not call it end-to-end latency or
-extrapolate a crossover between measured grid points.
+`STUDY_MODE=pilot` is exploratory: three runs, one warm-up, one ascending sweep.
+`publication` defaults to 24 runs and two complete sweeps, ascending then
+descending, and requires a clean tree, strict environment, explicit CPU mask and
+hard memory backend. Its run count must be a multiple of six, completing the
+Williams design for the three per-point targets. It withholds a session on a
+drift warning. `RESUME=1` is accepted only when the recorded
+source/configuration fingerprint matches and the current usable RAM cap still
+meets the admission threshold for the largest originally selected N.
+
+The combined report derives quantities from run-level medians across complete
+sweeps. A verification crossover is reportable only when the paired 95% CI for
+`raw_verify - snark_verify` is wholly positive. Speedup and break-even retain
+quartiles. `ceil(prove / (raw_verify - snark_verify))` excludes process setup,
+networking, signing and fixture generation; withhold it if any paired run has no
+positive saving rather than deleting that run. Do not call it end-to-end latency
+or extrapolate a crossover between measured grid points; refine the grid around
+the first favorable point.

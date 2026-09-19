@@ -12,12 +12,20 @@
 //! Files named `update-*` must verify; files named `attack-*` must be rejected.
 //! Exits non-zero if any expectation is violated.
 //!
-//! It then runs the DHT freshness layer: `select_freshest` picks the newest valid
-//! record, and a persistent high-water mark (`verifier-highwater.state`, keyed to
-//! the anchor; override with `VERIFIER_STATE`) refuses any replay of an older but
-//! still-valid record. That mark is local verifier state; never publish it.
+//! It then authenticates `canonical.bin`, the single current-record fixture an
+//! external secure VDR would supply. A persistent high-water mark
+//! (`verifier-highwater.state`, keyed to the anchor; override with
+//! `VERIFIER_STATE`) refuses any replay of an older but still-valid record. The
+//! VDR is outside this crate; the mark is local verifier state and is never
+//! published.
 //!
-//! Usage: `cargo run --release --bin verifier -- [dir]` (default `./artifacts`)
+//! Usage:
+//! - first initialization: `cargo run --release --bin verifier -- --init-state [dir]`
+//! - normal startup: `cargo run --release --bin verifier -- [dir]`
+//!
+//! The artifact directory defaults to `./artifacts`. Initialization is an
+//! explicit administrative operation and refuses to overwrite any existing
+//! state; normal startup refuses missing, corrupt, unreadable, or foreign state.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,10 +58,24 @@ fn artifacts(dir: &Path, prefix: &str) -> Vec<PathBuf> {
     paths
 }
 
+/// Decodes and authenticates one record under this verifier's fixed anchor.
+fn authenticate(verifier: &PQSNARKVerifierModule, bytes: &[u8]) -> Option<SnarkStatusList> {
+    let record = SnarkStatusList::from_bytes(bytes).ok()?;
+    verifier.verify(&record).then_some(record)
+}
+
 fn main() -> ExitCode {
-    let dir = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "artifacts".into());
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+    let (initialize_state, dir) = match first.as_deref() {
+        Some("--init-state") => (true, args.next().unwrap_or_else(|| "artifacts".into())),
+        Some(dir) => (false, dir.to_owned()),
+        None => (false, "artifacts".into()),
+    };
+    if args.next().is_some() {
+        eprintln!("usage: verifier [--init-state] [dir]");
+        return ExitCode::from(2);
+    }
     let dir = Path::new(&dir);
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
 
@@ -72,7 +94,20 @@ fn main() -> ExitCode {
     let state_path = std::env::var_os("VERIFIER_STATE")
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join("verifier-highwater.state"));
-    let mut hwm = HighWaterMark::try_load(&state_path, &anchor)
+    if initialize_state {
+        HighWaterMark::create(&state_path, &anchor).unwrap_or_else(|e| {
+            panic!(
+                "cannot initialize high-water mark {}: {e}",
+                state_path.display()
+            )
+        });
+        println!(
+            "initialized empty high-water mark for this anchor at {}",
+            state_path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    let mut hwm = HighWaterMark::open(&state_path, &anchor)
         .unwrap_or_else(|e| panic!("cannot open high-water mark {}: {e}", state_path.display()));
 
     println!("verifier: setup...");
@@ -167,92 +202,45 @@ fn main() -> ExitCode {
         );
     }
 
-    // ---- DHT freshness layer + persistent anti-rollback ----
-    // Two stages that compose: crypto first, freshness second.
-    //   1. `select_freshest` picks the newest *valid* record among the ones a
-    //      lookup returned (updates + a hostile inflated-version forgery).
-    //   2. the high-water mark refuses anything not strictly newer than what this
-    //      verifier has already accepted, across restarts.
-    // Stage 2 is what stops a replay: an old status list still verifies (that is
-    // stateless), so without the mark a peer could serve it and re-grant access a
-    // node had lost. The mark is local verifier state, keyed to this anchor.
-    println!("\nDHT freshness + anti-rollback");
+    // ---- one external-registry record + persistent anti-rollback ----
+    // The external secure VDR is responsible for canonicality and global
+    // latestness. This crate receives exactly one record, authenticates it under
+    // its fixed anchor, and only then offers its version to the local gate.
+    // An old status list remains cryptographically valid, so the mark is still
+    // required to stop rollback across restarts.
+    println!("\nExternal registry record + local anti-rollback");
     match hwm.current() {
         Some(v) => println!("  high-water mark (persisted): version {v}"),
         None => println!("  high-water mark: none yet for this committee"),
     }
 
-    let mut candidates: Vec<Vec<u8>> = artifacts(dir, "update-")
-        .iter()
-        .map(|p| std::fs::read(p).expect("cannot read update"))
-        .collect();
-    if let Ok(forgery) = std::fs::read(dir.join("attack-version.bin")) {
-        candidates.push(forgery); // a hostile peer advertising a fake-fresh version
-    }
-    // The mark is passed *into* the selection, not merely consulted after it. A
-    // record at or below the mark would verify and then be refused as stale, so
-    // paying for its proof first buys nothing, and the stale case is the common
-    // one, since a node polling an unchanged list hits it every round.
-    let floor = hwm.current();
-    // How many candidates the floor removes, counted by *decoding* only: no proof
-    // is verified to produce this number. That is the point: the diagnostic below
-    // must not undo the saving it is reporting on.
-    let pruned = match floor {
-        Some(f) => candidates
-            .iter()
-            .filter(|b| {
-                SnarkStatusList::from_bytes(b).is_ok_and(|sl: SnarkStatusList| sl.version() <= f)
-            })
-            .count(),
-        None => 0,
-    };
-    match verifier.select_freshest_above(&candidates, floor) {
-        Some(sl) => match hwm.try_advance(sl.version()) {
+    let canonical = std::fs::read(dir.join("canonical.bin"))
+        .ok()
+        .and_then(|bytes| authenticate(&verifier, &bytes));
+    match canonical {
+        Some(record) => match hwm.try_advance(record.version()) {
             Ok(Decision::Accepted) => {
                 println!(
-                    "  selected version {} -> accepted, high-water advanced",
-                    sl.version()
+                    "  canonical version {} authenticated -> high-water advanced",
+                    record.version()
                 )
             }
-            // Unreachable while `floor` comes from this same mark: anything the
-            // floor let through is strictly above it, and the gate applies the same
-            // rule. Reaching it means the filter and the gate disagree, which is a
-            // bug in one of them and not a quiet "nothing to do".
             Ok(Decision::Stale(hw)) => {
                 println!(
-                    "  selected version {} -> not newer than high-water {hw} <- BUG (the floor let it through)",
-                    sl.version()
+                    "  canonical version {} authenticated -> unchanged at high-water {hw}",
+                    record.version()
                 );
-                failures += 1;
             }
             Err(e) => {
                 println!(
-                    "  selected version {} -> high-water update failed: {e} <- SECURITY FAILURE",
-                    sl.version()
+                    "  canonical version {} -> high-water update failed: {e} <- SECURITY FAILURE",
+                    record.version()
                 );
                 failures += 1;
             }
         },
-        // Nothing came back, and the two reasons differ: the floor removed
-        // everything worth verifying (a re-run over an unchanged corpus: correct,
-        // and what the floor is for), or nothing verified at all (a bug). `pruned`
-        // separates them without verifying anything, which is the point: re-running
-        // the selection unfloored for a nicer message would undo the saving.
-        //
-        // `pruned > 0` rather than "everything was pruned": the planted forgery
-        // declares a version above the mark, so it always survives the floor and
-        // always fails to verify. A broken update is caught in the loop above, not
-        // here.
-        None if pruned > 0 => println!(
-            "  nothing newer than high-water {}: {pruned} of {} candidates pruned before verifying any proof",
-            floor.expect("a non-zero prune count requires a floor"),
-            candidates.len()
-        ),
         None => {
-            println!(
-                "  no valid record among {} candidates <- BUG",
-                candidates.len()
-            );
+            println!("  canonical.bin missing, malformed, or unauthenticated <- BUG");
             failures += 1;
         }
     }
@@ -267,7 +255,7 @@ fn main() -> ExitCode {
         .into_iter()
         .next()
         .and_then(|p| std::fs::read(&p).ok())
-        .and_then(|bytes| verifier.select_freshest(std::slice::from_ref(&bytes)));
+        .and_then(|bytes| authenticate(&verifier, &bytes));
 
     match (hwm.current(), replayed) {
         (Some(_), Some(sl)) => match hwm.try_advance(sl.version()) {

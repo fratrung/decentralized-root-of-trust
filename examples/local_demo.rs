@@ -82,7 +82,8 @@ fn run() -> Result<(), String> {
         Mode::Raw => {
             let node = RawNode::new(
                 committee.clone(),
-                HighWaterMark::load(&mark_path, &anchor_bytes),
+                HighWaterMark::create(&mark_path, &anchor_bytes)
+                    .map_err(|e| format!("cannot create freshness state: {e}"))?,
             );
             raw_node = Some(node);
             println!("raw verifier  : no circuit setup\n");
@@ -99,7 +100,8 @@ fn run() -> Result<(), String> {
             let setup_verifier = Instant::now();
             snark_node = Some(SnarkNode::new(
                 committee.clone(),
-                HighWaterMark::load(&mark_path, &anchor_bytes),
+                HighWaterMark::create(&mark_path, &anchor_bytes)
+                    .map_err(|e| format!("cannot create freshness state: {e}"))?,
             ));
             println!(
                 "leanVM setup  : verifier ready in {}\n",

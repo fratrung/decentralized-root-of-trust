@@ -214,7 +214,9 @@ impl Committee {
     /// The anchor must have exactly **one** wire form:
     /// [`crate::state::freshness::HighWaterMark`] fingerprints it to identify its trust
     /// domain, so a second encoding of the same committee would read as a rotation
-    /// and silently reset the anti-rollback mark.
+    /// and make normal state opening fail as a foreign anchor. Recovery or rotation
+    /// must then be an explicit administrative operation; neither silently resets
+    /// the anti-rollback mark.
     ///
     /// That is why the encoding is SSZ. Every field is fixed-width or a list of
     /// fixed-width items: no length varints to pad, no alternative spelling of an

@@ -331,8 +331,8 @@ impl Node {
         // Start from the current validity snapshot. `Proposal` accepts the whole
         // replacement snapshot: neither this member nor the wire format imposes
         // a one-entry delta, a minimum size, or an append-only prefix rule.
-        let (version, mut list) = match storage::latest_record() {
-            Some((_, bytes)) => match self.decode_list(&bytes) {
+        let (version, mut list) = match storage::current_record() {
+            Some(bytes) => match self.decode_list(&bytes) {
                 Ok((v, list)) => match v.checked_add(1) {
                     Some(next) => (next, list),
                     None => {
@@ -430,7 +430,7 @@ impl Node {
             Ok(bytes) => bytes,
             Err(e) => return (wire::MSG_FAILURE, Failure::of(e)),
         };
-        let path = match storage::publish(version, &record) {
+        let path = match storage::publish(&record) {
             Ok(p) => p,
             Err(e) => {
                 return (

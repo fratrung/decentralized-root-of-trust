@@ -42,9 +42,11 @@ Three volumes, and the split between them is the design:
 
 * `committee/` is written once at start: the run identifier, ten public keys,
   and the anchor assembled from them in index order.
-* `storage/` stands in for the DHT. Anyone can read it and, in the demo, anyone
-  could write to it. A record's authority comes from the signatures inside it,
-  never from where it was found.
+* `storage/` is a one-file orchestration fixture. It atomically exposes
+  `status-current.ssz`, modelling only the single canonical record an external
+  secure VDR would return. It does not implement distributed storage,
+  replication, consensus or canonicality; the node still authenticates the
+  record locally.
 * `signer-<i>-state/` is **private to one member**: its durable slot counter.
   Sharing it would destroy the property it exists to provide.
 
@@ -75,8 +77,8 @@ grow, shrink, or become empty. There is no one-entry transition rule.
    address map decides *where* to look and never *whether* the signature is
    good.
 5. It builds the record (bitmap from those indices, or one aggregated proof) and
-   publishes it atomically to the shared volume.
-6. Node A fetches the freshest record from the volume and hands the bytes to a
+   atomically replaces the demo's single current-record fixture.
+6. Node A fetches that one record and hands the bytes to a
    `RawNode` or a `SnarkNode`, which decodes, verifies against the anchor, and
    only then lets the version move its anti-rollback mark. Node A requires the
    issued credential's fingerprint to be present, or the revoked credential's
@@ -117,6 +119,11 @@ Staying up is also what makes the anti-rollback mark mean anything: node A
 carries a high-water version across rounds, so `verify` twice in a row shows the
 second answer refused as stale, which is exactly what a replayed record looks
 like.
+
+`demo.sh up` provisions that mark only when the mode's `holder-state` volume does
+not yet exist. Every later start explicitly opens it and fails if it is missing,
+corrupt, unreadable, or belongs to another anchor. `demo.sh down` removes the
+volume, so a later `up` is a new explicit provisioning event.
 
 ## The crash scenario
 

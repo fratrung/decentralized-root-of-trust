@@ -104,7 +104,9 @@ fn publish(
 fn two_rounds_with_a_rotating_quorum_verify_and_advance_the_gate() {
     let dir = scratch("round");
     let (verifier, mut nodes) = bring_up(&dir, 1);
-    let mut hwm = HighWaterMark::load(dir.join("freshness"), &verifier.get_committee().to_bytes());
+    let mut hwm =
+        HighWaterMark::create(dir.join("freshness"), &verifier.get_committee().to_bytes())
+            .expect("create freshness state");
 
     // --- round 0: members 0,1,2 ---
     let mut list = vec![hash_any(b"revoke-alice")];

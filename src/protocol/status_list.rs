@@ -101,7 +101,7 @@ const MESSAGE_CONTEXT: &[u8] = b"decentralized-root-of-trust/status-list-message
 ///   member key, `t` and the genesis slot are all covered. A different committee
 ///   is a different domain, and — deliberately — a *rotated* committee is too,
 ///   which is the same trust-domain notion [`crate::state::freshness::HighWaterMark`]
-///   already uses to decide when to reset its mark;
+///   uses to bind its state and refuse accidental cross-anchor reuse;
 /// - the **algorithm**, so a record cannot be relabelled from one signature
 ///   scheme to another while keeping evidence produced under the first. Today
 ///   only one tag decodes, so this is latent; it stops being latent the moment a

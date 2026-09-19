@@ -67,24 +67,4 @@ impl SnarkNode {
         }
         Outcome::advance(&mut self.mark, record.version())
     }
-
-    /// The freshest candidate that verifies, out of what several peers returned.
-    ///
-    /// The selection is [`PQSNARKVerifierModule::select_freshest_above`], given
-    /// this node's mark as the floor: candidates at or below it are dropped
-    /// before a proof is verified, which matters here more than on the raw path
-    /// because a SNARK verification is the most expensive thing an
-    /// unauthenticated peer can make this node do.
-    ///
-    /// Whatever comes back has already verified, so the gate is the only step
-    /// left.
-    pub fn accept_best(&mut self, candidates: &[Vec<u8>]) -> Outcome {
-        match self
-            .verifier
-            .select_freshest_above(candidates, self.mark.current())
-        {
-            Some(record) => Outcome::advance(&mut self.mark, record.version()),
-            None => Outcome::Refused,
-        }
-    }
 }

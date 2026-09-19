@@ -1,7 +1,7 @@
 //! Prover side of the split deployment.
 //!
-//! Aggregates each update into one SNARK proof and writes the publishable
-//! artifacts to disk (stand-in for the DHT). With `BENCH_INPUT_DIR`, signatures
+//! Aggregates each update into one SNARK proof and writes the benchmark and
+//! verification fixtures to disk. With `BENCH_INPUT_DIR`, signatures
 //! come from a separate fixture process and this process holds no secret keys,
 //! matching one deployed aggregator. Without it, the self-contained demo mode
 //! generates the committee locally. It **never verifies**: that is `verifier`'s
@@ -10,6 +10,7 @@
 //! Artifacts written to `<outdir>`:
 //!   anchor.bin          the committee (N public keys + threshold t)
 //!   update-NN.bin       legitimate updates: the verifier MUST accept these
+//!   canonical.bin       the single current record supplied to the relying party
 //!   attack-*.bin        forgeries: the verifier MUST reject these
 //!
 //! Usage: `cargo run --release --bin prover -- [outdir]` (default `./artifacts`)
@@ -140,6 +141,9 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
         let record = SnarkStatusList::new(raw.alg, raw.list_cloned(), raw.version(), proof);
         let bytes = record.to_bytes();
         write(outdir, &format!("update-{index:02}.bin"), &bytes);
+        if index + 1 == updates.len() {
+            write(outdir, "canonical.bin", &bytes);
+        }
 
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
@@ -305,7 +309,10 @@ fn main() {
     for entry in std::fs::read_dir(outdir).expect("cannot read output directory") {
         let path = entry.expect("cannot read directory entry").path();
         let stale = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            n == "anchor.bin" || n.starts_with("update-") || n.starts_with("attack-")
+            n == "anchor.bin"
+                || n == "canonical.bin"
+                || n.starts_with("update-")
+                || n.starts_with("attack-")
         });
         if stale {
             std::fs::remove_file(&path)
@@ -414,6 +421,9 @@ fn main() {
         let sl = SnarkStatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
         let bytes = sl.to_bytes();
         write(outdir, &format!("update-{i:02}.bin"), &bytes);
+        if i + 1 == N_UPDATES {
+            write(outdir, "canonical.bin", &bytes);
+        }
 
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
@@ -495,10 +505,8 @@ fn main() {
         &SnarkStatusList::new(Algorithms::WotsXmss, out_list, 0, out_proof).to_bytes(),
     );
 
-    // C) a valid proof of (list, version) re-labelled with an inflated version, as
-    //    a hostile DHT peer would do to look freshest. Defeated by check 2 (message
-    //    binds the version). It is also the decoy the verifier's freshness
-    //    selection must try first and then skip.
+    // C) a valid proof of (list, version) re-labelled with an inflated version.
+    //    Defeated by check 2 because the signed message binds the version.
     //
     //    The forgery is built slot-consistent on purpose: signed at the slot the
     //    inflated version derives to, so check 3 passes and check 2 is the one that

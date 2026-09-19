@@ -2,7 +2,8 @@
 //!
 //! Every other test in this repository feeds the decoders records that some part
 //! of this crate produced. That is the wrong shape for the threat model: records
-//! arrive from a DHT, so *every* byte is attacker-chosen, and a verifier that
+//! cross this library's boundary from external storage, so *every* byte remains
+//! untrusted until locally authenticated, and a verifier that
 //! panics on a malformed one is a verifier that can be taken offline by anybody
 //! who can serve it a record.
 //!

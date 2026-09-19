@@ -226,6 +226,7 @@ services:
     environment:
       <<: *env
       HOLDER_SERVE: "1"
+      HOLDER_STATE_MODE: "${HOLDER_STATE_MODE:-open}"
     volumes:
       - committee:/shared/committee
       - storage:/shared/storage

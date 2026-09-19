@@ -369,9 +369,8 @@ fn main() {
         .expect("well-formed"),
     );
 
-    // B) the same quorum re-labelled with a later version, as a hostile peer would
-    //    do to look freshest. The version is folded into the message AND fixes the
-    //    slot, so both bindings break at once.
+    // B) the same quorum re-labelled with a later version. The version is folded
+    //    into the message AND fixes the slot, so both bindings break at once.
     let relabel_rejected = !verifier.verify_status_list(
         &StatusList::new(
             Algorithms::WotsXmss,
