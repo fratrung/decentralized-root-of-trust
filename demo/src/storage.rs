@@ -65,7 +65,8 @@ pub fn member_key_file(index: usize) -> PathBuf {
 /// file at all: write a temporary, `fsync` it, `rename` over the target, then
 /// `fsync` the directory so the rename itself survives a crash.
 ///
-/// The same four steps the durable counter takes, for the same reason.
+/// Published objects have variable length, so this uses replacement rather than
+/// the durable counter's fixed-size, alternating-record journal.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp)?;

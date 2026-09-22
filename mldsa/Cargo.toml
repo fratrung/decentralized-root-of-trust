@@ -1,0 +1,16 @@
+[package]
+name = "drot-mldsa"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep the experimental ML-DSA implementation out of the existing XMSS crate.
+[workspace]
+
+[dependencies]
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+ml-dsa = { version = "=0.1.1", features = ["zeroize"] }
+sha3 = "0.10.8"
+ssz = { package = "ethereum_ssz", version = "0.10.4" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.10.1" }
+typenum = "1"

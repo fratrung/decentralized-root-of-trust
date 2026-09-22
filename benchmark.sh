@@ -299,9 +299,10 @@ temp_now_c() {
   echo "stack ulimit     : $(ulimit -s)"
   echo
   echo "## Storage"
-  # `signer` fsyncs twice per reserved slot INSIDE its timed region, so its sign
-  # figure is a property of this filesystem as much as of the scheme. A near-full
-  # filesystem allocates differently; record the fill level too.
+  # `signer` waits for one sync_data durability barrier per reserved slot INSIDE
+  # its timed region, so its sign figure is a property of this filesystem as much
+  # as of the scheme. A near-full filesystem allocates differently; record the
+  # fill level too.
   echo "TMPDIR           : ${TMPDIR:-/tmp}"
   df -Th "${TMPDIR:-/tmp}" 2>/dev/null | sed 's/^/  /'
   echo "repo filesystem  :"
@@ -986,7 +987,7 @@ label() {
   echo "    above n x median. Verification is near-deterministic and does match."
   echo "  * Exactly one target reports 'sign': signer, which measures ONE member"
   echo "    doing ONE signature per round, preceded by its durable slot burn (write"
-  echo "    + fsync + rename + fsync dir) through SignerNode."
+  echo "    the inactive journal generation + sync_data) through SignerNode."
   if [ "$INPUT_MODE" = fixture ]; then
     echo "    The measured prover/raw verifier receive t signatures prepared by the"
     echo "    fixture process; neither produces signatures or holds secret keys."

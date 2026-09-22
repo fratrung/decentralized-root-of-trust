@@ -40,7 +40,7 @@ cargo run --release --bin verifier -- [dir]            # split: verify-only, ope
 cargo run --release --bin signer                       # split: ONE member, one signature + durable slot burn per round
 cargo fmt --all -- --check                             # formatting gate used by CI
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --locked                                    # 69 unit + 10 integration tests; 78 run + 1 ignored
+cargo test --locked                                    # 73 unit + 10 integration tests; 82 run + 1 ignored
 ./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
 ./committee-scaling-benchmark.sh                       # exploratory pilot; hard RAM/disk-gated N/t sweep
 STUDY_MODE=publication PIN_CPUS=0-7 ./committee-scaling-benchmark.sh # clean-tree, repeated counterbalanced sweep
@@ -141,9 +141,10 @@ Library:
   `&Committee`; they are now methods on the node type that owns the anchor, so a
   participant is one value with the operations its role can perform.
 - `src/state/slot_counter.rs` — the durable monotonic slot allocator. Burns the
-  slot on disk **before** handing it out (write tmp → fsync → rename → fsync the
-  parent dir), guarded by a lock on a separate file so two processes cannot share
-  a key. `reserve` takes the next local slot; `reserve_at` takes a
+  slot on disk **before** handing it out using a fixed two-record journal (write
+  the inactive generation → `sync_data` → return the slot), guarded by a lock on
+  a separate file so two processes cannot share a key. There is no batching.
+  `reserve` takes the next local slot; `reserve_at` takes a
   protocol-chosen one, jumping forward over missed rounds and refusing the past.
 - `src/node/signer.rs` — one member: keypair + counter. `sign` for the local-slot
   path, `sign_at` for the derived-slot one.
@@ -244,7 +245,7 @@ committee of one, and the raw path with a real `t`-of-`N` quorum. They write slo
 state into the working directory (`next_slot`, `signers/`), which `.gitignore`
 covers.
 
-Tests (`cargo test`, 79 registered: 78 run plus one `#[ignore]`d):
+Tests (`cargo test`, 83 registered: 82 run plus one `#[ignore]`d):
 - `src/*.rs` unit tests cover each module against its own contract.
   `status_list.rs`'s pin the seam this crate has with leanVM: that
   `status_list_message` is BLAKE2s-256 of the exact domain/version/count/entries
@@ -368,10 +369,12 @@ Three things about it are load-bearing and easy to break by "simplifying":
    at slots the previous run already spent.
 
 The `crash` scenario is the only test in the repository that kills a real process
-mid-protocol. The unit tests around `AtomicSlotCounter` restart it *cleanly*
-(`drop` then `open`, with the lock released and the file fully written), so the
-tmp/fsync/rename/fsync-dir chain is argued but not exercised there. Treat the
-scenario as coverage, not decoration: if it starts passing for the wrong reason
+mid-protocol. The `AtomicSlotCounter` unit tests additionally inject an invalid
+inactive journal record, damage the older record while retaining the latest one,
+and refuse a journal with no valid record. Those byte-level cases exercise the
+recovery decisions but cannot emulate a storage device violating `sync_data`'s
+durability contract. Treat the scenario as coverage, not decoration: if it
+starts passing for the wrong reason
 (a member that never signed in step 1, say), it stops proving anything.
 
 ### The security boundary (most important thing to understand)

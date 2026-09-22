@@ -127,17 +127,29 @@ slot = genesis_slot + version
 `Committee::slot_for` is the authoritative implementation of this derivation.
 
 `AtomicSlotCounter` holds an exclusive cross-process lock for the signer state.
-Each slot reservation is persisted before signing:
+Its state file is a fixed 8 KiB journal with two alternating, checksummed
+records. Each record binds the key fingerprint, a monotonic generation and
+`next_free`. The whole file is allocated and directory-synced at first
+provisioning; an existing textual v2 counter is migrated once without changing
+its durable frontier.
 
-1. write the advanced counter to a temporary file;
-2. `fsync` the temporary file;
-3. rename it over the state file;
-4. `fsync` the parent directory;
-5. produce the XMSS signature.
+Each ordinary reservation then performs only this synchronous sequence:
 
-A crash may therefore discard a signature, but cannot make a spent slot
-available again. Members that miss a round skip the corresponding slot when
-they next participate.
+1. overwrite the inactive record with the next generation and advanced
+   `next_free`;
+2. call `sync_data()` and wait for it to succeed;
+3. only then produce the XMSS signature.
+
+No runtime, background worker or batching is involved. Sequential signing burns
+exactly the slot being returned; `reserve_at` may additionally skip slots for
+protocol rounds that the member missed, but never reserves future rounds. A
+crash during the record write leaves the previous checksummed generation usable;
+a crash after the durability barrier finds the advanced generation, whether or
+not signing completed. A crash may therefore discard a signature, but cannot
+make that slot available again under the filesystem durability contract.
+
+The steady-state path neither creates temporary files nor renames directory
+entries, so it avoids their metadata overhead without weakening burn-before-sign.
 
 ## Published records
 

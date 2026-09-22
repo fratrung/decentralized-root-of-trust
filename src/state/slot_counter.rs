@@ -1,11 +1,12 @@
 //! Durable, monotonic slot allocation for one XMSS key.
 //!
-//! A slot is fsync'd as spent before it is returned. A crash may waste slots but
-//! cannot reuse one, which would compromise stateful XMSS. Missing or invalid state
-//! therefore refuses signing; initialization is explicit through [`AtomicSlotCounter::create`].
+//! A slot is recorded as spent and `sync_data` completes before it is returned.
+//! A crash may waste slots but cannot reuse one, which would compromise stateful
+//! XMSS. Missing or invalid state therefore refuses signing; initialization is
+//! explicit through [`AtomicSlotCounter::create`].
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use leanvm::xmss::XmssPublicKey;
@@ -22,21 +23,94 @@ pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Persists `next_free` through power loss: write + fsync, rename, then fsync the
-/// parent directory. Skipping the final sync could resurrect spent slots.
-fn persist(path: &Path, key_tag: &str, next_free: u64) -> Result<(), AtomicSlotCounterError> {
+const RECORD_SIZE: usize = 128;
+// Keep the two records in separate 4 KiB regions so an interrupted block write
+// does not normally damage both generations. The durability guarantee still
+// depends on the filesystem and device honoring sync_data().
+const JOURNAL_SLOT_SIZE: usize = 4096;
+const JOURNAL_SIZE: usize = JOURNAL_SLOT_SIZE * 2;
+const CHECKSUM_OFFSET: usize = 96;
+const JOURNAL_MAGIC: &[u8; 8] = b"DROTSL03";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalRecord {
+    generation: u64,
+    next_free: u64,
+    key_tag: [u8; 32],
+}
+
+fn encode_record(record: JournalRecord) -> [u8; RECORD_SIZE] {
+    let mut bytes = [0u8; RECORD_SIZE];
+    bytes[..8].copy_from_slice(JOURNAL_MAGIC);
+    bytes[8..16].copy_from_slice(&record.generation.to_le_bytes());
+    bytes[16..24].copy_from_slice(&record.next_free.to_le_bytes());
+    bytes[24..56].copy_from_slice(&record.key_tag);
+    let checksum = Sha3_256::digest(&bytes[..CHECKSUM_OFFSET]);
+    bytes[CHECKSUM_OFFSET..].copy_from_slice(&checksum);
+    bytes
+}
+
+fn decode_record(bytes: &[u8], slot: usize) -> Result<Option<JournalRecord>, String> {
+    if bytes.len() != RECORD_SIZE {
+        return Err("wrong record length".into());
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    if &bytes[..8] != JOURNAL_MAGIC {
+        return Err("wrong journal magic".into());
+    }
+    if bytes[56..CHECKSUM_OFFSET].iter().any(|byte| *byte != 0) {
+        return Err("non-zero reserved bytes".into());
+    }
+    let expected = Sha3_256::digest(&bytes[..CHECKSUM_OFFSET]);
+    if bytes[CHECKSUM_OFFSET..] != expected[..] {
+        return Err("checksum mismatch".into());
+    }
+
+    let generation = u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice"));
+    if generation % 2 != slot as u64 {
+        return Err("generation is stored in the wrong journal slot".into());
+    }
+    let next_free = u64::from_le_bytes(bytes[16..24].try_into().expect("fixed slice"));
+    let key_tag = bytes[24..56].try_into().expect("fixed slice");
+    Ok(Some(JournalRecord {
+        generation,
+        next_free,
+        key_tag,
+    }))
+}
+
+/// Creates a complete journal image and installs it atomically. This metadata-
+/// heavy path runs only at first provisioning or while migrating legacy state;
+/// ordinary reservations overwrite one already-allocated record in place.
+fn install_journal(
+    path: &Path,
+    key_tag: [u8; 32],
+    next_free: u64,
+) -> Result<File, AtomicSlotCounterError> {
     let tmp = sibling(path, "tmp");
+    let mut image = [0u8; JOURNAL_SIZE];
+    image[..RECORD_SIZE].copy_from_slice(&encode_record(JournalRecord {
+        generation: 0,
+        next_free,
+        key_tag,
+    }));
 
-    let mut f = File::create(&tmp)?;
-    f.write_all(format!("v2 {key_tag} {next_free}\n").as_bytes())?;
+    let mut f = File::options()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&tmp)?;
+    // Writing the whole image allocates both fixed record slots up front. Later
+    // updates neither resize the file nor change its directory entry.
+    f.write_all(&image)?;
     f.sync_all()?;
-    drop(f);
-
     fs::rename(&tmp, path)?;
-
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
-    Ok(())
+    Ok(f)
 }
 
 /// Locks a separate sibling file so replacing the state file cannot discard the
@@ -53,17 +127,19 @@ fn acquire_lock(state_path: &Path) -> Result<File, AtomicSlotCounterError> {
 }
 
 /// Binds state to the public key's canonical SSZ representation.
-fn key_fingerprint(pk: &XmssPublicKey) -> String {
+fn key_fingerprint(pk: &XmssPublicKey) -> [u8; 32] {
     let bytes = pk.as_ssz_bytes();
-    Sha3_256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    Sha3_256::digest(&bytes).into()
 }
 
-/// Parses the versioned state record, while recognizing ordinary legacy files.
-fn parse(s: &str, key_tag: &str) -> Result<(u64, bool), AtomicSlotCounterError> {
-    let (s, legacy) = match s.strip_prefix("v2 ") {
+fn key_fingerprint_hex(key_tag: &[u8; 32]) -> String {
+    key_tag.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parses either textual predecessor of the journal. The boolean reports the
+/// unversioned format whose top-of-window value was historically ambiguous.
+fn parse_legacy(s: &str, key_tag: &[u8; 32]) -> Result<(u64, bool), AtomicSlotCounterError> {
+    let (s, unversioned) = match s.strip_prefix("v2 ") {
         Some(versioned) => (versioned, false),
         None => (s, true),
     };
@@ -74,7 +150,7 @@ fn parse(s: &str, key_tag: &str) -> Result<(u64, bool), AtomicSlotCounterError> 
     let next = it
         .next()
         .ok_or_else(|| AtomicSlotCounterError::State("missing slot counter".into()))?;
-    if fp != key_tag {
+    if fp != key_fingerprint_hex(key_tag) {
         return Err(AtomicSlotCounterError::State(
             "state file belongs to a different key".into(),
         ));
@@ -82,7 +158,71 @@ fn parse(s: &str, key_tag: &str) -> Result<(u64, bool), AtomicSlotCounterError> 
     let next = next
         .parse::<u64>()
         .map_err(|e| AtomicSlotCounterError::State(format!("unparseable slot counter: {e}")))?;
-    Ok((next, legacy))
+    if it.next().is_some() {
+        return Err(AtomicSlotCounterError::State(
+            "unexpected trailing data in state file".into(),
+        ));
+    }
+    Ok((next, unversioned))
+}
+
+fn recover_journal(
+    bytes: &[u8],
+    key_tag: &[u8; 32],
+    slot_end: u32,
+) -> Result<JournalRecord, AtomicSlotCounterError> {
+    if bytes.len() != JOURNAL_SIZE {
+        return Err(AtomicSlotCounterError::State(format!(
+            "journal has length {}, expected {JOURNAL_SIZE}",
+            bytes.len()
+        )));
+    }
+
+    let mut records = Vec::with_capacity(2);
+    let mut invalid = Vec::new();
+    for slot in 0..2 {
+        let start = slot * JOURNAL_SLOT_SIZE;
+        let range = start..start + RECORD_SIZE;
+        match decode_record(&bytes[range], slot) {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(reason) => invalid.push(format!("record {slot}: {reason}")),
+        }
+    }
+    if records.is_empty() {
+        let detail = if invalid.is_empty() {
+            "both records are empty".into()
+        } else {
+            invalid.join("; ")
+        };
+        return Err(AtomicSlotCounterError::State(format!(
+            "journal contains no valid record ({detail})"
+        )));
+    }
+    if records.iter().any(|record| &record.key_tag != key_tag) {
+        return Err(AtomicSlotCounterError::State(
+            "journal belongs to a different key or mixes keys".into(),
+        ));
+    }
+    records.sort_unstable_by_key(|record| record.generation);
+    if records.len() == 2 {
+        let older = records[0];
+        let newer = records[1];
+        if newer.generation != older.generation + 1 || newer.next_free <= older.next_free {
+            return Err(AtomicSlotCounterError::State(
+                "journal records are not one monotonic generation apart".into(),
+            ));
+        }
+    }
+    let current = *records.last().expect("at least one record");
+    let one_past_end = u64::from(slot_end) + 1;
+    if current.next_free > one_past_end {
+        return Err(AtomicSlotCounterError::State(format!(
+            "persisted next slot {} is outside this key's window ending at {slot_end}",
+            current.next_free
+        )));
+    }
+    Ok(current)
 }
 
 /// Refusals from slot allocation. None permit guessing a slot.
@@ -129,20 +269,17 @@ impl From<std::io::Error> for AtomicSlotCounterError {
     }
 }
 
-/// On-disk state is `"v2 <key fingerprint> <next_free-u64>"`; every lower slot is spent.
-/// A foreign state file is refused rather than reset.
+/// On-disk state is a fixed-size, two-record journal; every slot below its latest
+/// valid `next_free` is spent. A foreign state file is refused rather than reset.
 pub struct AtomicSlotCounter {
-    path: PathBuf,
-    key_tag: String,
-    /// Next slot to hand out (in memory). Invariant: `next <= durable`.
+    state_file: File,
+    key_tag: [u8; 32],
+    generation: u64,
+    /// Next slot to hand out. The same value is already durable on disk whenever
+    /// no reservation is in progress.
     next: u64,
-    /// Highest `next_free` written to disk. Slots in `next..durable` are already
-    /// burned on disk and can be handed out without another fsync.
-    durable: u64,
     /// Last usable slot, inclusive (as passed to `leanvm::xmss::key_gen`).
     end: u32,
-    /// How many slots to burn per fsync. See [`AtomicSlotCounter::with_batch`].
-    batch: u64,
     /// Held for the counter's whole lifetime: cross-process mutual exclusion.
     _lock: File,
 }
@@ -175,14 +312,13 @@ impl AtomicSlotCounter {
                 path.display()
             )));
         }
-        persist(&path, &key_tag, u64::from(slot_start))?;
+        let state_file = install_journal(&path, key_tag, u64::from(slot_start))?;
         Ok(Self {
-            path,
+            state_file,
             key_tag,
+            generation: 0,
             next: u64::from(slot_start),
-            durable: u64::from(slot_start),
             end: slot_end,
-            batch: 1,
             _lock: lock,
         })
     }
@@ -205,50 +341,81 @@ impl AtomicSlotCounter {
         let path = path.into();
         let key_tag = key_fingerprint(pk);
         let lock = acquire_lock(&path)?;
-        let raw = fs::read_to_string(&path).map_err(|e| {
+        let mut state_file = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                AtomicSlotCounterError::State(format!("cannot read {}: {e}", path.display()))
+            })?;
+        let mut raw = Vec::new();
+        state_file.read_to_end(&mut raw).map_err(|e| {
             AtomicSlotCounterError::State(format!("cannot read {}: {e}", path.display()))
         })?;
-        let (next, legacy) = parse(&raw, &key_tag)?;
+
+        if raw.len() == JOURNAL_SIZE {
+            let current = recover_journal(&raw, &key_tag, slot_end)?;
+            return Ok(Self {
+                state_file,
+                key_tag,
+                generation: current.generation,
+                next: current.next_free,
+                end: slot_end,
+                _lock: lock,
+            });
+        }
+
+        let raw = std::str::from_utf8(&raw).map_err(|e| {
+            AtomicSlotCounterError::State(format!("state is neither a journal nor UTF-8: {e}"))
+        })?;
+        let (next, unversioned) = parse_legacy(raw, &key_tag)?;
         let one_past_end = u64::from(slot_end) + 1;
         if next > one_past_end {
             return Err(AtomicSlotCounterError::State(format!(
                 "persisted next slot {next} is outside this key's window ending at {slot_end}"
             )));
         }
-        if legacy && slot_end == u32::MAX && next == u64::from(u32::MAX) {
+        if unversioned && slot_end == u32::MAX && next == u64::from(u32::MAX) {
             return Err(AtomicSlotCounterError::State(
                 "legacy state at u32::MAX is ambiguous; refusing to risk slot reuse".into(),
             ));
         }
-        if legacy {
-            persist(&path, &key_tag, next)?;
-        }
-        // Everything below the persisted `next_free` is treated as spent. This is
-        // what makes a crash mid-window safe: the unused tail of the previous
-        // reservation is skipped, never replayed.
+
+        // Migration retains the exact durable frontier. Its one-time rename is
+        // crash-safe: before the directory sync, recovery sees either the old
+        // text record or the new journal, both naming the same `next_free`.
+        drop(state_file);
+        let state_file = install_journal(&path, key_tag, next)?;
         Ok(Self {
-            path,
+            state_file,
             key_tag,
+            generation: 0,
             next,
-            durable: next,
             end: slot_end,
-            batch: 1,
             _lock: lock,
         })
     }
 
-    /// Burns `batch` slots per fsync instead of one.
-    ///
-    /// Paying one fsync per signature can dominate signing on durable storage.
-    /// Reserving a window amortises it; the cost is that an unclean
-    /// shutdown discards the unused remainder of that window. That is the harmless
-    /// direction (slots are skipped, never reused), so the only real budget is
-    /// how much of the `2^32` window you are willing to waste per crash.
-    ///
-    /// `batch = 1` (the default) wastes nothing and fsyncs every signature.
-    pub fn with_batch(mut self, batch: u32) -> Self {
-        self.batch = u64::from(batch.max(1));
-        self
+    fn persist_next(&mut self, next_free: u64) -> Result<(), AtomicSlotCounterError> {
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| AtomicSlotCounterError::State("journal generation exhausted".into()))?;
+        let slot = (generation % 2) as usize;
+        let bytes = encode_record(JournalRecord {
+            generation,
+            next_free,
+            key_tag: self.key_tag,
+        });
+        self.state_file
+            .seek(SeekFrom::Start((slot * JOURNAL_SLOT_SIZE) as u64))?;
+        self.state_file.write_all(&bytes)?;
+        // The file was fully allocated and its directory entry synced at create
+        // or migration time. Only record data changes here, so sync_data is the
+        // durability barrier that must complete before XMSS can touch the slot.
+        self.state_file.sync_data()?;
+        self.generation = generation;
+        Ok(())
     }
 
     /// The next slot that would be handed out.
@@ -272,15 +439,10 @@ impl AtomicSlotCounter {
                 end: self.end,
             });
         }
-        if self.next >= self.durable {
-            // Extend the durable window. Saturating at `end + 1` keeps the record
-            // inside the key's range even with a large batch.
-            let target = (self.next + self.batch).min(u64::from(self.end) + 1);
-            persist(&self.path, &self.key_tag, target)?;
-            self.durable = target;
-        }
         let slot = u32::try_from(self.next).expect("next is within the u32 slot window");
-        self.next += 1;
+        let target = self.next + 1;
+        self.persist_next(target)?;
+        self.next = target;
         Ok(slot)
     }
 
@@ -315,14 +477,9 @@ impl AtomicSlotCounter {
                 next: self.next,
             });
         }
-        if requested_u64 >= self.durable {
-            // Same batching rule as `reserve`, clamped so the record never claims
-            // slots outside the key's window.
-            let target = (requested_u64 + self.batch).min(u64::from(self.end) + 1);
-            persist(&self.path, &self.key_tag, target)?;
-            self.durable = target;
-        }
-        self.next = requested_u64 + 1;
+        let target = requested_u64 + 1;
+        self.persist_next(target)?;
+        self.next = target;
         Ok(requested)
     }
 }
@@ -438,7 +595,15 @@ mod tests {
     fn ambiguous_legacy_state_at_u32_max_is_refused() {
         let path = scratch("legacy-max");
         let (_, pk) = key(7);
-        fs::write(&path, format!("{} {}\n", key_fingerprint(&pk), u32::MAX)).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{} {}\n",
+                key_fingerprint_hex(&key_fingerprint(&pk)),
+                u32::MAX
+            ),
+        )
+        .unwrap();
 
         assert!(matches!(
             AtomicSlotCounter::open(&path, &pk, u32::MAX),
@@ -448,19 +613,112 @@ mod tests {
     }
 
     #[test]
-    fn unused_batch_window_is_skipped_never_replayed() {
-        let path = scratch("batch");
+    fn v2_state_migrates_without_moving_the_frontier() {
+        let path = scratch("v2-migration");
         let (_, pk) = key(7);
+        fs::write(
+            &path,
+            format!("v2 {} 103\n", key_fingerprint_hex(&key_fingerprint(&pk))),
+        )
+        .unwrap();
 
-        let mut c = AtomicSlotCounter::create(&path, &pk, 100, 140)
-            .unwrap()
-            .with_batch(16);
-        assert_eq!(c.reserve().unwrap(), 100); // burns 100..116 on disk at once
+        let mut c = AtomicSlotCounter::open(&path, &pk, 140).unwrap();
+        assert_eq!(c.next_slot(), 103);
+        assert_eq!(fs::metadata(&path).unwrap().len(), JOURNAL_SIZE as u64);
+        assert_eq!(c.reserve().unwrap(), 103);
         drop(c);
 
-        // 101..115 were reserved but never used: they are lost, not reissued.
-        let mut c = AtomicSlotCounter::open(&path, &pk, 140).unwrap();
-        assert_eq!(c.reserve().unwrap(), 116);
+        assert_eq!(
+            AtomicSlotCounter::open(&path, &pk, 140)
+                .unwrap()
+                .next_slot(),
+            104
+        );
+    }
+
+    #[test]
+    fn journal_alternates_records_without_resizing_or_batching() {
+        let path = scratch("journal");
+        let (_, pk) = key(7);
+        let mut c = AtomicSlotCounter::create(&path, &pk, 100, 140).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), JOURNAL_SIZE as u64);
+
+        assert_eq!(c.reserve().unwrap(), 100);
+        assert_eq!(c.reserve().unwrap(), 101);
+        assert_eq!(fs::metadata(&path).unwrap().len(), JOURNAL_SIZE as u64);
+        drop(c);
+
+        let raw = fs::read(&path).unwrap();
+        let first = decode_record(&raw[..RECORD_SIZE], 0).unwrap().unwrap();
+        let second = decode_record(&raw[JOURNAL_SLOT_SIZE..JOURNAL_SLOT_SIZE + RECORD_SIZE], 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!((first.generation, first.next_free), (2, 102));
+        assert_eq!((second.generation, second.next_free), (1, 101));
+
+        let mut reopened = AtomicSlotCounter::open(&path, &pk, 140).unwrap();
+        assert_eq!(reopened.reserve().unwrap(), 102);
+    }
+
+    #[test]
+    fn incomplete_inactive_record_does_not_advance_the_frontier() {
+        let path = scratch("torn-inactive");
+        let (_, pk) = key(7);
+        drop(AtomicSlotCounter::create(&path, &pk, 100, 140).unwrap());
+
+        // Model a crash during the next in-place write. Because persistence did
+        // not complete, SignerNode could not yet have touched slot 100.
+        let mut incomplete = encode_record(JournalRecord {
+            generation: 1,
+            next_free: 101,
+            key_tag: key_fingerprint(&pk),
+        });
+        incomplete[CHECKSUM_OFFSET] ^= 1;
+        let mut file = File::options().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(JOURNAL_SLOT_SIZE as u64))
+            .unwrap();
+        file.write_all(&incomplete).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut reopened = AtomicSlotCounter::open(&path, &pk, 140).unwrap();
+        assert_eq!(reopened.reserve().unwrap(), 100);
+    }
+
+    #[test]
+    fn valid_latest_record_survives_a_damaged_older_record() {
+        let path = scratch("damaged-old");
+        let (_, pk) = key(7);
+        let mut c = AtomicSlotCounter::create(&path, &pk, 100, 140).unwrap();
+        assert_eq!(c.reserve().unwrap(), 100);
+        drop(c);
+
+        let mut file = File::options().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(CHECKSUM_OFFSET as u64)).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut reopened = AtomicSlotCounter::open(&path, &pk, 140).unwrap();
+        assert_eq!(reopened.reserve().unwrap(), 101);
+    }
+
+    #[test]
+    fn journal_with_no_valid_record_is_refused() {
+        let path = scratch("both-invalid");
+        let (_, pk) = key(7);
+        drop(AtomicSlotCounter::create(&path, &pk, 100, 140).unwrap());
+
+        let mut file = File::options().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(CHECKSUM_OFFSET as u64)).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert!(matches!(
+            AtomicSlotCounter::open(&path, &pk, 140),
+            Err(AtomicSlotCounterError::State(_))
+        ));
     }
 
     #[test]
