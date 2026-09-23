@@ -1,17 +1,16 @@
 # Container demos
 
-Two runs of the same ten-node network, differing in one decision: what the
-aggregator publishes once it has a quorum.
+Three runs of the same ten-node topology, distinguished by signature scheme and
+published quorum form.
 
-* **raw** lets any member aggregate, then publishes the `t` XMSS signatures and a
-  bitmap naming their signers.
-* **snark** publishes one aggregated proof, produced by a configured aggregator subset.
+* **raw** publishes `t` XMSS signatures and their signer bitmap.
+* **snark** aggregates that XMSS quorum into one leanVM proof; only a configured
+  prover subset may coordinate these rounds.
+* **mldsa** publishes `t` raw FIPS 204 ML-DSA-65 signatures and their bitmap.
 
-The protocol flow is otherwise the same: same committee, same threshold, same
-credential, same shared storage, same relying party. In SNARK mode the aggregator
-role is restricted to a small prover subset, so only those members pay
-`setup_prover()`; all ten members still sign proposals. The publication and
-verification reports remain the comparison points the demo prints.
+All modes use `N = 10`, `t = 7`, the same credential lifecycle, storage
+fixture and relying-party anti-rollback rule. ML-DSA uses its own committee
+anchor and signed-statement format; it is not fed into the XMSS SNARK path.
 
 ```
 ./demo.sh raw   up        # build, start 1 bootstrap + 10 members + node A
@@ -21,22 +20,28 @@ verification reports remain the comparison points the demo prints.
 ./demo.sh raw   crash     # kill a member mid-protocol, watch it re-align
 ./demo.sh raw   down      # stop and delete the volumes
 
-./demo.sh snark up        # the same network, publishing one proof instead
+./demo.sh snark up        # XMSS quorum aggregated into one proof
 ./demo.sh snark round
+
+./demo.sh mldsa up        # raw ML-DSA-65 quorum
+./demo.sh mldsa round
+./demo.sh mldsa revoke
+./demo.sh mldsa verify
+./demo.sh mldsa down
 ```
 
-The two demos share the `172.28.0.0/24` subnet, so only one runs at a time.
-`up` tears the other one down first.
+The three demos share the `172.28.0.0/24` subnet, so only one runs at a time.
+`up` tears the other two down first.
 
 ## Topology
 
 | container | address | role |
 |---|---|---|
 | `bootstrap` | 172.28.0.5 | assembles the anchor, then exits |
-| `signer-0` … `signer-9` | 172.28.0.11 … .20 | committee members, `N = 10`, `t = 7`; in SNARK mode `0`, `4`, `8` are also aggregators |
+| `signer-0` … `signer-9` | 172.28.0.11 … .20 | committee members, `N = 10`, `t = 7`; raw and ML-DSA allow every member to aggregate, while SNARK restricts aggregation to `0`, `4`, `8` |
 | `holder` | 172.28.0.30 | node A, the relying party; resident, verifies on demand |
 | `trigger` | assigned | asks node A for one round; run on demand |
-| `probe` | assigned | double-sign probe; run on demand |
+| `probe` | assigned | XMSS double-sign probe and shared-volume utility; run on demand |
 
 Three volumes, and the split between them is the design:
 
@@ -47,8 +52,9 @@ Three volumes, and the split between them is the design:
   secure VDR would return. It does not implement distributed storage,
   replication, consensus or canonicality; the node still authenticates the
   record locally.
-* `signer-<i>-state/` is **private to one member**: its durable slot counter.
-  Sharing it would destroy the property it exists to provide.
+* `signer-<i>-state/` exists in the XMSS modes only and is **private to one
+  member**: it holds the durable one-time-slot counter. ML-DSA is stateless and
+  therefore has no corresponding slot-counter volume.
 
 ## What a round looks like
 
@@ -66,21 +72,25 @@ grow, shrink, or become empty. There is no one-entry transition rule.
 2. The aggregator constructs the next complete `(version, list)` snapshot and
    proposes it to all ten members. The protocol permits any number of additions
    and removals in the same version; `round` and `revoke` merely drive one simple
-   operation each. The aggregator does **not** propose a slot: every member
-   derives that itself through `Committee::slot_for`.
-3. Each member burns the derived slot durably, signs the exact snapshot, and
-   answers. A member whose slot is already spent abstains, which is a normal
-   outcome. The demo approves every requested lifecycle operation; a deployment
-   supplies its own issuance and revocation policy.
+   operation each. In the XMSS modes the aggregator does **not** propose a slot:
+   every member derives it through `Committee::slot_for`. ML-DSA has no slot.
+3. Each member signs the exact canonical statement. XMSS members first burn the
+   derived leaf slot durably and abstain if it is already spent. ML-DSA members
+   use randomized FIPS 204 signing and need no one-time state. The demo approves
+   every requested lifecycle operation; a deployment supplies its own policy.
+   ML-DSA itself does not prevent a member from signing two different statements
+   for one version. The demo does not implement a durable anti-equivocation rule;
+   it assumes the external VDR supplies one canonical current record.
 4. The aggregator counts signatures until the seventh arrives. Each one is
    verified against the anchor's key at that index before it is counted, so the
    address map decides *where* to look and never *whether* the signature is
    good.
-5. It builds the record (bitmap from those indices, or one aggregated proof) and
-   atomically replaces the demo's single current-record fixture.
-6. Node A fetches that one record and hands the bytes to a
-   `RawNode` or a `SnarkNode`, which decodes, verifies against the anchor, and
-   only then lets the version move its anti-rollback mark. Node A requires the
+5. It builds the selected record: raw XMSS, aggregated XMSS, or raw ML-DSA. It
+   then atomically replaces the demo's single current-record fixture.
+6. Node A fetches that record, decodes and verifies it against the mode's anchor,
+   and only then lets the authenticated version move its anti-rollback mark.
+   The ML-DSA node preserves the same verify-before-gate ordering as `RawNode`
+   and `SnarkNode`. Node A requires the
    issued credential's fingerprint to be present, or the revoked credential's
    fingerprint to be absent.
 
@@ -88,13 +98,14 @@ grow, shrink, or become empty. There is no one-entry transition rule.
 
 Node A prints the two figures worth comparing.
 
-**Size.** The raw record is `t` signatures and a rounding error, so it grows by
-1208 bytes per additional signer. The SNARK record is a proof whose size does
-not move with `t` at all. The breakdown makes that structural rather than
-asserted.
+**Size.** Raw records grow linearly with `t`: 1208 bytes per XMSS signature
+or 3309 bytes per ML-DSA-65 signature, plus bitmap and framing. The SNARK record
+replaces the XMSS signatures with one aggregate proof. The printed breakdown
+reports the complete serialized record rather than only its cryptographic body.
 
 **Memory.** The raw verifier has no setup: it holds an anchor and calls
-`leanvm::xmss::verify` `t` times. In SNARK mode, node A loads the verifier once and the
+`leanvm::xmss::verify` `t` times; the ML-DSA raw verifier performs `t`
+FIPS 204 verifications. In SNARK mode, node A loads the verifier once and the
 aggregator subset loads the prover once per aggregator process. The first cost is
 visible in node A's startup log; the second is visible in the selected members'
 startup logs. Each round then prints proof generation and verification costs.
@@ -145,10 +156,16 @@ victim is also an aggregator, so restart includes a fresh `setup_prover()`.
 The probe exits `0` when a member signs and `3` when it abstains, so the script
 asserts each step rather than leaving it to be read out of a log.
 
+This scenario is deliberately unavailable in `mldsa` mode. It tests the
+stateful one-time-leaf safety property of XMSS; ML-DSA safely signs repeatedly
+and has no durable leaf counter to recover. Treating a normal ML-DSA restart as
+the same test would produce a meaningless security claim.
+
 ## Deliberate simplifications
 
-These are demo shortcuts. None of them weakens the protocol code, which is used
-unmodified from the parent crate.
+These are demo shortcuts. The XMSS paths use the parent crate's node types; the
+ML-DSA path uses the independent `drot-mldsa` signer, committee, record and
+verifier APIs with the same external freshness gate.
 
 * **Fixed addresses.** The aggregator turns a peer into a committee index by
   looking it up in a compile-time table. A real deployment authenticates peers

@@ -41,7 +41,8 @@ pub struct Committee {
     anchor_id: [u8; ANCHOR_ID_BYTES],
 }
 
-fn encode_public_key(public_key: &PublicKey) -> [u8; PUBLIC_KEY_BYTES] {
+/// Return the canonical FIPS 204 encoding of one ML-DSA-65 public key.
+pub fn encode_public_key(public_key: &PublicKey) -> [u8; PUBLIC_KEY_BYTES] {
     let encoded = public_key.encode();
     let encoded_bytes: &[u8] = encoded.as_ref();
     let mut bytes = [0u8; PUBLIC_KEY_BYTES];
@@ -49,7 +50,8 @@ fn encode_public_key(public_key: &PublicKey) -> [u8; PUBLIC_KEY_BYTES] {
     bytes
 }
 
-fn decode_public_key(bytes: &[u8; PUBLIC_KEY_BYTES]) -> Result<PublicKey, String> {
+/// Decode and enforce the canonical FIPS 204 encoding of one public key.
+pub fn decode_public_key(bytes: &[u8; PUBLIC_KEY_BYTES]) -> Result<PublicKey, String> {
     let encoded = EncodedVerifyingKey::<MlDsa65>::try_from(bytes.as_slice())
         .map_err(|_| "invalid ML-DSA-65 public-key length".to_string())?;
     let public_key = PublicKey::decode(&encoded);

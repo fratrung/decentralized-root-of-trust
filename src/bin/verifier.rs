@@ -127,6 +127,8 @@ fn main() -> ExitCode {
         anchor.len()
     );
 
+    let mut decode_ts = Vec::new();
+    let mut verify_only_ts = Vec::new();
     let mut verify_ts = Vec::new();
     let mut failures = 0usize;
     let mut rss_max = rss_after_setup;
@@ -138,16 +140,21 @@ fn main() -> ExitCode {
         // Decoding is timed with verification: on an untrusted transport it is
         // part of the cost an attacker can force, and it is not free: leanVM
         // recomputes the bytecode claim while deserializing.
-        let t = Instant::now();
-        let ok = match SnarkStatusList::from_bytes(&bytes) {
-            Ok(sl) => verifier.verify(&sl),
+        let total_start = Instant::now();
+        let decoded = SnarkStatusList::from_bytes(&bytes);
+        let decode_time = total_start.elapsed();
+        let record = match decoded {
+            Ok(record) => record,
             Err(e) => {
                 println!("  {name:<22} DECODE FAILED: {e}");
                 failures += 1;
                 continue;
             }
         };
-        let elapsed = t.elapsed();
+        let verify_start = Instant::now();
+        let ok = verifier.verify(&record);
+        let verify_only_time = verify_start.elapsed();
+        let elapsed = total_start.elapsed();
         let rss = rss_now_mb();
         rss_max = rss_max.max(rss);
         if !ok {
@@ -161,11 +168,15 @@ fn main() -> ExitCode {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=verifier idx={idx} verify_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=verifier idx={idx} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
+                ms(decode_time),
+                ms(verify_only_time),
                 ms(elapsed),
                 bytes.len()
             );
         }
+        decode_ts.push(decode_time);
+        verify_only_ts.push(verify_only_time);
         verify_ts.push(elapsed);
     }
 
@@ -286,16 +297,20 @@ fn main() -> ExitCode {
         }
     }
 
-    let verify = Series::new(verify_ts.iter().map(|d| ms(*d)));
+    let decode = Series::new(decode_ts.iter().map(|d| ms(*d)));
+    let verify = Series::new(verify_only_ts.iter().map(|d| ms(*d)));
+    let total = Series::new(verify_ts.iter().map(|d| ms(*d)));
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
+    let (total_min, total_med, total_max) = total.min_med_max();
 
     println!("\nsetup_verifier         : {setup_time:.2?}");
     println!(
         "verified               : {} updates, {:.1} ms total",
         verify.len(),
-        verify.sum()
+        total.sum()
     );
-    println!("verify min/med/max     : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
+    println!("verify-only min/med/max: {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
+    println!("decode+verify min/med/max: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
     println!("\nRAM (verify-only process)");
     println!("baseline (pre-setup)   : {rss_baseline} MB");
     println!("after setup (resident) : {rss_after_setup} MB");
@@ -306,7 +321,11 @@ fn main() -> ExitCode {
     println!(
         "\nVERIFIER setup_ms={:.3} n_verified={} verify_med_ms={vf_med:.3} \
          verify_mean_ms={:.3} verify_sd_ms={:.3} verify_min_ms={vf_min:.3} \
-         verify_max_ms={vf_max:.3} verify_total_ms={:.3} anchor_bytes={} \
+         verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
+         decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
+         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
+         total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
+         total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} anchor_bytes={} \
          rss_setup_mb={rss_after_setup} rss_verify_max_mb={rss_max} peak_rss_mb={} \
          failures={failures}",
         ms(setup_time),
@@ -314,6 +333,15 @@ fn main() -> ExitCode {
         verify.mean(),
         verify.stddev(),
         verify.sum(),
+        decode.median(),
+        decode.mean(),
+        decode.stddev(),
+        decode.min(),
+        decode.max(),
+        decode.sum(),
+        total.mean(),
+        total.stddev(),
+        total.sum(),
         anchor.len(),
         peak_rss_mb()
     );

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Driver for the two container demos.
+# Driver for the three container demos.
 #
 #   ./demo.sh raw   up        build the image and start the network + node A
 #   ./demo.sh raw   round     node A asks for a credential, then verifies it
@@ -10,10 +10,11 @@
 #   ./demo.sh raw   logs      follow every node
 #   ./demo.sh raw   down      stop the network and delete its volumes
 #
-# `snark` in place of `raw` runs the same network publishing one aggregated
-# proof instead of the signatures. Only the configured prover subset can
-# aggregate SNARK rounds; the other members still sign. The two share a subnet,
-# so `up` tears the other one down first.
+# `mldsa` runs the same raw-quorum workflow with ML-DSA-65 keys and records.
+#
+# `snark` publishes one aggregate instead of raw XMSS signatures. Only the
+# configured prover subset can aggregate those rounds. All three modes share one
+# subnet, so `up` tears down the other two first.
 #
 # Node A is resident: `up` starts it, it does its one-time setup there, and
 # `round`, `revoke` and `verify` only send it a trigger. That is why the SNARK setup cost
@@ -26,13 +27,11 @@ MODE="${1:-raw}"
 CMD="${2:-help}"
 
 case "$MODE" in
-  raw)   OTHER=snark ;;
-  snark) OTHER=raw ;;
-  *) echo "usage: $0 {raw|snark} {up|round|revoke|verify|crash|logs|ps|down}" >&2; exit 2 ;;
+  raw|snark|mldsa) ;;
+  *) echo "usage: $0 {raw|snark|mldsa} {up|round|revoke|verify|crash|logs|ps|down}" >&2; exit 2 ;;
 esac
 
 COMPOSE=(docker compose -f "$HERE/compose.$MODE.yml")
-OTHER_COMPOSE=(docker compose -f "$HERE/compose.$OTHER.yml")
 
 # The default victim is one of the SNARK aggregators, so the SNARK crash scenario
 # also exercises prover setup after restart. Override with VICTIM=<index>.
@@ -123,8 +122,11 @@ case "$CMD" in
     ;;
 
   up)
-    say "clearing the $OTHER demo, which shares this subnet"
-    "${OTHER_COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
+    say "clearing the other demos, which share this subnet"
+    for other in raw snark mldsa; do
+      [ "$other" = "$MODE" ] && continue
+      docker compose -f "$HERE/compose.$other.yml" down --remove-orphans >/dev/null 2>&1 || true
+    done
     if docker volume inspect "drot-${MODE}_holder-state" >/dev/null 2>&1; then
       export HOLDER_STATE_MODE=open
       say "opening node A's existing anti-rollback state"
@@ -169,6 +171,12 @@ case "$CMD" in
     ;;
 
   crash)
+    if [ "$MODE" = mldsa ]; then
+      echo "the crash scenario is XMSS-only: ML-DSA has no one-time leaf slot or durable slot counter" >&2
+      echo "use mldsa round/revoke/verify; do not interpret this omission as a failed ML-DSA safety test" >&2
+      exit 2
+    fi
+
     # Does a durable slot burn survive the machine it was made on?
     #
     # The member signs, is killed without warning, comes back, and is asked to

@@ -167,3 +167,15 @@ pub fn request(
     send(&mut stream, kind, payload)?;
     recv(&mut stream)
 }
+
+/// An ML-DSA member's answer to a proposal.
+///
+/// The fixed-size signature is carried as bytes because the FIPS 204 type does
+/// not implement SSZ. The receiver reconstructs it and rejects malformed or
+/// non-canonical encodings before counting the contribution.
+#[derive(SszEncode, SszDecode)]
+pub struct MlDsaSignatureReply {
+    /// Exactly one 3309-byte signature when signing succeeded; empty otherwise.
+    pub signature: Vec<Vec<u8>>,
+    pub reason: Vec<u8>,
+}

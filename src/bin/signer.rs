@@ -76,6 +76,8 @@ fn main() {
 
     let mut list: Vec<[u8; 32]> = Vec::new();
     let mut sign_ms = Vec::new();
+    let mut reserve_ms = Vec::new();
+    let mut crypto_ms = Vec::new();
     let mut failures = 0usize;
     let mut rss_max = rss_after_keygen;
 
@@ -90,7 +92,9 @@ fn main() {
         let message = committee.message_for(Algorithms::WotsXmss, &list, version);
 
         let t_sign = Instant::now();
-        let signature = signer.sign_at(&message, slot).expect("signing failed");
+        let (signature, phases) = signer
+            .sign_at_timed(&message, slot)
+            .expect("signing failed");
         let sign_time = t_sign.elapsed();
 
         // Not part of a member's job, and not timed: a cheap guard that the run
@@ -113,15 +117,21 @@ fn main() {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=signer idx={i} sign_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=signer idx={i} sign_ms={:.3} reserve_ms={:.3} crypto_ms={:.3} bytes={} rss_mb={rss}",
                 ms(sign_time),
+                ms(phases.reserve),
+                ms(phases.crypto),
                 SIGNATURE_SSZ_LEN
             );
         }
         sign_ms.push(ms(sign_time));
+        reserve_ms.push(ms(phases.reserve));
+        crypto_ms.push(ms(phases.crypto));
     }
 
     let sign = Series::new(sign_ms);
+    let reserve = Series::new(reserve_ms);
+    let crypto = Series::new(crypto_ms);
     let (sg_min, sg_med, sg_max) = sign.min_med_max();
 
     println!("\nkeygen (1 key)         : {keygen_time:.2?}");
@@ -138,7 +148,9 @@ fn main() {
     println!(
         "\nSIGNER keygen_ms={:.3} slot_state_ms={:.3} n_rounds={} \
          sign_med_ms={sg_med:.3} sign_mean_ms={:.3} sign_sd_ms={:.3} sign_min_ms={sg_min:.3} \
-         sign_max_ms={sg_max:.3} sign_total_ms={:.3} sig_bytes={} \
+         sign_max_ms={sg_max:.3} sign_total_ms={:.3} \
+         reserve_med_ms={:.3} reserve_total_ms={:.3} \
+         crypto_med_ms={:.3} crypto_total_ms={:.3} sig_bytes={} \
          rss_keygen_mb={rss_after_keygen} rss_rounds_max_mb={rss_max} peak_rss_mb={} \
          failures={failures}",
         ms(keygen_time),
@@ -147,6 +159,10 @@ fn main() {
         sign.mean(),
         sign.stddev(),
         sign.sum(),
+        reserve.median(),
+        reserve.sum(),
+        crypto.median(),
+        crypto.sum(),
         SIGNATURE_SSZ_LEN,
         peak_rss_mb(),
     );

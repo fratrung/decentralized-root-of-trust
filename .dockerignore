@@ -2,6 +2,7 @@
 # host-specific directories out of it.
 target/
 demo/target/
+mldsa/target/
 .git/
 bench-*/
 artifacts/

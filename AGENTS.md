@@ -22,7 +22,11 @@ verifier accepts either:
   and verifier setup.
 
 The verifier embeds one fixed anchor — the committee (`N` public keys, threshold
-`t`, genesis slot). Secure distributed storage is an external assumption: a VDR
+`t`, genesis slot).
+The independent `mldsa/` crate provides a raw-quorum variant with FIPS 204
+ML-DSA-65, its own anchor and SSZ record. Its signatures are not aggregated by
+the XMSS SNARK path.
+Secure distributed storage is an external assumption: a VDR
 establishes and returns one canonical current record. This repository does not
 implement storage, replica discovery, conflict resolution, or candidate
 selection; it authenticates that one record and applies local anti-rollback.
@@ -41,17 +45,17 @@ cargo run --release --bin signer                       # split: ONE member, one 
 cargo fmt --all -- --check                             # formatting gate used by CI
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked                                    # 73 unit + 10 integration tests; 82 run + 1 ignored
-./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
+./benchmark.sh                                         # defaults: RUNS=24 WARMUP=2; six XMSS/ML-DSA role targets
 ./committee-scaling-benchmark.sh                       # exploratory pilot; hard RAM/disk-gated N/t sweep
 STUDY_MODE=publication PIN_CPUS=0-7 ./committee-scaling-benchmark.sh # clean-tree, repeated counterbalanced sweep
 PLAN_ONLY=1 ./committee-scaling-benchmark.sh           # persist the host-derived sweep limit only
 tools/mutate.py                                        # mutation testing: 25 checks, each must be caught by a test
-./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
-./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
-./demo/docker/demo.sh {raw|snark} revoke               # remove that credential's fingerprint, then verify its absence
-./demo/docker/demo.sh {raw|snark} verify               # node A re-checks what is published (expect a stale refusal)
-./demo/docker/demo.sh {raw|snark} crash                # SIGKILL a member mid-protocol; it must refuse to re-sign
-./demo/docker/demo.sh {raw|snark} down                 # stop and delete that demo's volumes
+./demo/docker/demo.sh {raw|snark|mldsa} up             # container demo: 1 bootstrap + 10 members, N=10 t=7
+./demo/docker/demo.sh {raw|snark|mldsa} round          # node A requests a credential, then verifies the record
+./demo/docker/demo.sh {raw|snark|mldsa} revoke         # remove its fingerprint, then verify absence
+./demo/docker/demo.sh {raw|snark|mldsa} verify         # re-check the canonical record (expect stale on replay)
+./demo/docker/demo.sh {raw|snark} crash                # XMSS-only durable one-time-slot crash test
+./demo/docker/demo.sh {raw|snark|mldsa} down           # stop and delete that demo's volumes
 ```
 
 **Always `--release`** for anything touching the prover; it is unusable in a debug
@@ -328,12 +332,12 @@ split so `benchmark.sh` can measure each process shape independently.
 ### The container demos (`demo/`)
 
 A **separate crate**, with its own `[workspace]` and its own lockfile. That is
-the whole rule: the library and the four benchmark binaries are the artifact this
-project measures, and the demo adds networking, orchestration and a credential
-format, none of which belong in that surface. Nothing in `demo/` may be reachable
-from a `benchmark.sh` build, and the parent `Cargo.toml` must stay unaware of it.
+the whole rule: the measured root and `mldsa/` crates contain protocol code;
+the demo adds networking, orchestration and a credential format. Nothing in
+`demo/` may be reachable from a `benchmark.sh` build, and the parent
+`Cargo.toml` must stay unaware of it.
 
-Ten containers run one image and differ only by environment. `demo/src/bin/`
+The container roles share one image and differ by command and environment. `demo/src/bin/`
 holds `bootstrap` (assembles the anchor from ten published public keys, in index
 order, then exits), `signer` (a member; in raw mode any member may aggregate a
 round, while in SNARK mode only the configured prover subset aggregates and runs
@@ -341,17 +345,20 @@ round, while in SNARK mode only the configured prover subset aggregates and runs
 directly, exit `0` signed / `3` abstained, which is what lets the crash scenario
 assert instead of grep).
 
-`holder` is **resident**, and `round`/`revoke`/`verify` only send it a trigger (the same
-binary with `HOLDER_TRIGGER` set, run as the throwaway `trigger` service).
-`setup_verifier()` is a per-process cost, so a node A that exited after every
-check would repeatedly include process startup. Keep it resident: the one-shot
-shape still exists (neither `HOLDER_SERVE` nor `HOLDER_TRIGGER`) for cold-start
-benchmarking.
-Node A holds a `RawNode` or a `SnarkNode`, so the anti-rollback mark is inside
-the node and survives a container restart on its `holder-state` volume. It also
-keeps the last credential in its private state: `round` accepts it only when its
-fingerprint is present in the authenticated snapshot, while `revoke` accepts the
-next snapshot only when that fingerprint is absent.
+The `mldsa` mode has separate `mldsa_bootstrap`, `mldsa_signer` and
+`mldsa_holder` binaries. Its holder decodes the SSZ record, verifies the
+ML-DSA quorum and only then advances the same durable freshness gate.
+
+The selected mode's holder is **resident**; `round`/`revoke`/`verify` send it a
+trigger via the throwaway `trigger` service. `setup_verifier()` has a
+per-process cost in SNARK mode. The one-shot shape still exists (neither
+`HOLDER_SERVE` nor `HOLDER_TRIGGER`) for cold-start benchmarking.
+In XMSS modes node A holds a `RawNode` or `SnarkNode`; in ML-DSA mode it
+composes `RawVerifier` with the same durable `HighWaterMark`. In every mode
+the mark survives a container restart on the `holder-state` volume. Node A
+also keeps the last credential in its private state: `round` accepts it only
+when its fingerprint is present in the authenticated snapshot, while
+`revoke` accepts the next snapshot only when that fingerprint is absent.
 
 Three things about it are load-bearing and easy to break by "simplifying":
 
@@ -553,8 +560,10 @@ per-item raw samples when `EMIT_SAMPLES` is set in the environment:
 | `prover` | `PROVER k=v ...` | `SAMPLE target=prover idx=… prove_ms=… bytes=…` |
 | `verifier` | `VERIFIER k=v ... failures=N` | `SAMPLE target=verifier idx=… verify_ms=…` |
 | `raw_agg` | `RAW_AGG k=v ... tamper_rejected=…` | `SAMPLE target=raw_agg idx=… verify_ms=… bytes=…` |
+| `mldsa_signer` | `MLDSA_SIGNER k=v ... failures=N` | `SAMPLE target=mldsa_signer idx=… sign_ms=… bytes=…` |
+| `mldsa_raw_agg` | `MLDSA_RAW_AGG k=v ... tamper_rejected=…` | decode, verify and decode-plus-verify samples |
 
-`benchmark.sh` normalises all five in `emit_run_row`; adding or renaming a field
+`benchmark.sh` normalises every selected target in `emit_run_row`; adding or renaming a field
 means updating that function. The script exits if a summary line is missing, and
 aborts before printing any statistics if any run reports `failures > 0`.
 
@@ -563,12 +572,12 @@ the comparison between the two paths gets inverted:
 
 | field | what it is | who pays it |
 |---|---|---|
-| `setup_ms` | the leanVM circuit (`setup_prover` / `setup_verifier`) | SNARK path only — `raw_agg` and `signer` leave it empty |
-| `keygen_ms` | generating XMSS keys | every path; `N` keys, except `signer`, which generates **one** |
-| `slot_state_ms` | creating durable `AtomicSlotCounter`s | only a real signer — `N` for `raw_agg`, **one** for `signer` |
+| `setup_ms` | the leanVM circuit (`setup_prover` / `setup_verifier`) | SNARK path only |
+| `keygen_ms` | generating the target scheme's keys | one key for each signer target; fixture generation is unmeasured |
+| `slot_state_ms` | creating durable `AtomicSlotCounter`s | XMSS signer only; ML-DSA is stateless |
 
 Per-update phases are carried into `runs.csv` under their **own names**
-(`sign_*`, `prove_*`, `verify_*`), never under a positional primary/secondary
+(`sign_*`, `prove_*`, `verify_*`, `decode_*`, `decode_verify_*`), never under a positional primary/secondary
 slot: a shared column put unlike phases under one heading and made `summary.csv`
 unreadable on its own. A target leaves blank the phases it does not
 run, and `col()` drops empty cells, so an absent phase produces no row rather than
@@ -596,7 +605,7 @@ environment (`env.txt`), emits tidy raw data (`samples.csv`), per-run rows
 frequency and the highest readable temperature before and after each process.
 `drift.csv` flags an early/late median shift above 15% without deleting data.
 Strict runs require a clean tree; exploratory dirty runs preserve
-`source.patch` and `source-status.txt`.
+`source.patch` and `source-status.txt`, but untracked contents are omitted.
 
 The unit of analysis for per-update metrics is the **per-run median** (n = RUNS),
 not the pooled sample: updates inside one process share allocator and cache state
@@ -604,31 +613,34 @@ and are not independent. Preserve that distinction if you touch the aggregation.
 
 ### One target per role
 
-The sweep has three targets that correspond to real processes, plus two contrast
-targets. What each one measures is decided by **which role would run that
-process**, and no target is charged for another role's work:
+The default sweep has six isolated targets. ML-DSA signer timing is crypto-only
+until a durable one-statement-per-version policy exists. What each one measures is
+decided by **which role would run that process**, and no target is charged for
+another role's work:
 
 | target | role | reports |
 |---|---|---|
-| `signer` | one committee member | `sign` per round (incl. its durable slot burn), 1 key, 1 counter |
+| `signer` | one committee member | protocol sign, durable slot burn, crypto sign, 1 key, 1 counter |
 | `prover` | the aggregator | `prove` per update, `setup`, complete `SnarkStatusList` size |
-| `verifier` | a relying party | `verify` per record, `setup` |
-| `raw_agg` | the no-SNARK baseline | `verify` per record + record size |
+| `verifier` | a relying party | decode, verify-only, contiguous decode+verify, `setup` |
+| `raw_agg` | the raw XMSS baseline | decode, verify-only, contiguous decode+verify + record size |
+| `mldsa_signer` | one ML-DSA member | randomized crypto sign only, 1 key, no version state |
+| `mldsa_raw_agg` | an ML-DSA relying party | separate decode, verify, total time + record size |
 
 `combined` (`main.rs`) is **not** in the default `TARGETS`. It measures a process
 that proves and verifies at once — not a role anyone deploys. It stays available
 as `TARGETS="... combined"` for one purpose: an independent second reading of
 prove time. Do not add it back to the defaults for any other reason.
 
-**Only `signer` reports a `sign` row, and that is deliberate.** In production
-nobody produces `t` signatures: each member signs *once* per round on its own
-machine and broadcasts, and the aggregator receives `t` and produces none. Timing
+**Only `signer` and `mldsa_signer` report a `sign` row, and that is
+deliberate.** In production nobody produces `t` signatures: each member signs
+*once* per round on its own machine and broadcasts, and the aggregator receives
+`t` and produces none. Timing
 a loop that signs `t` times sums the work of `t` machines and bills it to one —
 which is what the `sign / update` column used to do for a process that does not
-exist. By default, one unmeasured `committee_fixture` produces the signed raw
-records before the sweep. `raw_agg` verifies those `StatusList` records, while
-`prover` consumes the same logical signed inputs and writes
-`SnarkStatusList` records. Neither measured process holds committee secret keys.
+exist. Unmeasured XMSS and ML-DSA fixture generators produce their respective
+signed corpora before the sweep. `raw_agg`, `mldsa_raw_agg` and `prover`
+therefore receive ready-made inputs and hold no committee secret keys.
 `BENCH_SELF_CONTAINED=1` retains the former all-in-one process shape only for
 diagnostic back-comparison; in that mode `prover`, `combined` and `raw_agg`
 produce signatures outside their timed phase.
@@ -638,9 +650,11 @@ A member's signing cost is identical on both published forms — same key, same
 SNARK and the raw path, and what separates the two paths is only how the quorum is
 evidenced and what a relying party pays to check it.
 
-`signer`'s `keygen` and `slot_state` are for **one** key and **one** counter.
-In the default fixture-shaped benchmark, `prover` and `raw_agg` report neither
-cost because the measured aggregator and verifier do not own signer state. The
+`signer`'s `keygen` and `slot_state` are for **one** XMSS key and counter.
+`mldsa_signer` reports one ML-DSA key and no durable version state. Its
+crypto-only timing is not comparable to the complete XMSS protocol cost. In the default
+fixture-shaped benchmark, `prover`, `raw_agg` and `mldsa_raw_agg` report no
+signer-state cost because those measured roles do not own signer state. The
 self-contained diagnostic mode reports the whole committee's `N`; do not read
 those figures as the same quantity as the signer row.
 
@@ -670,12 +684,12 @@ projection block existed once and was removed — do not reintroduce it.
 `committee-scaling-benchmark.sh` must remain an orchestrator over
 `benchmark.sh`, not a second measurement implementation. `benchmark.sh` remains
 the authority for scheduling, raw samples, descriptive statistics, confidence
-intervals, drift diagnostics and security failure gates. The scaling layer measures the `signer`
-target once for the whole campaign, then chooses `(N,t)`, prepares unmeasured
-signatures, enforces resources, invokes complete benchmark sessions and
-aggregates their run-level medians. The signer result stays separate in
-`signer.csv`: it is a one-member cost common to both publication forms, not a
-quantity to multiply by `t` or repeat at every committee size.
+intervals, drift diagnostics and security failure gates. The scaling layer
+measures `signer` and `mldsa_signer` once for the whole campaign, then chooses
+`(N,t)`, prepares both unmeasured signature corpora, enforces resources, invokes
+complete benchmark sessions and aggregates their run-level medians. Signer
+results stay separate in `signer.csv`: each is a one-member cost, not a quantity
+to multiply by `t` or repeat at every committee size.
 
 The requested grid is `N = 5, 10, 100, 500, 1000, 1500`, with
 `t = floor(2N/3) + 1`. This is a strict two-thirds authorization policy, not PBFT
@@ -696,16 +710,18 @@ never turn a resource abort into a partial timing row.
 `STUDY_MODE=pilot` is exploratory: three runs, one warm-up, one ascending sweep.
 `publication` defaults to 24 runs and two complete sweeps, ascending then
 descending, and requires a clean tree, strict environment, explicit CPU mask and
-hard memory backend. Its run count must be a multiple of six, completing the
-Williams design for the three per-point targets. It withholds a session on a
+hard memory backend. Its run count must be a multiple of four, completing the
+balanced design for the four per-point targets (`prover`, `verifier`,
+`raw_agg`, `mldsa_raw_agg`). It withholds a session on a
 drift warning. `RESUME=1` is accepted only when the recorded
 source/configuration fingerprint matches and the current usable RAM cap still
 meets the admission threshold for the largest originally selected N.
 
 The combined report derives quantities from run-level medians across complete
-sweeps. A verification crossover is reportable only when the paired 95% CI for
-`raw_verify - snark_verify` is wholly positive. Speedup and break-even retain
-quartiles. `ceil(prove / (raw_verify - snark_verify))` excludes process setup,
+sweeps. A validator requires complete run IDs, metric fields and phase samples
+before a session contributes; per-target run overrides are rejected. A verification crossover is reportable only when the paired 95% CI for
+`raw_decode_verify - snark_decode_verify` is wholly positive. Speedup and break-even retain
+quartiles. `ceil(prove / (raw_decode_verify - snark_decode_verify))` excludes process setup,
 networking, signing and fixture generation; withhold it if any paired run has no
 positive saving rather than deleting that run. Do not call it end-to-end latency
 or extrapolate a crossover between measured grid points; refine the grid around

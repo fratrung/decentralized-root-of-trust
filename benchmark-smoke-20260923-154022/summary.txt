@@ -1,0 +1,161 @@
+BENCHMARK SUMMARY
+generated : 2026-09-23T15:40:56+02:00
+host      : AMD Ryzen 7 4800H with Radeon Graphics (x86_64), 16 effective threads
+governor  : schedutil
+threads   : 16
+committee : N=5, t=3
+XMSS input: fixture
+MLDSA input: fixture
+order     : Williams-style balanced across targets
+cooldown  : 0s before each target process
+runs      : n=1 measured, 0 warmup(s) discarded (default;
+            RUNS_<target> may override — the authoritative count is the
+            per-row 'n' column below)
+unit      : per-run value; for per-update metrics, the per-run median
+ci95      : Student's t, df=n-1 (normal approximation for n>31). This is a
+            PRECISION interval for the mean of repeated runs on THIS host in
+            THIS session. It says nothing about other hardware, other
+            builds, or this machine on another day.
+memory    : the MB rows are RSS, resident set size — the physical pages
+            the process holds. A 'peak' row is the high-water mark over
+            the whole run, read two independent ways: VmHWM is the
+            process's own /proc/self/status, kernel is ru_maxrss from
+            /usr/bin/time -v.
+
+target    metric                  unit     n        min     median        max       mean         sd      cv%  ci95±
+signer    keygen (1 key, once)    ms       1       4.58       4.58       4.58       4.58       0.00     0.0%    0.00
+signer    slot state (1 counter)  ms       1       2.46       2.46       2.46       2.46       0.00     0.0%    0.00
+signer    XMSS protocol sign / round ms       1      11.42      11.42      11.42      11.42       0.00     0.0%    0.00
+signer    XMSS protocol sign total ms       1     310.58     310.58     310.58     310.58       0.00     0.0%    0.00
+signer    XMSS durable slot burn  ms       1       0.86       0.86       0.86       0.86       0.00     0.0%    0.00
+signer    XMSS crypto sign / round ms       1      10.53      10.53      10.53      10.53       0.00     0.0%    0.00
+signer    XMSS signature size     bytes    1       1208       1208       1208       1208          0     0.0%       0
+signer    RSS after keygen        MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+signer    RSS max during work     MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+signer    peak RSS (VmHWM)        MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+signer    peak RSS (kernel)       MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+mldsa_signer keygen ML-DSA (1 key)   ms       1       1.75       1.75       1.75       1.75       0.00     0.0%    0.00
+mldsa_signer ML-DSA crypto sign / round ms       1       0.55       0.55       0.55       0.55       0.00     0.0%    0.00
+mldsa_signer ML-DSA crypto sign total ms       1      20.86      20.86      20.86      20.86       0.00     0.0%    0.00
+mldsa_signer ML-DSA signature size   bytes    1       3309       3309       3309       3309          0     0.0%       0
+mldsa_signer RSS after keygen        MB       1        3.0        3.0        3.0        3.0        0.0     0.0%     0.0
+mldsa_signer RSS max during work     MB       1        3.0        3.0        3.0        3.0        0.0     0.0%     0.0
+mldsa_signer peak RSS (VmHWM)        MB       1        3.0        3.0        3.0        3.0        0.0     0.0%     0.0
+mldsa_signer peak RSS (kernel)       MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+prover    setup (circuit, once)   ms       1    1420.50    1420.50    1420.50    1420.50       0.00     0.0%    0.00
+prover    prove / update          ms       1     471.86     471.86     471.86     471.86       0.00     0.0%    0.00
+prover    prove total / run       ms       1    9556.47    9556.47    9556.47    9556.47       0.00     0.0%    0.00
+prover    SnarkStatusList size    bytes    1     164153     164153     164153     164153          0     0.0%       0
+prover    RSS after setup         MB       1      182.0      182.0      182.0      182.0        0.0     0.0%     0.0
+prover    RSS max during work     MB       1      847.0      847.0      847.0      847.0        0.0     0.0%     0.0
+prover    peak RSS (VmHWM)        MB       1      847.0      847.0      847.0      847.0        0.0     0.0%     0.0
+prover    peak RSS (kernel)       MB       1      846.0      846.0      846.0      846.0        0.0     0.0%     0.0
+verifier  setup (circuit, once)   ms       1    1559.07    1559.07    1559.07    1559.07       0.00     0.0%    0.00
+verifier  SNARK verify-only / update ms       1     164.83     164.83     164.83     164.83       0.00     0.0%    0.00
+verifier  verify total / run      ms       1    3404.55    3404.55    3404.55    3404.55       0.00     0.0%    0.00
+verifier  SNARK decode / update   ms       1       0.20       0.20       0.20       0.20       0.00     0.0%    0.00
+verifier  decode total / run      ms       1       3.96       3.96       3.96       3.96       0.00     0.0%    0.00
+verifier  SNARK decode + verify   ms       1     165.03     165.03     165.03     165.03       0.00     0.0%    0.00
+verifier  decode + verify total   ms       1    3408.56    3408.56    3408.56    3408.56       0.00     0.0%    0.00
+verifier  RSS after setup         MB       1      147.0      147.0      147.0      147.0        0.0     0.0%     0.0
+verifier  RSS max during work     MB       1      147.0      147.0      147.0      147.0        0.0     0.0%     0.0
+verifier  peak RSS (VmHWM)        MB       1      392.0      392.0      392.0      392.0        0.0     0.0%     0.0
+verifier  peak RSS (kernel)       MB       1      392.0      392.0      392.0      392.0        0.0     0.0%     0.0
+raw_agg   verify-only XMSS / update ms       1       0.23       0.23       0.23       0.23       0.00     0.0%    0.00
+raw_agg   verify total / run      ms       1       4.53       4.53       4.53       4.53       0.00     0.0%    0.00
+raw_agg   decode XMSS / update    ms       1       0.00       0.00       0.00       0.00       0.00     0.0%    0.00
+raw_agg   decode total / run      ms       1       0.13       0.13       0.13       0.13       0.00     0.0%    0.00
+raw_agg   XMSS decode + verify    ms       1       0.23       0.23       0.23       0.23       0.00     0.0%    0.00
+raw_agg   decode + verify total   ms       1       4.73       4.73       4.73       4.73       0.00     0.0%    0.00
+raw_agg   XMSS StatusList size    bytes    1       3978       3978       3978       3978          0     0.0%       0
+raw_agg   RSS after anchor        MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+raw_agg   RSS max during work     MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+raw_agg   peak RSS (VmHWM)        MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+raw_agg   peak RSS (kernel)       MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+mldsa_raw_agg verify-only ML-DSA      ms       1       0.49       0.49       0.49       0.49       0.00     0.0%    0.00
+mldsa_raw_agg verify total / run      ms       1       8.44       8.44       8.44       8.44       0.00     0.0%    0.00
+mldsa_raw_agg decode ML-DSA / update  ms       1       0.09       0.09       0.09       0.09       0.00     0.0%    0.00
+mldsa_raw_agg decode total / run      ms       1       1.72       1.72       1.72       1.72       0.00     0.0%    0.00
+mldsa_raw_agg decode + verify ML-DSA  ms       1       0.57       0.57       0.57       0.57       0.00     0.0%    0.00
+mldsa_raw_agg decode + verify total   ms       1      10.23      10.23      10.23      10.23       0.00     0.0%    0.00
+mldsa_raw_agg ML-DSA StatusList size  bytes    1      10281      10281      10281      10281          0     0.0%       0
+mldsa_raw_agg RSS after anchor        MB       1        3.0        3.0        3.0        3.0        0.0     0.0%     0.0
+mldsa_raw_agg RSS max during work     MB       1        3.0        3.0        3.0        3.0        0.0     0.0%     0.0
+mldsa_raw_agg peak RSS (VmHWM)        MB       1        3.0        3.0        3.0        3.0        0.0     0.0%     0.0
+mldsa_raw_agg peak RSS (kernel)       MB       1        2.0        2.0        2.0        2.0        0.0     0.0%     0.0
+
+PEAK RSS BY ROLE (median) — why the deployment splits
+  member    (signer)  : 2 MB
+  verifier            : 392 MB
+  aggregator (prover) : 847 MB
+  a node that only verifies saves 53.7% (455 MB) against proving
+  a node that only signs is 424x smaller than the aggregator
+WARNING   : mldsa_signer peak RSS disagrees — VmHWM 3 MB vs kernel 2 MB (50.0%)
+WARNING   : mldsa_raw_agg peak RSS disagrees — VmHWM 3 MB vs kernel 2 MB (50.0%)
+
+CAVEATS (carry these into any write-up)
+  * Binaries are built with target-cpu=native: they are host-specific and
+    NOT portable. Re-run on each machine you report.
+  * CPU governor was 'schedutil', not 'performance': variance is inflated,
+    and absolute timings are NOT comparable with a 'performance' run.
+  * leanVM sizes its worker pool from available_parallelism() at startup and
+    offers no override, so every timing here is a 16-thread figure.
+    Nothing was pinned: set PIN_CPUS to fix it across machines.
+  * A 0s idle cooldown preceded every target process. The balanced
+    order reduces positional and predecessor bias but cannot guarantee equal
+    package temperature; inspect t_start and host telemetry when publishing.
+  * runs.csv carries t_start (epoch s) per run. Plot the metric against it
+    before reporting. It also records load, selected-CPU frequency and the
+    highest readable host temperature before and after every process. Empty
+    telemetry fields mean the kernel exposed no portable sensor. drift.csv
+    flags >15% early/late shifts but never removes observations.
+  * The tree was dirty. source.patch records tracked changes only; untracked
+    contents are omitted, so this run may not be exactly reconstructible.
+  * A prover process calls zk_alloc::enable_arena(), which sets
+    M_TRIM_THRESHOLD=-1: its RSS never decreases, so 'peak' means
+    'high-water mark of a monotonic curve'. A verify-only process keeps
+    normal malloc behaviour and its RSS is flat in the number of verifications.
+  * Setup is paid once per process and is not persisted across restarts:
+    every run re-executes the binary, so each target above paid it on all
+    1 of its executions. It dominates total time; never fold it into
+    per-update figures.
+  * 'setup' is the leanVM circuit and nothing else.
+    Committee key generation and signing ran in the separate fixture process
+    before measurement. The prover row is one aggregator holding public keys
+    and t ready-made signatures; the raw row is one relying-party verifier.
+  * ML-DSA key generation and quorum signing ran in a separate fixture
+    process. mldsa_raw_agg measures only record decode and verification.
+  * Per-update samples within a run are not independent (shared allocator
+    and cache state). The table's unit is the per-run median; samples.csv
+    holds every raw observation if you need the pooled distribution.
+  * sd / cv% / ci95 describe the spread BETWEEN runs, i.e. how reproducible
+    the experiment is — not how much one operation varies. A single
+    operation varies far more: see samples.csv, and the min/max columns of
+    the *_total rows. Do not quote 'median ± ci95' as the cost of one call.
+  * '<phase> / update' is a median and '<phase> total / run' is a sum, so
+    total != n x per-update whenever the phase is skewed. Signing is: it
+    has stragglers several times the median, and its total runs visibly
+    above n x median. Verification is near-deterministic and does match.
+  * Each signer target measures ONE member doing ONE signature per round.
+    XMSS includes its durable slot burn (inactive journal generation plus
+    sync_data) through SignerNode. ML-DSA is stateless and randomized, so
+    it has no slot counter or persistence cost. Its crypto-sign row is not
+    a complete signer protocol cost: one-statement-per-version state is absent.
+    The measured prover/raw verifier receive t signatures prepared by the
+    fixture process; neither produces signatures or holds secret keys.
+  * Each keygen row is for ONE key. Only the XMSS signer has a slot-state
+    row, for ONE durable counter.
+    The fixture-mode prover/raw verifier report neither: the committee paid
+    those costs outside the measured aggregator and verifier processes.
+  * The XMSS signer cost applies unchanged to XMSS raw and PQ-SNARK records:
+    those forms use the same XMSS statement, key and derived slot. ML-DSA is
+    a separate raw alternative and its signer cost must not be substituted
+    into the XMSS-based proof path.
+  * Prove cost is driven by t, not by the number of updates. At small t
+    the trace pads to a power of two, so prove time is a step function
+    (t=5..=8 all cost the same); from a few dozen signers upward the
+    linear term dominates. This sweep measured ONE t: t=3 at 471.9 ms,
+    i.e. 157.29 ms per aggregated signature -- a single point, not a
+    slope, since it still carries the t-independent part of the proof.
+    Re-run at a second t before quoting any per-signature figure, and
+    do not extrapolate the step behaviour past small t.

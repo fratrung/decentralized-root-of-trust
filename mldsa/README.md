@@ -3,8 +3,8 @@
 This independent crate implements the ML-DSA-65 raw form of a committee-signed
 status list: a signer, a canonical SSZ trust anchor, a canonical SSZ record,
 and a stateless quorum verifier. Local anti-rollback protection is the caller's
-responsibility. The measurement binaries can be run directly; the repository's
-benchmark scripts do not yet include them.
+responsibility. The measurement binaries can be run directly or through
+`benchmark.sh` and `committee-scaling-benchmark.sh`.
 
 ```rust
 use drot_mldsa::status_list::MlDsaStatusList;
@@ -35,7 +35,10 @@ not consume an XMSS leaf or need a slot journal. A status-list signer uses
 Signing a precomputed digest with the generic signer is ordinary ML-DSA over
 those digest bytes, not the standardized HashML-DSA mode. The seed is private
 key material; its durable, access-controlled storage is left to the embedding
-application.
+application. ML-DSA permits a key to sign conflicting statements for the same
+version. This crate authenticates a quorum but does not enforce a
+one-statement-per-version signer policy; deployments that require that property
+must implement it separately.
 
 ## Trust anchor and record
 
@@ -115,13 +118,14 @@ The signer binary measures one member's ML-DSA signing operation per update;
 statement construction, self-verification and key generation are outside its
 `sign_ms` samples. The raw verifier reports `decode_ms` (SSZ plus signature
 decoding), `verify_ms` (bitmap, threshold and cryptographic checks), and
-`total_ms` as the sum of those two timed intervals. File I/O and
+`total_ms` from one continuous interval around decode and verification. File I/O and
 fixture creation are outside every timed verifier sample. `bytes` is the
 complete serialized record; `sig_bytes` is the fixed size of one signature
 (3,309 B), and `signatures_bytes` is the aggregate signature payload `t × 3,309`
 B. Runtime and memory measurements require Linux `/proc/self/status`. These
-binaries emit raw samples; this crate does not produce a combined comparison
-report.
+binaries emit raw samples; `benchmark.sh` and
+`committee-scaling-benchmark.sh` organize comparisons with the XMSS raw and
+XMSS/SNARK paths.
 
 The dependency is pinned to RustCrypto `ml-dsa` 0.1.1 with key zeroization
 enabled. Its maintainers state that this implementation has not been

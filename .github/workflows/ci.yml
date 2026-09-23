@@ -47,11 +47,15 @@ jobs:
         working-directory: demo
         run: cargo fmt --all -- --check
 
+      - name: Check ML-DSA formatting
+        working-directory: mldsa
+        run: cargo fmt --all -- --check
+
       - name: Validate mutation catalogue
         run: tools/mutate.py check
 
       - name: Check benchmark shell syntax
-        run: bash -n benchmark.sh committee-scaling-benchmark.sh
+        run: bash -n benchmark.sh committee-scaling-benchmark.sh demo/docker/demo.sh
 
       - name: Lint
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -60,9 +64,17 @@ jobs:
         working-directory: demo
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      - name: Lint ML-DSA
+        working-directory: mldsa
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
       - name: Test
         run: cargo test --locked
 
       - name: Test demo
         working-directory: demo
+        run: cargo test --locked
+
+      - name: Test ML-DSA
+        working-directory: mldsa
         run: cargo test --locked

@@ -1,0 +1,255 @@
+# ML-DSA demo: ten committee members, threshold 7, one shared storage volume.
+#
+# Every member's address and index select the anchor key used to check its signature.
+#
+# The three demos share the 172.28.0.0/24 subnet, so run one at a time.
+# `demo.sh` tears the other two down before bringing this one up.
+
+name: drot-mldsa
+
+x-node: &node
+  image: drot-demo:latest
+  build:
+    context: ../..
+    dockerfile: demo/docker/Dockerfile
+  restart: "no"
+  environment: &env
+    DEMO_MODE: mldsa
+    RUST_LOG: info
+  volumes:
+    - committee:/shared/committee
+    - storage:/shared/storage
+
+services:
+  bootstrap:
+    <<: *node
+    container_name: drot-mldsa-bootstrap
+    command: ["mldsa-bootstrap"]
+    networks:
+      drot:
+        ipv4_address: 172.28.0.5
+
+  signer-0:
+    <<: *node
+    container_name: drot-mldsa-signer-0
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "0"
+      MEMBER_SECRET: "sky-anvil-quartz"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.11
+
+  signer-1:
+    <<: *node
+    container_name: drot-mldsa-signer-1
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "1"
+      MEMBER_SECRET: "north-ember-lattice"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.12
+
+  signer-2:
+    <<: *node
+    container_name: drot-mldsa-signer-2
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "2"
+      MEMBER_SECRET: "violet-tide-hammer"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.13
+
+  signer-3:
+    <<: *node
+    container_name: drot-mldsa-signer-3
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "3"
+      MEMBER_SECRET: "salt-cinder-rook"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.14
+
+  signer-4:
+    <<: *node
+    container_name: drot-mldsa-signer-4
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "4"
+      MEMBER_SECRET: "green-moss-pillar"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.15
+
+  signer-5:
+    <<: *node
+    container_name: drot-mldsa-signer-5
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "5"
+      MEMBER_SECRET: "amber-storm-relay"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.16
+
+  signer-6:
+    <<: *node
+    container_name: drot-mldsa-signer-6
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "6"
+      MEMBER_SECRET: "iron-willow-crest"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.17
+
+  signer-7:
+    <<: *node
+    container_name: drot-mldsa-signer-7
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "7"
+      MEMBER_SECRET: "slate-harbor-vane"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.18
+
+  signer-8:
+    <<: *node
+    container_name: drot-mldsa-signer-8
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "8"
+      MEMBER_SECRET: "copper-drift-nine"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.19
+
+  signer-9:
+    <<: *node
+    container_name: drot-mldsa-signer-9
+    command: ["mldsa-signer"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      MEMBER_INDEX: "9"
+      MEMBER_SECRET: "umber-flint-sable"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+    networks:
+      drot:
+        ipv4_address: 172.28.0.20
+
+  # Node A remains resident so its durable anti-rollback state and credential
+  # persist across rounds. ML-DSA verification requires no circuit setup.
+  holder:
+    <<: *node
+    container_name: drot-mldsa-holder
+    command: ["mldsa-holder"]
+    depends_on:
+      - bootstrap
+    environment:
+      <<: *env
+      HOLDER_SERVE: "1"
+      HOLDER_STATE_MODE: "${HOLDER_STATE_MODE:-open}"
+    volumes:
+      - committee:/shared/committee
+      - storage:/shared/storage
+      - holder-state:/state
+    networks:
+      drot:
+        ipv4_address: 172.28.0.30
+
+  # Asks node A for one round and prints its verdict. A separate service only
+  # because `docker compose run` would otherwise try to claim node A's address.
+  trigger:
+    <<: *node
+    container_name: drot-mldsa-trigger
+    command: ["mldsa-holder"]
+    profiles: ["tools"]
+    environment:
+      <<: *env
+      HOLDER_TRIGGER: "round"
+    networks:
+      - drot
+
+  # Utility container used by demo.sh to inspect the shared volumes.
+  probe:
+    <<: *node
+    container_name: drot-mldsa-probe
+    entrypoint: ["sh"]
+    command: []
+    profiles: ["tools"]
+    networks:
+      - drot
+
+networks:
+  drot:
+    name: drot-demo-net
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  committee:
+  storage:
+  holder-state:

@@ -116,15 +116,15 @@ fn main() {
     for index in 0..updates {
         let path = directory.join(format!("update-{index:05}.ssz"));
         let bytes = read_bounded(&path, MAX_RECORD_BYTES as u64);
-        let decode_start = Instant::now();
+        let total_start = Instant::now();
         let record = MlDsaStatusList::from_bytes(&bytes).expect("invalid fixture record");
-        let decode_time = decode_start.elapsed();
-        assert_eq!(record.version(), index as u32, "fixture version mismatch");
-        assert_eq!(record.signer_count(), threshold, "fixture quorum mismatch");
+        let decode_time = total_start.elapsed();
         let verify_start = Instant::now();
         let accepted = verifier.verify_status_list(&record);
         let verify_time = verify_start.elapsed();
-        let total_time = decode_time + verify_time;
+        let total_time = total_start.elapsed();
+        assert_eq!(record.version(), index as u32, "fixture version mismatch");
+        assert_eq!(record.signer_count(), threshold, "fixture quorum mismatch");
         assert!(accepted, "honest fixture failed ML-DSA verification");
 
         let rss = support::rss_mb("VmRSS:");
@@ -160,9 +160,11 @@ fn main() {
     println!(
         "MLDSA_RAW_AGG n_members={n} t={threshold} n_updates={} \
          decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
+         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
          verify_med_ms={:.3} verify_mean_ms={:.3} verify_sd_ms={:.3} \
          verify_min_ms={:.3} verify_max_ms={:.3} verify_total_ms={:.3} \
          total_med_ms={:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
+         total_min_ms={:.3} total_max_ms={:.3} total_total_ms={:.3} \
          record_med_bytes={:.3} sig_bytes={SIGNATURE_BYTES} \
          signatures_bytes={} rss_anchor_mb={rss_anchor} \
          rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
@@ -171,6 +173,9 @@ fn main() {
         decode.median,
         decode.mean,
         decode.sd,
+        decode.min,
+        decode.max,
+        decode.total,
         verify.median,
         verify.mean,
         verify.sd,
@@ -180,6 +185,9 @@ fn main() {
         total.median,
         total.mean,
         total.sd,
+        total.min,
+        total.max,
+        total.total,
         size.median,
         threshold * SIGNATURE_BYTES,
         support::rss_mb("VmHWM:")

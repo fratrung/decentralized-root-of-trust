@@ -45,6 +45,20 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
+fn measure_verification(
+    bytes: &[u8],
+    verifier: &VerifierNode,
+) -> (bool, Duration, Duration, Duration) {
+    let total_start = Instant::now();
+    let decoded = StatusList::from_bytes(bytes);
+    let decode_time = total_start.elapsed();
+    let verify_start = Instant::now();
+    let accepted = decoded.is_ok_and(|record| verifier.verify_status_list(&record));
+    let verify_time = verify_start.elapsed();
+    let total_time = total_start.elapsed();
+    (accepted, decode_time, verify_time, total_time)
+}
+
 fn fixture_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("cannot read fixture directory {}: {e}", dir.display()))
@@ -97,6 +111,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         N_UPDATES,
         "fixture must contain exactly N_UPDATES honest records"
     );
+    let mut decode_ms = Vec::with_capacity(updates.len());
+    let mut verify_only_ms = Vec::with_capacity(updates.len());
     let mut verify_ms = Vec::with_capacity(updates.len());
     let mut record_bytes = Vec::with_capacity(updates.len());
     let mut rss_updates_max = rss_after_anchor;
@@ -104,10 +120,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
     for (index, path) in updates.iter().enumerate() {
         let bytes = std::fs::read(path)
             .unwrap_or_else(|e| panic!("cannot read raw fixture {}: {e}", path.display()));
-        let t_verify = Instant::now();
-        let accepted =
-            StatusList::from_bytes(&bytes).is_ok_and(|record| verifier.verify_status_list(&record));
-        let verify_time = t_verify.elapsed();
+        let (accepted, decode_time, verify_only_time, verify_time) =
+            measure_verification(&bytes, &verifier);
         assert!(accepted, "an honest fixture failed raw verification");
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
@@ -122,11 +136,15 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=raw_agg idx={index} verify_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=raw_agg idx={index} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
+                ms(decode_time),
+                ms(verify_only_time),
                 ms(verify_time),
                 bytes.len()
             );
         }
+        decode_ms.push(ms(decode_time));
+        verify_only_ms.push(ms(verify_only_time));
         verify_ms.push(ms(verify_time));
         record_bytes.push(bytes.len());
     }
@@ -170,8 +188,11 @@ fn run_fixture_verifier(fixture_dir: &Path) {
     let outsider_rejected = !verifier.verify_status_list(&outsider);
     let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
 
-    let verify = Series::new(verify_ms);
+    let decode = Series::new(decode_ms);
+    let verify = Series::new(verify_only_ms);
+    let total = Series::new(verify_ms);
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
+    let (total_min, total_med, total_max) = total.min_med_max();
     let record_med = median_usize(&record_bytes);
     let per_signature_us = vf_med * 1000.0 / T as f64;
 
@@ -180,7 +201,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         "forgeries rejected (tampered / relabelled / short / outsider): \
          {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected}"
     );
-    println!("verify min/med/max      : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
+    println!("verify-only min/med/max : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
+    println!("decode+verify min/med/max: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
     println!("published record size (median): {record_med:.1} bytes");
     println!("\nRAM (raw verifier process; no secret keys)");
     println!("after anchor            : {rss_after_anchor} MB");
@@ -190,6 +212,10 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         "\nRAW_AGG n_members={N_MEMBERS} t={T} n_updates={} \
          verify_med_ms={vf_med:.3} verify_mean_ms={:.3} verify_sd_ms={:.3} \
          verify_min_ms={vf_min:.3} verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
+         decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
+         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
+         total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
+         total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
          per_sig_verify_us={per_signature_us:.3} record_med_bytes={record_med:.3} \
          rss_keygen_mb={rss_after_anchor} rss_updates_max_mb={rss_updates_max} \
          peak_rss_mb={} tamper_rejected={} fixture_input=1",
@@ -197,6 +223,15 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         verify.mean(),
         verify.stddev(),
         verify.sum(),
+        decode.median(),
+        decode.mean(),
+        decode.stddev(),
+        decode.min(),
+        decode.max(),
+        decode.sum(),
+        total.mean(),
+        total.stddev(),
+        total.sum(),
         peak_rss_mb(),
         all_rejected as u8,
     );
@@ -273,6 +308,8 @@ fn main() {
     // ---- N_UPDATES updates. For each: t signers sign the (list, version) root,
     //      the signatures plus their bitmap ARE the record, then it is verified. ----
     let mut list: Vec<[u8; 32]> = Vec::new();
+    let mut decode_ms = Vec::new();
+    let mut verify_only_ms = Vec::new();
     let mut verify_ms = Vec::new();
     let mut record_bytes = Vec::new();
     let mut accepted = 0usize;
@@ -308,12 +345,8 @@ fn main() {
         // Verify the way a peer would: decode off the wire, then check against the
         // anchor alone. Decoding is timed with verification because on an
         // untrusted transport it is part of the cost an attacker can force.
-        let t_verify = Instant::now();
-        let ok = match StatusList::from_bytes(&wire) {
-            Ok(sl) => verifier.verify_status_list(&sl),
-            Err(_) => false,
-        };
-        let verify_time = t_verify.elapsed();
+        let (ok, decode_time, verify_only_time, verify_time) =
+            measure_verification(&wire, &verifier);
         assert!(ok, "a legitimate update failed to verify");
         accepted += 1;
 
@@ -331,11 +364,15 @@ fn main() {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=raw_agg idx={i} verify_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=raw_agg idx={i} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
+                ms(decode_time),
+                ms(verify_only_time),
                 ms(verify_time),
                 wire.len()
             );
         }
+        decode_ms.push(ms(decode_time));
+        verify_only_ms.push(ms(verify_only_time));
         verify_ms.push(ms(verify_time));
         record_bytes.push(wire.len());
     }
@@ -419,8 +456,11 @@ fn main() {
     let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
 
     // ---- Summary ----
-    let verify = Series::new(verify_ms);
+    let decode = Series::new(decode_ms);
+    let verify = Series::new(verify_only_ms);
+    let total = Series::new(verify_ms);
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
+    let (total_min, total_med, total_max) = total.min_med_max();
     let record_med = median_usize(&record_bytes);
     // Per-signature figure, derived from the median: what checking one signature
     // costs, which is what makes the number projectable to other values of t.
@@ -434,7 +474,8 @@ fn main() {
     println!("\nkeygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
     println!("slot state ({N_MEMBERS} counters) : {slot_state_time:.2?}   (durable, fsync'd)");
     println!("--- per update (t={T}): min / median / max ---");
-    println!("verify   : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms   (incl. wire decode)");
+    println!("verify-only: {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
+    println!("decode+verify: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
     println!("per signature : verify {per_sig_verify_us:.1} us");
     println!("published record size (median): {record_med:.1} bytes  ({T} signatures + bitmap)");
 
@@ -454,6 +495,10 @@ fn main() {
          verify_med_ms={vf_med:.3} \
          verify_mean_ms={:.3} verify_sd_ms={:.3} verify_min_ms={vf_min:.3} \
          verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
+         decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
+         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
+         total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
+         total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
          per_sig_verify_us={per_sig_verify_us:.3} \
          record_med_bytes={record_med:.3} rss_keygen_mb={rss_after_keygen} \
          rss_updates_max_mb={rss_updates_max} peak_rss_mb={} tamper_rejected={}",
@@ -463,6 +508,15 @@ fn main() {
         verify.mean(),
         verify.stddev(),
         verify.sum(),
+        decode.median(),
+        decode.mean(),
+        decode.stddev(),
+        decode.min(),
+        decode.max(),
+        decode.sum(),
+        total.mean(),
+        total.stddev(),
+        total.sum(),
         peak_rss_mb(),
         // Must be an integer: benchmark.sh's failure gate tests this field against
         // "1", and a Rust bool would print "true" and score every run as a

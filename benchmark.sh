@@ -5,10 +5,15 @@
 # actually run it. No target is ever charged for another role's work:
 #   signer    ONE committee member, one signature + one durable slot burn per
 #             round                                 (src/bin/signer.rs)
+#   mldsa_signer
+#             ONE ML-DSA member, one randomized stateless signature per round
+#                                                   (mldsa/src/bin/mldsa_signer.rs)
 #   prover    the aggregator: N updates, prove only (src/bin/prover.rs)
 #   verifier  a relying party: verifies a FIXED artifact corpus
 #                                                   (src/bin/verifier.rs)
-# plus the baseline the SNARK has to beat:
+# plus the raw alternatives:
+#   mldsa_raw_agg
+#             decode + verify an ML-DSA StatusList (mldsa/src/bin/mldsa_raw_agg.rs)
 #   raw_agg   crude multisig, NO SNARK              (src/bin/raw_agg.rs)
 #             verify scales with t, unlike the constant-time SNARK verify, and
 #             record_size is the complete StatusList on the wire
@@ -18,9 +23,9 @@
 # deploys. It stays available as `TARGETS="... combined"` when an independent
 # second reading of prove time is wanted — that is what it is for.
 #
-# Only `signer` reports a `sign` row, and that is the point. In production nobody
-# produces t signatures: each member signs ONCE per round on its own machine and
-# broadcasts, and the aggregator receives t signatures and produces none. A `sign`
+# Only the two signer targets report a `sign` row. In production nobody produces
+# t signatures: each member signs ONCE per round on its own machine and broadcasts,
+# and the aggregator receives t signatures and produces none. A `sign`
 # figure taken from a process that signs t times is the summed work of t machines
 # billed to one, and describes no process that exists. By default a separate,
 # unmeasured fixture process creates the signed inputs once; the measured prover
@@ -35,7 +40,7 @@
 #   summary.csv  aggregate statistics, machine-readable
 #   summary.txt  the same table, human-readable
 #   drift.csv    early/late regime diagnostic; observations are never removed
-#   source.patch / source-status.txt  exact dirty-tree disclosure, when present
+#   source.patch / source-status.txt  tracked diff and dirty paths; untracked contents omitted
 #
 # The unit of analysis for per-update metrics is the PER-RUN MEDIAN (n = RUNS),
 # not the pooled sample: updates within one process share allocator and cache
@@ -69,11 +74,12 @@ export LC_ALL=C
 cd "$(dirname "${BASH_SOURCE[0]}")"
 REPO="$PWD"
 
-RUNS="${RUNS:-20}"
+RUNS="${RUNS:-24}"
 WARMUP="${WARMUP:-2}"
-TARGETS="${TARGETS:-signer prover verifier raw_agg}"
+TARGETS="${TARGETS:-signer mldsa_signer prover verifier raw_agg mldsa_raw_agg}"
 OUTDIR="${OUTDIR:-bench-$(date +%Y%m%d-%H%M%S)}"
 BENCH_INPUT_DIR="${BENCH_INPUT_DIR:-}"
+MLDSA_INPUT_DIR="${MLDSA_INPUT_DIR:-}"
 BENCH_SELF_CONTAINED="${BENCH_SELF_CONTAINED:-0}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-2}"
 
@@ -83,6 +89,7 @@ COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-2}"
 # recompiles this crate (not the pinned leanVM tree) when either value changes.
 DEFAULT_N="$(sed -n 's/^pub const DEFAULT_N_MEMBERS: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
 DEFAULT_T="$(sed -n 's/^pub const DEFAULT_T: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+BENCH_UPDATES="$(sed -n 's/^pub const N_UPDATES: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
 if { [ -n "${DROT_BENCH_N:-}" ] && [ -z "${DROT_BENCH_T:-}" ]; } ||
    { [ -z "${DROT_BENCH_N:-}" ] && [ -n "${DROT_BENCH_T:-}" ]; }; then
   echo "DROT_BENCH_N and DROT_BENCH_T must be set together" >&2
@@ -102,6 +109,10 @@ if [ "$BENCH_N" -gt 2048 ]; then
 fi
 if [ -n "$BENCH_INPUT_DIR" ] && [ ! -d "$BENCH_INPUT_DIR" ]; then
   echo "BENCH_INPUT_DIR is not a directory: $BENCH_INPUT_DIR" >&2
+  exit 1
+fi
+if [ -n "$MLDSA_INPUT_DIR" ] && [ ! -d "$MLDSA_INPUT_DIR" ]; then
+  echo "MLDSA_INPUT_DIR is not a directory: $MLDSA_INPUT_DIR" >&2
   exit 1
 fi
 
@@ -139,8 +150,14 @@ PIN_CPUS="${PIN_CPUS:-}"
 read -r -a TARGET_LIST <<<"$TARGETS"
 [ "${#TARGET_LIST[@]}" -gt 0 ] || { echo "TARGETS must not be empty" >&2; exit 1; }
 declare -A SEEN_TARGETS=()
+NEED_ROOT=0
+NEED_MLDSA=0
 for target in "${TARGET_LIST[@]}"; do
-  case "$target" in signer|prover|verifier|raw_agg|combined) ;; *) echo "unknown target: $target" >&2; exit 1 ;; esac
+  case "$target" in
+    signer|prover|verifier|raw_agg|combined) NEED_ROOT=1 ;;
+    mldsa_signer|mldsa_raw_agg) NEED_MLDSA=1 ;;
+    *) echo "unknown target: $target" >&2; exit 1 ;;
+  esac
   [ -z "${SEEN_TARGETS[$target]:-}" ] || { echo "duplicate target: $target" >&2; exit 1; }
   SEEN_TARGETS[$target]=1
 done
@@ -188,6 +205,9 @@ if [ "$STRICT_ENV" = 1 ]; then
   [ "$GOVERNORS" = performance ] || { echo "STRICT: every target CPU governor must be 'performance', got '$GOVERNORS'" >&2; fatal=1; }
   [ -n "$TIME_BIN" ]             || { echo "STRICT: /usr/bin/time -v required for the RSS cross-check" >&2; fatal=1; }
   [ -f Cargo.lock ]               || { echo "STRICT: Cargo.lock required for a reproducible dependency set" >&2; fatal=1; }
+  if [ "$NEED_MLDSA" = 1 ]; then
+    [ -f mldsa/Cargo.lock ] || { echo "STRICT: mldsa/Cargo.lock required for reproducible ML-DSA binaries" >&2; fatal=1; }
+  fi
   [ "$REQUIRE_CLEAN_TREE" = 0 ] || [ "$GIT_DIRTY" = no ] || {
     echo "STRICT: the Git working tree is dirty; commit the benchmark candidate first" >&2
     fatal=1
@@ -196,6 +216,7 @@ if [ "$STRICT_ENV" = 1 ]; then
 fi
 
 BIN_DIR="$REPO/target/release"
+MLDSA_BIN_DIR="$REPO/mldsa/target/release"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
@@ -216,10 +237,18 @@ SOURCE_PATCH_SHA256="$(sha256sum "$SOURCE_PATCH" 2>/dev/null | awk '{print $1}')
 
 # ---------------------------------------------------------------- build ----
 echo "building --release ..."
-cargo build --release --locked >/dev/null 2>&1
-for b in signer prover verifier decentralized-root-of-trust raw_agg committee_fixture; do
-  [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
-done
+if [ "$NEED_ROOT" = 1 ]; then
+  cargo build --release --locked >/dev/null 2>&1
+  for b in signer prover verifier decentralized-root-of-trust raw_agg committee_fixture; do
+    [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
+  done
+fi
+if [ "$NEED_MLDSA" = 1 ]; then
+  cargo build --manifest-path mldsa/Cargo.toml --release --locked >/dev/null 2>&1
+  for b in mldsa_signer mldsa_raw_agg mldsa_fixture; do
+    [ -x "$MLDSA_BIN_DIR/$b" ] || { echo "missing binary: $MLDSA_BIN_DIR/$b"; exit 1; }
+  done
+fi
 
 AUTO_FIXTURE=0
 if [ "$BENCH_SELF_CONTAINED" = 0 ] && [ -z "$BENCH_INPUT_DIR" ]; then
@@ -233,12 +262,23 @@ if [ "$BENCH_SELF_CONTAINED" = 0 ] && [ -z "$BENCH_INPUT_DIR" ]; then
     esac
   done
 fi
+AUTO_MLDSA_FIXTURE=0
+if [ -n "${SEEN_TARGETS[mldsa_raw_agg]:-}" ] && [ -z "$MLDSA_INPUT_DIR" ]; then
+  MLDSA_INPUT_DIR="$SCRATCH/mldsa-fixture"
+  AUTO_MLDSA_FIXTURE=1
+fi
+
 if [ -n "$BENCH_INPUT_DIR" ]; then
   INPUT_MODE=fixture
 elif [ "$BENCH_SELF_CONTAINED" = 1 ]; then
   INPUT_MODE=self-contained
 else
   INPUT_MODE=target-native
+fi
+if [ -n "$MLDSA_INPUT_DIR" ]; then
+  MLDSA_INPUT_MODE=fixture
+else
+  MLDSA_INPUT_MODE=not-selected
 fi
 
 # ------------------------------------------------------ environment ----
@@ -322,11 +362,13 @@ temp_now_c() {
   echo "source patch     : $(basename "$SOURCE_PATCH")"
   echo "leanVM rev       : $(sed -n 's/.*leanEthereum\/leanVM.git", rev = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
   echo "Cargo.lock       : $(test -f Cargo.lock && echo present || echo MISSING)"
+  echo "ML-DSA Cargo.lock: $(test -f mldsa/Cargo.lock && echo present || echo MISSING)"
   echo
   echo "## Parameters (src/params.rs)"
   grep -E '^pub const' src/params.rs | sed 's/^/  /'
   echo "  resolved N_MEMBERS = $BENCH_N"
   echo "  resolved T         = $BENCH_T"
+  echo "  resolved N_UPDATES = $BENCH_UPDATES"
   echo
   echo "## Benchmark configuration"
   echo "runs (default)   : $RUNS measured, $WARMUP warmup(s) discarded"
@@ -337,8 +379,10 @@ temp_now_c() {
   done
   echo "targets          : $TARGETS"
   echo "committee        : N=$BENCH_N t=$BENCH_T"
-  echo "signed inputs    : ${BENCH_INPUT_DIR:-generated inside each target}"
-  echo "input mode       : $INPUT_MODE"
+  echo "XMSS inputs      : ${BENCH_INPUT_DIR:-generated inside each target}"
+  echo "XMSS input mode  : $INPUT_MODE"
+  echo "ML-DSA inputs    : ${MLDSA_INPUT_DIR:-<target not selected>}"
+  echo "ML-DSA input mode: $MLDSA_INPUT_MODE"
   echo "cooldown         : ${COOLDOWN_SECONDS}s before every target process"
   echo "kernel RSS probe : ${TIME_BIN:-unavailable (self-reported VmHWM only)}"
   echo
@@ -362,7 +406,8 @@ echo "cooldown  : ${COOLDOWN_SECONDS}s before each target process"
 [ "$gov" = performance ] || echo "WARNING   : target CPU governors '$gov' are not uniformly performance -> inflated variance"
 [ -n "$TIME_BIN" ] || echo "WARNING   : /usr/bin/time absent -> no independent kernel RSS cross-check"
 [ -f Cargo.lock ] || echo "WARNING   : Cargo.lock missing -> dependency resolution is not reproducible"
-[ "$GIT_DIRTY" = no ] || echo "WARNING   : dirty source tree; source.patch is required to reconstruct this run"
+[ "$NEED_MLDSA" = 0 ] || [ -f mldsa/Cargo.lock ] || echo "WARNING   : mldsa/Cargo.lock missing -> ML-DSA dependency resolution is not reproducible"
+[ "$GIT_DIRTY" = no ] || echo "WARNING   : dirty source tree; source.patch omits untracked contents, so this run may not be reconstructible"
 echo
 
 # The default workload separates the roles faithfully: one unmeasured process
@@ -375,6 +420,18 @@ if [ "$AUTO_FIXTURE" = 1 ]; then
   "$BIN_DIR/committee_fixture" "$BENCH_INPUT_DIR" >/dev/null
   echo "  raw StatusList inputs: $BENCH_INPUT_DIR"
   echo
+fi
+if [ "$AUTO_MLDSA_FIXTURE" = 1 ]; then
+  echo "generating one unmeasured ML-DSA committee fixture ..."
+  "$MLDSA_BIN_DIR/mldsa_fixture" "$MLDSA_INPUT_DIR" "$BENCH_N" "$BENCH_T" "$BENCH_UPDATES" >/dev/null
+  echo "  ML-DSA StatusList inputs: $MLDSA_INPUT_DIR"
+  echo
+fi
+if [ -n "${SEEN_TARGETS[mldsa_raw_agg]:-}" ] &&
+   ! printf 'N=%s\nt=%s\nupdates=%s\n' "$BENCH_N" "$BENCH_T" "$BENCH_UPDATES" |
+     cmp -s - "$MLDSA_INPUT_DIR/manifest.txt"; then
+  echo "ML-DSA fixture does not match requested N=$BENCH_N t=$BENCH_T updates=$BENCH_UPDATES" >&2
+  exit 1
 fi
 
 # ----------------------------------------------------- fixed corpus ----
@@ -415,7 +472,7 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
 # the fixed-cost columns comparable across targets: `raw_agg` leaves `setup_ms`
 # empty because it has no circuit, which is the result, rather than borrowing the
 # column for its keygen and making the SNARK look like the cheaper setup.
-echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures,load1_start,load1_end,freq_start_mhz,freq_end_mhz,temp_start_c,temp_end_c' > "$RUNS_CSV"
+echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures,load1_start,load1_end,freq_start_mhz,freq_end_mhz,temp_start_c,temp_end_c,decode_med_ms,decode_mean_ms,decode_sd_ms,decode_min_ms,decode_max_ms,decode_total_ms,decode_verify_med_ms,decode_verify_mean_ms,decode_verify_sd_ms,decode_verify_min_ms,decode_verify_max_ms,decode_verify_total_ms,slot_burn_med_ms,slot_burn_total_ms,sign_crypto_med_ms,sign_crypto_total_ms' > "$RUNS_CSV"
 
 # Column indices into runs.csv, named once. Every awk gate and every summary row
 # below addresses columns through these, so inserting a column is one edit here
@@ -427,6 +484,9 @@ C_PROVE_MED=14;  C_PROVE_TOT=19
 C_VERIFY_MED=20; C_VERIFY_TOT=25
 C_ARTIFACT=26;   C_RSS_SETUP=27;  C_RSS_MAX=28
 C_PEAK=29;       C_KERNEL=30;     C_FAIL=31
+C_DECODE_MED=38; C_DECODE_TOT=43
+C_DECODE_VERIFY_MED=44; C_DECODE_VERIFY_TOT=49
+C_SLOT_BURN_MED=50; C_SIGN_CRYPTO_MED=52
 
 RUN_T_START=""
 RUN_LOAD_START=""; RUN_LOAD_END=""
@@ -438,6 +498,7 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
   local -a cmd
   case "$target" in
     signer)   cmd=("$BIN_DIR/signer") ;;
+    mldsa_signer) cmd=("$MLDSA_BIN_DIR/mldsa_signer" "$BENCH_UPDATES") ;;
     prover)
       rm -rf "$SCRATCH/pout"
       if [ -n "$BENCH_INPUT_DIR" ]; then
@@ -449,6 +510,7 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
     verifier) cmd=("$BIN_DIR/verifier" "$CORPUS") ;;
     combined) cmd=("$BIN_DIR/decentralized-root-of-trust") ;;
     raw_agg)  cmd=("$BIN_DIR/raw_agg") ;;
+    mldsa_raw_agg) cmd=("$MLDSA_BIN_DIR/mldsa_raw_agg" "$MLDSA_INPUT_DIR" "$BENCH_UPDATES") ;;
     *) echo "unknown target: $target" >&2; exit 1 ;;
   esac
   # Pinning wraps the binary, not the harness: leanVM reads the affinity mask once
@@ -477,6 +539,8 @@ emit_run_row() { # $1 target  $2 run index
   local target="$1" run="$2" kmax; kmax="$(kernel_maxrss_mb)"
   local tag
   case "$target" in
+    mldsa_signer) tag='^MLDSA_SIGNER ' ;;
+    mldsa_raw_agg) tag='^MLDSA_RAW_AGG ' ;;
     signer) tag='^SIGNER ' ;; prover) tag='^PROVER ' ;; verifier) tag='^VERIFIER ' ;;
     combined) tag='^BENCH ' ;; raw_agg) tag='^RAW_AGG ' ;;
   esac
@@ -494,6 +558,9 @@ emit_run_row() { # $1 target  $2 run index
     sg_med=""; sg_mean=""; sg_sd=""; sg_lo=""; sg_hi=""; sg_tot=""
     pv_med=""; pv_mean=""; pv_sd=""; pv_lo=""; pv_hi=""; pv_tot=""
     vf_med=""; vf_mean=""; vf_sd=""; vf_lo=""; vf_hi=""; vf_tot=""
+    dc_med=""; dc_mean=""; dc_sd=""; dc_lo=""; dc_hi=""; dc_tot=""
+    dv_med=""; dv_mean=""; dv_sd=""; dv_lo=""; dv_hi=""; dv_tot=""
+    rb_med=""; rb_tot=""; cr_med=""; cr_tot=""
     if (t=="signer") {
       # The only target that reports `sign`, and the only one whose keygen and
       # slot state are ONE key and ONE counter rather than the whole committee.
@@ -502,8 +569,18 @@ emit_run_row() { # $1 target  $2 run index
       keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_rounds"]
       sg_med=v["sign_med_ms"]; sg_mean=v["sign_mean_ms"]; sg_sd=v["sign_sd_ms"]
       sg_lo=v["sign_min_ms"]; sg_hi=v["sign_max_ms"]; sg_tot=v["sign_total_ms"]
+      rb_med=v["reserve_med_ms"]; rb_tot=v["reserve_total_ms"]
+      cr_med=v["crypto_med_ms"]; cr_tot=v["crypto_total_ms"]
       pb=v["sig_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_rounds_max_mb"]; pk=v["peak_rss_mb"]
       # Every round self-verifies; a missing key means the run told us nothing.
+      f=(v["failures"]=="")?1:v["failures"]
+    } else if (t=="mldsa_signer") {
+      # ML-DSA is stateless: there is one key but no durable slot counter.
+      keygen=v["keygen_ms"]; n=v["n_rounds"]
+      sg_med=v["sign_med_ms"]; sg_mean=v["sign_mean_ms"]; sg_sd=v["sign_sd_ms"]
+      sg_lo=v["sign_min_ms"]; sg_hi=v["sign_max_ms"]; sg_tot=v["sign_total_ms"]
+      cr_med=sg_med; cr_tot=sg_tot
+      pb=v["sig_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_rounds_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["failures"]=="")?1:v["failures"]
     } else if (t=="prover") {
       # Aggregator. It signs to have something to aggregate, but does not time it:
@@ -517,6 +594,10 @@ emit_run_row() { # $1 target  $2 run index
       setup=v["setup_ms"]; n=v["n_verified"]
       vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
       vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
+      dc_med=v["decode_med_ms"]; dc_mean=v["decode_mean_ms"]; dc_sd=v["decode_sd_ms"]
+      dc_lo=v["decode_min_ms"]; dc_hi=v["decode_max_ms"]; dc_tot=v["decode_total_ms"]
+      dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
+      dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
       # An absent `failures=` key yields "", which awk would later coerce to 0 —
       # a silent pass for the one target that reports real accept/reject verdicts.
       # Missing means "this run told us nothing", which is a failure, not a zero.
@@ -532,7 +613,23 @@ emit_run_row() { # $1 target  $2 run index
       keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_updates"]
       vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
       vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
+      dc_med=v["decode_med_ms"]; dc_mean=v["decode_mean_ms"]; dc_sd=v["decode_sd_ms"]
+      dc_lo=v["decode_min_ms"]; dc_hi=v["decode_max_ms"]; dc_tot=v["decode_total_ms"]
+      dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
+      dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
       pb=v["record_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+      f=(v["tamper_rejected"]=="1")?0:1
+    } else if (t=="mldsa_raw_agg") {
+      # Fixture I/O is outside all timed regions. Decode, cryptographic verify,
+      # and their contiguous per-record total stay distinct throughout the output schema.
+      n=v["n_updates"]
+      dc_med=v["decode_med_ms"]; dc_mean=v["decode_mean_ms"]; dc_sd=v["decode_sd_ms"]
+      dc_lo=v["decode_min_ms"]; dc_hi=v["decode_max_ms"]; dc_tot=v["decode_total_ms"]
+      vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
+      vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
+      dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
+      dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
+      pb=v["record_med_bytes"]; rs=v["rss_anchor_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["tamper_rejected"]=="1")?0:1
     } else {
       # `updates_total_ms` is the whole loop (sign + prove + verify + printing);
@@ -546,12 +643,15 @@ emit_run_row() { # $1 target  $2 run index
       pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
       f=(v["sec_ok"]=="1")?0:1
     }
-    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
       t,r,ts,setup,keygen,slotstate,n,
       sg_med,sg_mean,sg_sd,sg_lo,sg_hi,sg_tot,
       pv_med,pv_mean,pv_sd,pv_lo,pv_hi,pv_tot,
       vf_med,vf_mean,vf_sd,vf_lo,vf_hi,vf_tot,
-      pb,rs,rm,pk,k,f,ls,le,fs,fe,cs,ce
+      pb,rs,rm,pk,k,f,ls,le,fs,fe,cs,ce,
+      dc_med,dc_mean,dc_sd,dc_lo,dc_hi,dc_tot,
+      dv_med,dv_mean,dv_sd,dv_lo,dv_hi,dv_tot,
+      rb_med,rb_tot,cr_med,cr_tot
   }' <<<"$line" >> "$RUNS_CSV"
 
   # Raw per-update samples.
@@ -559,13 +659,25 @@ emit_run_row() { # $1 target  $2 run index
     /^SAMPLE / {
       delete v; for (i=2;i<=NF;i++){ split($i,kv,"="); v[kv[1]]=kv[2] }
       if (v["target"]=="signer") {
-        printf "%s,%d,%s,sign,%s,%s,%s\n",   t,r,v["idx"],v["sign_ms"],  v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,sign_protocol,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,slot_burn,%s,%s,%s\n", t,r,v["idx"],v["reserve_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["crypto_ms"],v["bytes"],v["rss_mb"]
+      } else if (v["target"]=="mldsa_signer") {
+        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["sig_bytes"],v["rss_mb"]
       } else if (v["target"]=="prover") {
         printf "%s,%d,%s,prove,%s,%s,%s\n",  t,r,v["idx"],v["prove_ms"], v["bytes"],v["rss_mb"]
       } else if (v["target"]=="verifier") {
+        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
         printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
       } else if (v["target"]=="raw_agg") {
+        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
         printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
+      } else if (v["target"]=="mldsa_raw_agg") {
+        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
       }
     }' "$SCRATCH/out.txt" >> "$SAMPLES"
 }
@@ -627,7 +739,7 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
     echo
     echo "ABORT: $target run $((i - tw)) reported a security-expectation failure" >&2
     echo "(or an unparseable failure count). Numbers withheld." >&2
-    grep -E '^(SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
+    grep -E '^(SIGNER|MLDSA_SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG|MLDSA_RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
     exit 1
   fi
   if [ "$(count_bad_item_counts)" -gt 0 ]; then
@@ -635,7 +747,13 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
     echo "ABORT: $target run $((i - tw)) measured 0 items, or a different number of" >&2
     echo "items than earlier runs of the same target. A per-run median is only" >&2
     echo "meaningful over a fixed workload. Numbers withheld." >&2
-    grep -E '^(SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
+    grep -E '^(SIGNER|MLDSA_SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG|MLDSA_RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
+    exit 1
+  fi
+  if ! awk -F, -v targets="$target" -v expected_runs="$((i - tw))" \
+      -v expected_items="$BENCH_UPDATES" -v allow_extra=1 \
+      -f tools/validate_benchmark_csv.awk "$RUNS_CSV" "$SAMPLES"; then
+    echo "ABORT: $target run $((i - tw)) has incomplete or malformed measurements" >&2
     exit 1
   fi
 }
@@ -715,6 +833,17 @@ else
   done
 fi
 
+# Validate every target and every expected sample before aggregating statistics.
+# Standalone runs may intentionally use different RUNS_<target> counts.
+run_counts=""
+for target in "${TARGET_LIST[@]}"; do
+  runs_var="RUNS_$target"
+  run_counts+="${run_counts:+ }$target:${!runs_var:-$RUNS}"
+done
+awk -F, -v targets="$TARGETS" -v run_counts="$run_counts" -v expected_runs="$RUNS" \
+    -v expected_items="$BENCH_UPDATES" -f tools/validate_benchmark_csv.awk \
+    "$RUNS_CSV" "$SAMPLES" || { echo "ABORT: incomplete campaign; numbers withheld" >&2; exit 1; }
+
 # ---------------------------------------------------------- aggregate ----
 # Descriptive stats on stdin (one number per line):
 #   n min q1 median q3 max mean sd cv% ci95_halfwidth
@@ -758,16 +887,27 @@ for target in "${TARGET_LIST[@]}"; do
   emit "$target" setup            ms    "$C_SETUP"
   emit "$target" keygen           ms    "$C_KEYGEN"
   emit "$target" slot_state       ms    "$C_SLOTSTATE"
-  emit "$target" sign_per_item    ms    "$C_SIGN_MED"
-  emit "$target" sign_total       ms    "$C_SIGN_TOT"
+  if [ "$target" = signer ]; then
+    emit "$target" sign_protocol_per_item ms "$C_SIGN_MED"
+    emit "$target" sign_protocol_total ms "$C_SIGN_TOT"
+    emit "$target" slot_burn_per_item ms "$C_SLOT_BURN_MED"
+    emit "$target" sign_crypto_per_item ms "$C_SIGN_CRYPTO_MED"
+  elif [ "$target" = mldsa_signer ]; then
+    emit "$target" sign_crypto_per_item ms "$C_SIGN_MED"
+    emit "$target" sign_crypto_total ms "$C_SIGN_TOT"
+  fi
   emit "$target" prove_per_item   ms    "$C_PROVE_MED"
   emit "$target" prove_total      ms    "$C_PROVE_TOT"
   emit "$target" verify_per_item  ms    "$C_VERIFY_MED"
   emit "$target" verify_total     ms    "$C_VERIFY_TOT"
+  emit "$target" decode_per_item  ms    "$C_DECODE_MED"
+  emit "$target" decode_total     ms    "$C_DECODE_TOT"
+  emit "$target" decode_verify_per_item ms "$C_DECODE_VERIFY_MED"
+  emit "$target" decode_verify_total ms  "$C_DECODE_VERIFY_TOT"
   case "$target" in
-    signer)   emit "$target" signature_size bytes "$C_ARTIFACT" ;;
+    signer|mldsa_signer) emit "$target" signature_size bytes "$C_ARTIFACT" ;;
     prover)   emit "$target" record_size    bytes "$C_ARTIFACT" ;;
-    raw_agg)  emit "$target" record_size    bytes "$C_ARTIFACT" ;;
+    raw_agg|mldsa_raw_agg) emit "$target" record_size bytes "$C_ARTIFACT" ;;
     combined) emit "$target" proof_size     bytes "$C_ARTIFACT" ;;
   esac
   emit "$target" rss_after_setup  MB    "$C_RSS_SETUP"
@@ -798,9 +938,13 @@ drift_metric() { # target metric column
 }
 for target in "${TARGET_LIST[@]}"; do
   case "$target" in
-    signer) drift_metric "$target" sign_per_item "$C_SIGN_MED" ;;
+    signer) drift_metric "$target" sign_protocol_per_item "$C_SIGN_MED" ;;
+    mldsa_signer) drift_metric "$target" sign_crypto_per_item "$C_SIGN_MED" ;;
     prover) drift_metric "$target" prove_per_item "$C_PROVE_MED" ;;
-    verifier|raw_agg) drift_metric "$target" verify_per_item "$C_VERIFY_MED" ;;
+    verifier|raw_agg) drift_metric "$target" decode_verify_per_item "$C_DECODE_VERIFY_MED" ;;
+    mldsa_raw_agg)
+      drift_metric "$target" decode_verify_per_item "$C_DECODE_VERIFY_MED"
+      ;;
     combined)
       drift_metric "$target" prove_per_item "$C_PROVE_MED"
       drift_metric "$target" verify_per_item "$C_VERIFY_MED"
@@ -814,27 +958,44 @@ label() {
   case "$1:$2" in
     signer:keygen)           echo "keygen (1 key, once)" ;;
     signer:slot_state)       echo "slot state (1 counter)" ;;
-    signer:sign_per_item)    echo "sign / round (1 member)" ;;
-    signer:sign_total)       echo "sign total / run" ;;
-    signer:signature_size)   echo "signature size" ;;
-    raw_agg:verify_per_item) echo "verify / update (raw)" ;;
-    raw_agg:record_size)     echo "StatusList size" ;;
+    signer:sign_protocol_per_item) echo "XMSS protocol sign / round" ;;
+    signer:slot_burn_per_item) echo "XMSS durable slot burn" ;;
+    signer:sign_crypto_per_item) echo "XMSS crypto sign / round" ;;
+    mldsa_signer:keygen)     echo "keygen ML-DSA (1 key)" ;;
+    mldsa_signer:sign_crypto_per_item) echo "ML-DSA crypto sign / round" ;;
+    signer:sign_protocol_total) echo "XMSS protocol sign total" ;;
+    mldsa_signer:sign_crypto_total) echo "ML-DSA crypto sign total" ;;
+    signer:signature_size)   echo "XMSS signature size" ;;
+    mldsa_signer:signature_size) echo "ML-DSA signature size" ;;
+    raw_agg:verify_per_item) echo "verify-only XMSS / update" ;;
+    raw_agg:decode_per_item) echo "decode XMSS / update" ;;
+    raw_agg:decode_verify_per_item) echo "XMSS decode + verify" ;;
+    verifier:verify_per_item) echo "SNARK verify-only / update" ;;
+    verifier:decode_per_item) echo "SNARK decode / update" ;;
+    verifier:decode_verify_per_item) echo "SNARK decode + verify" ;;
+    mldsa_raw_agg:verify_per_item) echo "verify-only ML-DSA" ;;
+    mldsa_raw_agg:decode_per_item) echo "decode ML-DSA / update" ;;
+    mldsa_raw_agg:decode_verify_per_item) echo "decode + verify ML-DSA" ;;
+    raw_agg:record_size)     echo "XMSS StatusList size" ;;
+    mldsa_raw_agg:record_size) echo "ML-DSA StatusList size" ;;
     prover:record_size)      echo "SnarkStatusList size" ;;
     *:setup)                 echo "setup (circuit, once)" ;;
     *:keygen)                echo "keygen (N keys, once)" ;;
     *:slot_state)            echo "slot state (counters)" ;;
-    *:sign_per_item)         echo "sign / round" ;;
-    *:sign_total)            echo "sign total / run" ;;
     *:prove_per_item)        echo "prove / update" ;;
     *:prove_total)           echo "prove total / run" ;;
     *:verify_per_item)       echo "verify / update" ;;
     *:verify_total)          echo "verify total / run" ;;
+    *:decode_total)          echo "decode total / run" ;;
+    *:decode_verify_total)   echo "decode + verify total" ;;
     *:proof_size)            echo "proof size" ;;
     # RSS is expanded once, in the header legend above; these four then use the
     # acronym alone, which is what keeps the varying part of each label visible.
     # The first one is named after whatever fixed cost the target actually paid:
     # signer and raw_agg build no circuit, so for them the column is post-keygen.
     signer:rss_after_setup)  echo "RSS after keygen" ;;
+    mldsa_signer:rss_after_setup) echo "RSS after keygen" ;;
+    mldsa_raw_agg:rss_after_setup) echo "RSS after anchor" ;;
     raw_agg:rss_after_setup)
       [ -n "$BENCH_INPUT_DIR" ] && echo "RSS after anchor" || echo "RSS after keygen"
       ;;
@@ -853,7 +1014,8 @@ label() {
   echo "governor  : $gov"
   echo "threads   : $EFFECTIVE_THREADS${PIN_CPUS:+ (pinned to $PIN_CPUS)}"
   echo "committee : N=$BENCH_N, t=$BENCH_T"
-  echo "input     : $INPUT_MODE"
+  echo "XMSS input: $INPUT_MODE"
+  echo "MLDSA input: $MLDSA_INPUT_MODE"
   echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'Williams-style balanced across targets' || echo 'contiguous blocks per target')"
   echo "cooldown  : ${COOLDOWN_SECONDS}s before each target process"
   echo "runs      : n=$RUNS measured, $WARMUP warmup(s) discarded (default;"
@@ -951,8 +1113,8 @@ label() {
   echo "    highest readable host temperature before and after every process. Empty"
   echo "    telemetry fields mean the kernel exposed no portable sensor. drift.csv"
   echo "    flags >15% early/late shifts but never removes observations."
-  [ "$GIT_DIRTY" = no ] || echo "  * The tree was dirty. source.patch and source-status.txt are part of the result;"
-  [ "$GIT_DIRTY" = no ] || echo "    without them the commit id does not reconstruct the measured source."
+  [ "$GIT_DIRTY" = no ] || echo "  * The tree was dirty. source.patch records tracked changes only; untracked"
+  [ "$GIT_DIRTY" = no ] || echo "    contents are omitted, so this run may not be exactly reconstructible."
   echo "  * A prover process calls zk_alloc::enable_arena(), which sets"
   echo "    M_TRIM_THRESHOLD=-1: its RSS never decreases, so 'peak' means"
   echo "    'high-water mark of a monotonic curve'. A verify-only process keeps"
@@ -971,8 +1133,12 @@ label() {
     echo "    so the SNARK's extra fixed cost is the setup row alone, and raw_agg has no"
     echo "    setup row. Comparing raw keygen with SNARK setup inverts the answer."
   else
-    echo "    No fixture-capable target was selected; signer and combined use their"
-    echo "    native process shape."
+    echo "    No XMSS fixture-capable target was selected; XMSS signer and combined"
+    echo "    use their native process shape."
+  fi
+  if [ "$MLDSA_INPUT_MODE" = fixture ]; then
+    echo "  * ML-DSA key generation and quorum signing ran in a separate fixture"
+    echo "    process. mldsa_raw_agg measures only record decode and verification."
   fi
   echo "  * Per-update samples within a run are not independent (shared allocator"
   echo "    and cache state). The table's unit is the per-run median; samples.csv"
@@ -985,9 +1151,11 @@ label() {
   echo "    total != n x per-update whenever the phase is skewed. Signing is: it"
   echo "    has stragglers several times the median, and its total runs visibly"
   echo "    above n x median. Verification is near-deterministic and does match."
-  echo "  * Exactly one target reports 'sign': signer, which measures ONE member"
-  echo "    doing ONE signature per round, preceded by its durable slot burn (write"
-  echo "    the inactive journal generation + sync_data) through SignerNode."
+  echo "  * Each signer target measures ONE member doing ONE signature per round."
+  echo "    XMSS includes its durable slot burn (inactive journal generation plus"
+  echo "    sync_data) through SignerNode. ML-DSA is stateless and randomized, so"
+  echo "    it has no slot counter or persistence cost. Its crypto-sign row is not"
+  echo "    a complete signer protocol cost: one-statement-per-version state is absent."
   if [ "$INPUT_MODE" = fixture ]; then
     echo "    The measured prover/raw verifier receive t signatures prepared by the"
     echo "    fixture process; neither produces signatures or holds secret keys."
@@ -997,7 +1165,8 @@ label() {
   else
     echo "    No measured aggregator or raw verifier was selected in this campaign."
   fi
-  echo "  * signer's keygen and slot-state rows are for ONE key and ONE counter."
+  echo "  * Each keygen row is for ONE key. Only the XMSS signer has a slot-state"
+  echo "    row, for ONE durable counter."
   if [ "$INPUT_MODE" = fixture ]; then
     echo "    The fixture-mode prover/raw verifier report neither: the committee paid"
     echo "    those costs outside the measured aggregator and verifier processes."
@@ -1007,11 +1176,10 @@ label() {
   else
     echo "    No committee-wide keygen or slot-state row is present in this campaign."
   fi
-  echo "  * A member's signing cost is IDENTICAL on both published forms: same key,"
-  echo "    same 32-byte message, same derived slot. What the two paths differ in is"
-  echo "    only how the quorum is evidenced (t signatures + bitmap vs one proof)"
-  echo "    and what a relying party pays to check it. So the signer row applies"
-  echo "    unchanged to the SNARK and the raw path alike."
+  echo "  * The XMSS signer cost applies unchanged to XMSS raw and PQ-SNARK records:"
+  echo "    those forms use the same XMSS statement, key and derived slot. ML-DSA is"
+  echo "    a separate raw alternative and its signer cost must not be substituted"
+  echo "    into the XMSS-based proof path."
 
   # Derived from THIS sweep, never remembered. Keeping historical figures here
   # would make them look like results of the current run.

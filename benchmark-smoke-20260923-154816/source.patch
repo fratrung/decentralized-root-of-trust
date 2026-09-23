@@ -1,0 +1,2694 @@
+diff --git a/.dockerignore b/.dockerignore
+index bb487e5..1edac66 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -2,6 +2,7 @@
+ # host-specific directories out of it.
+ target/
+ demo/target/
++mldsa/target/
+ .git/
+ bench-*/
+ artifacts/
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index cba2ced..4e15dd1 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -47,11 +47,15 @@ jobs:
+         working-directory: demo
+         run: cargo fmt --all -- --check
+ 
++      - name: Check ML-DSA formatting
++        working-directory: mldsa
++        run: cargo fmt --all -- --check
++
+       - name: Validate mutation catalogue
+         run: tools/mutate.py check
+ 
+       - name: Check benchmark shell syntax
+-        run: bash -n benchmark.sh committee-scaling-benchmark.sh
++        run: bash -n benchmark.sh committee-scaling-benchmark.sh demo/docker/demo.sh
+ 
+       - name: Lint
+         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+@@ -60,9 +64,17 @@ jobs:
+         working-directory: demo
+         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+ 
++      - name: Lint ML-DSA
++        working-directory: mldsa
++        run: cargo clippy --all-targets --all-features --locked -- -D warnings
++
+       - name: Test
+         run: cargo test --locked
+ 
+       - name: Test demo
+         working-directory: demo
+         run: cargo test --locked
++
++      - name: Test ML-DSA
++        working-directory: mldsa
++        run: cargo test --locked
+diff --git a/AGENTS.md b/AGENTS.md
+index eb06f9e..ffc4095 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -22,7 +22,11 @@ verifier accepts either:
+   and verifier setup.
+ 
+ The verifier embeds one fixed anchor — the committee (`N` public keys, threshold
+-`t`, genesis slot). Secure distributed storage is an external assumption: a VDR
++`t`, genesis slot).
++The independent `mldsa/` crate provides a raw-quorum variant with FIPS 204
++ML-DSA-65, its own anchor and SSZ record. Its signatures are not aggregated by
++the XMSS SNARK path.
++Secure distributed storage is an external assumption: a VDR
+ establishes and returns one canonical current record. This repository does not
+ implement storage, replica discovery, conflict resolution, or candidate
+ selection; it authenticates that one record and applies local anti-rollback.
+@@ -41,17 +45,17 @@ cargo run --release --bin signer                       # split: ONE member, one
+ cargo fmt --all -- --check                             # formatting gate used by CI
+ cargo clippy --all-targets --all-features --locked -- -D warnings
+ cargo test --locked                                    # 73 unit + 10 integration tests; 82 run + 1 ignored
+-./benchmark.sh                                         # defaults: RUNS=20 WARMUP=2 TARGETS="signer prover verifier raw_agg"
++./benchmark.sh                                         # defaults: RUNS=24 WARMUP=2; six XMSS/ML-DSA role targets
+ ./committee-scaling-benchmark.sh                       # exploratory pilot; hard RAM/disk-gated N/t sweep
+ STUDY_MODE=publication PIN_CPUS=0-7 ./committee-scaling-benchmark.sh # clean-tree, repeated counterbalanced sweep
+ PLAN_ONLY=1 ./committee-scaling-benchmark.sh           # persist the host-derived sweep limit only
+ tools/mutate.py                                        # mutation testing: 25 checks, each must be caught by a test
+-./demo/docker/demo.sh {raw|snark} up                   # container demo: 1 bootstrap + 10 members, N=10 t=7
+-./demo/docker/demo.sh {raw|snark} round                # node A requests a credential, then verifies the record
+-./demo/docker/demo.sh {raw|snark} revoke               # remove that credential's fingerprint, then verify its absence
+-./demo/docker/demo.sh {raw|snark} verify               # node A re-checks what is published (expect a stale refusal)
+-./demo/docker/demo.sh {raw|snark} crash                # SIGKILL a member mid-protocol; it must refuse to re-sign
+-./demo/docker/demo.sh {raw|snark} down                 # stop and delete that demo's volumes
++./demo/docker/demo.sh {raw|snark|mldsa} up             # container demo: 1 bootstrap + 10 members, N=10 t=7
++./demo/docker/demo.sh {raw|snark|mldsa} round          # node A requests a credential, then verifies the record
++./demo/docker/demo.sh {raw|snark|mldsa} revoke         # remove its fingerprint, then verify absence
++./demo/docker/demo.sh {raw|snark|mldsa} verify         # re-check the canonical record (expect stale on replay)
++./demo/docker/demo.sh {raw|snark} crash                # XMSS-only durable one-time-slot crash test
++./demo/docker/demo.sh {raw|snark|mldsa} down           # stop and delete that demo's volumes
+ ```
+ 
+ **Always `--release`** for anything touching the prover; it is unusable in a debug
+@@ -328,12 +332,12 @@ split so `benchmark.sh` can measure each process shape independently.
+ ### The container demos (`demo/`)
+ 
+ A **separate crate**, with its own `[workspace]` and its own lockfile. That is
+-the whole rule: the library and the four benchmark binaries are the artifact this
+-project measures, and the demo adds networking, orchestration and a credential
+-format, none of which belong in that surface. Nothing in `demo/` may be reachable
+-from a `benchmark.sh` build, and the parent `Cargo.toml` must stay unaware of it.
++the whole rule: the measured root and `mldsa/` crates contain protocol code;
++the demo adds networking, orchestration and a credential format. Nothing in
++`demo/` may be reachable from a `benchmark.sh` build, and the parent
++`Cargo.toml` must stay unaware of it.
+ 
+-Ten containers run one image and differ only by environment. `demo/src/bin/`
++The container roles share one image and differ by command and environment. `demo/src/bin/`
+ holds `bootstrap` (assembles the anchor from ten published public keys, in index
+ order, then exits), `signer` (a member; in raw mode any member may aggregate a
+ round, while in SNARK mode only the configured prover subset aggregates and runs
+@@ -341,17 +345,20 @@ round, while in SNARK mode only the configured prover subset aggregates and runs
+ directly, exit `0` signed / `3` abstained, which is what lets the crash scenario
+ assert instead of grep).
+ 
+-`holder` is **resident**, and `round`/`revoke`/`verify` only send it a trigger (the same
+-binary with `HOLDER_TRIGGER` set, run as the throwaway `trigger` service).
+-`setup_verifier()` is a per-process cost, so a node A that exited after every
+-check would repeatedly include process startup. Keep it resident: the one-shot
+-shape still exists (neither `HOLDER_SERVE` nor `HOLDER_TRIGGER`) for cold-start
+-benchmarking.
+-Node A holds a `RawNode` or a `SnarkNode`, so the anti-rollback mark is inside
+-the node and survives a container restart on its `holder-state` volume. It also
+-keeps the last credential in its private state: `round` accepts it only when its
+-fingerprint is present in the authenticated snapshot, while `revoke` accepts the
+-next snapshot only when that fingerprint is absent.
++The `mldsa` mode has separate `mldsa_bootstrap`, `mldsa_signer` and
++`mldsa_holder` binaries. Its holder decodes the SSZ record, verifies the
++ML-DSA quorum and only then advances the same durable freshness gate.
++
++The selected mode's holder is **resident**; `round`/`revoke`/`verify` send it a
++trigger via the throwaway `trigger` service. `setup_verifier()` has a
++per-process cost in SNARK mode. The one-shot shape still exists (neither
++`HOLDER_SERVE` nor `HOLDER_TRIGGER`) for cold-start benchmarking.
++In XMSS modes node A holds a `RawNode` or `SnarkNode`; in ML-DSA mode it
++composes `RawVerifier` with the same durable `HighWaterMark`. In every mode
++the mark survives a container restart on the `holder-state` volume. Node A
++also keeps the last credential in its private state: `round` accepts it only
++when its fingerprint is present in the authenticated snapshot, while
++`revoke` accepts the next snapshot only when that fingerprint is absent.
+ 
+ Three things about it are load-bearing and easy to break by "simplifying":
+ 
+@@ -553,8 +560,10 @@ per-item raw samples when `EMIT_SAMPLES` is set in the environment:
+ | `prover` | `PROVER k=v ...` | `SAMPLE target=prover idx=… prove_ms=… bytes=…` |
+ | `verifier` | `VERIFIER k=v ... failures=N` | `SAMPLE target=verifier idx=… verify_ms=…` |
+ | `raw_agg` | `RAW_AGG k=v ... tamper_rejected=…` | `SAMPLE target=raw_agg idx=… verify_ms=… bytes=…` |
++| `mldsa_signer` | `MLDSA_SIGNER k=v ... failures=N` | `SAMPLE target=mldsa_signer idx=… sign_ms=… bytes=…` |
++| `mldsa_raw_agg` | `MLDSA_RAW_AGG k=v ... tamper_rejected=…` | decode, verify and decode-plus-verify samples |
+ 
+-`benchmark.sh` normalises all five in `emit_run_row`; adding or renaming a field
++`benchmark.sh` normalises every selected target in `emit_run_row`; adding or renaming a field
+ means updating that function. The script exits if a summary line is missing, and
+ aborts before printing any statistics if any run reports `failures > 0`.
+ 
+@@ -563,12 +572,12 @@ the comparison between the two paths gets inverted:
+ 
+ | field | what it is | who pays it |
+ |---|---|---|
+-| `setup_ms` | the leanVM circuit (`setup_prover` / `setup_verifier`) | SNARK path only — `raw_agg` and `signer` leave it empty |
+-| `keygen_ms` | generating XMSS keys | every path; `N` keys, except `signer`, which generates **one** |
+-| `slot_state_ms` | creating durable `AtomicSlotCounter`s | only a real signer — `N` for `raw_agg`, **one** for `signer` |
++| `setup_ms` | the leanVM circuit (`setup_prover` / `setup_verifier`) | SNARK path only |
++| `keygen_ms` | generating the target scheme's keys | one key for each signer target; fixture generation is unmeasured |
++| `slot_state_ms` | creating durable `AtomicSlotCounter`s | XMSS signer only; ML-DSA is stateless |
+ 
+ Per-update phases are carried into `runs.csv` under their **own names**
+-(`sign_*`, `prove_*`, `verify_*`), never under a positional primary/secondary
++(`sign_*`, `prove_*`, `verify_*`, `decode_*`, `decode_verify_*`), never under a positional primary/secondary
+ slot: a shared column put unlike phases under one heading and made `summary.csv`
+ unreadable on its own. A target leaves blank the phases it does not
+ run, and `col()` drops empty cells, so an absent phase produces no row rather than
+@@ -596,7 +605,7 @@ environment (`env.txt`), emits tidy raw data (`samples.csv`), per-run rows
+ frequency and the highest readable temperature before and after each process.
+ `drift.csv` flags an early/late median shift above 15% without deleting data.
+ Strict runs require a clean tree; exploratory dirty runs preserve
+-`source.patch` and `source-status.txt`.
++`source.patch` and `source-status.txt`, but untracked contents are omitted.
+ 
+ The unit of analysis for per-update metrics is the **per-run median** (n = RUNS),
+ not the pooled sample: updates inside one process share allocator and cache state
+@@ -604,31 +613,34 @@ and are not independent. Preserve that distinction if you touch the aggregation.
+ 
+ ### One target per role
+ 
+-The sweep has three targets that correspond to real processes, plus two contrast
+-targets. What each one measures is decided by **which role would run that
+-process**, and no target is charged for another role's work:
++The default sweep has six isolated targets. ML-DSA signer timing is crypto-only
++until a durable one-statement-per-version policy exists. What each one measures is
++decided by **which role would run that process**, and no target is charged for
++another role's work:
+ 
+ | target | role | reports |
+ |---|---|---|
+-| `signer` | one committee member | `sign` per round (incl. its durable slot burn), 1 key, 1 counter |
++| `signer` | one committee member | protocol sign, durable slot burn, crypto sign, 1 key, 1 counter |
+ | `prover` | the aggregator | `prove` per update, `setup`, complete `SnarkStatusList` size |
+-| `verifier` | a relying party | `verify` per record, `setup` |
+-| `raw_agg` | the no-SNARK baseline | `verify` per record + record size |
++| `verifier` | a relying party | decode, verify-only, contiguous decode+verify, `setup` |
++| `raw_agg` | the raw XMSS baseline | decode, verify-only, contiguous decode+verify + record size |
++| `mldsa_signer` | one ML-DSA member | randomized crypto sign only, 1 key, no version state |
++| `mldsa_raw_agg` | an ML-DSA relying party | separate decode, verify, total time + record size |
+ 
+ `combined` (`main.rs`) is **not** in the default `TARGETS`. It measures a process
+ that proves and verifies at once — not a role anyone deploys. It stays available
+ as `TARGETS="... combined"` for one purpose: an independent second reading of
+ prove time. Do not add it back to the defaults for any other reason.
+ 
+-**Only `signer` reports a `sign` row, and that is deliberate.** In production
+-nobody produces `t` signatures: each member signs *once* per round on its own
+-machine and broadcasts, and the aggregator receives `t` and produces none. Timing
++**Only `signer` and `mldsa_signer` report a `sign` row, and that is
++deliberate.** In production nobody produces `t` signatures: each member signs
++*once* per round on its own machine and broadcasts, and the aggregator receives
++`t` and produces none. Timing
+ a loop that signs `t` times sums the work of `t` machines and bills it to one —
+ which is what the `sign / update` column used to do for a process that does not
+-exist. By default, one unmeasured `committee_fixture` produces the signed raw
+-records before the sweep. `raw_agg` verifies those `StatusList` records, while
+-`prover` consumes the same logical signed inputs and writes
+-`SnarkStatusList` records. Neither measured process holds committee secret keys.
++exist. Unmeasured XMSS and ML-DSA fixture generators produce their respective
++signed corpora before the sweep. `raw_agg`, `mldsa_raw_agg` and `prover`
++therefore receive ready-made inputs and hold no committee secret keys.
+ `BENCH_SELF_CONTAINED=1` retains the former all-in-one process shape only for
+ diagnostic back-comparison; in that mode `prover`, `combined` and `raw_agg`
+ produce signatures outside their timed phase.
+@@ -638,9 +650,11 @@ A member's signing cost is identical on both published forms — same key, same
+ SNARK and the raw path, and what separates the two paths is only how the quorum is
+ evidenced and what a relying party pays to check it.
+ 
+-`signer`'s `keygen` and `slot_state` are for **one** key and **one** counter.
+-In the default fixture-shaped benchmark, `prover` and `raw_agg` report neither
+-cost because the measured aggregator and verifier do not own signer state. The
++`signer`'s `keygen` and `slot_state` are for **one** XMSS key and counter.
++`mldsa_signer` reports one ML-DSA key and no durable version state. Its
++crypto-only timing is not comparable to the complete XMSS protocol cost. In the default
++fixture-shaped benchmark, `prover`, `raw_agg` and `mldsa_raw_agg` report no
++signer-state cost because those measured roles do not own signer state. The
+ self-contained diagnostic mode reports the whole committee's `N`; do not read
+ those figures as the same quantity as the signer row.
+ 
+@@ -670,12 +684,12 @@ projection block existed once and was removed — do not reintroduce it.
+ `committee-scaling-benchmark.sh` must remain an orchestrator over
+ `benchmark.sh`, not a second measurement implementation. `benchmark.sh` remains
+ the authority for scheduling, raw samples, descriptive statistics, confidence
+-intervals, drift diagnostics and security failure gates. The scaling layer measures the `signer`
+-target once for the whole campaign, then chooses `(N,t)`, prepares unmeasured
+-signatures, enforces resources, invokes complete benchmark sessions and
+-aggregates their run-level medians. The signer result stays separate in
+-`signer.csv`: it is a one-member cost common to both publication forms, not a
+-quantity to multiply by `t` or repeat at every committee size.
++intervals, drift diagnostics and security failure gates. The scaling layer
++measures `signer` and `mldsa_signer` once for the whole campaign, then chooses
++`(N,t)`, prepares both unmeasured signature corpora, enforces resources, invokes
++complete benchmark sessions and aggregates their run-level medians. Signer
++results stay separate in `signer.csv`: each is a one-member cost, not a quantity
++to multiply by `t` or repeat at every committee size.
+ 
+ The requested grid is `N = 5, 10, 100, 500, 1000, 1500`, with
+ `t = floor(2N/3) + 1`. This is a strict two-thirds authorization policy, not PBFT
+@@ -696,16 +710,18 @@ never turn a resource abort into a partial timing row.
+ `STUDY_MODE=pilot` is exploratory: three runs, one warm-up, one ascending sweep.
+ `publication` defaults to 24 runs and two complete sweeps, ascending then
+ descending, and requires a clean tree, strict environment, explicit CPU mask and
+-hard memory backend. Its run count must be a multiple of six, completing the
+-Williams design for the three per-point targets. It withholds a session on a
++hard memory backend. Its run count must be a multiple of four, completing the
++balanced design for the four per-point targets (`prover`, `verifier`,
++`raw_agg`, `mldsa_raw_agg`). It withholds a session on a
+ drift warning. `RESUME=1` is accepted only when the recorded
+ source/configuration fingerprint matches and the current usable RAM cap still
+ meets the admission threshold for the largest originally selected N.
+ 
+ The combined report derives quantities from run-level medians across complete
+-sweeps. A verification crossover is reportable only when the paired 95% CI for
+-`raw_verify - snark_verify` is wholly positive. Speedup and break-even retain
+-quartiles. `ceil(prove / (raw_verify - snark_verify))` excludes process setup,
++sweeps. A validator requires complete run IDs, metric fields and phase samples
++before a session contributes; per-target run overrides are rejected. A verification crossover is reportable only when the paired 95% CI for
++`raw_decode_verify - snark_decode_verify` is wholly positive. Speedup and break-even retain
++quartiles. `ceil(prove / (raw_decode_verify - snark_decode_verify))` excludes process setup,
+ networking, signing and fixture generation; withhold it if any paired run has no
+ positive saving rather than deleting that run. Do not call it end-to-end latency
+ or extrapolate a crossover between measured grid points; refine the grid around
+diff --git a/README.md b/README.md
+index 43d39e1..09850a1 100644
+--- a/README.md
++++ b/README.md
+@@ -292,12 +292,26 @@ Raw quorum path:
+ cargo run --release --bin raw_agg
+ ```
+ 
+-Single committee member:
++Single XMSS committee member:
+ 
+ ```sh
+ cargo run --release --bin signer
+ ```
+ 
++The independent [`mldsa/`](mldsa/) crate implements the parallel raw-quorum
++construction with FIPS 204 ML-DSA-65. It exposes a stateless signer, an SSZ
++committee anchor, an SSZ `MlDsaStatusList` carrying a signer bitmap and raw
++signatures, and a verifier that keeps decoding separate from authorization.
++The canonical statement binds the algorithm, committee-derived anchor identifier,
++version and ordered fingerprint list, and is passed directly to ML-DSA.Sign with
++the empty FIPS 204 context; it is not application-prehashed. This path is not an
++input to leanVM's XMSS aggregate and does not produce a SNARK.
++
++```sh
++cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_signer
++cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_raw_agg
++```
++
+ Small local walkthrough:
+ 
+ ```sh
+@@ -354,8 +368,17 @@ network.
+ ./demo/docker/demo.sh raw down
+ ```
+ 
+-Replace `raw` with `snark` to publish aggregated records. See
+-[`demo/README.md`](demo/README.md) for the topology and scenario details.
++Use `snark` to publish aggregated XMSS records, or `mldsa` to publish the
++raw ML-DSA-65 quorum form:
++
++```sh
++./demo/docker/demo.sh mldsa up
++./demo/docker/demo.sh mldsa round
++```
++
++The `crash` scenario is intentionally available only for `raw` and `snark`:
++it tests durable XMSS one-time-slot burning, a property ML-DSA does not have.
++See [`demo/README.md`](demo/README.md) for the topology and scenario details.
+ 
+ ## Tests
+ 
+@@ -394,47 +417,49 @@ The current catalog contains 25 mutations. Each removes or weakens one
+ security-relevant check and must be detected by the test suite.
+ 
+ GitHub Actions runs formatting, Clippy with warnings denied, the mutation
+-catalog consistency check, and the complete tests for both the root crate and
+-the independent `demo/` crate. It uses one Linux job so the expensive leanVM
++catalog consistency check, and the complete tests for the root, `mldsa/` and
++`demo/` crates. It uses one Linux job so the expensive leanVM
+ build is shared by all checks in that run. Benchmarks, container scenarios and
+ the full mutation campaign remain explicit local jobs; they are intentionally
+ excluded from pull-request CI.
+ 
+ ## Benchmark
+ 
+-The benchmark harness measures the signer, prover, verifier and raw-verification
+-roles as separate processes:
++The benchmark harness runs six isolated targets: an XMSS protocol signer, an
++ML-DSA cryptographic signer, the XMSS prover and verifier, and two raw
++relying-party verifiers. ML-DSA signing has no persistent one-statement-per-version
++state yet, so its cost is not a protocol-level equivalent of the XMSS signer.
+ 
+ ```sh
+ ./benchmark.sh
+ RUNS=30 WARMUP=3 ./benchmark.sh
+-TARGETS="signer prover verifier raw_agg" ./benchmark.sh
++TARGETS="signer mldsa_signer prover verifier raw_agg mldsa_raw_agg" ./benchmark.sh
+ ```
+ 
+ Defaults:
+ 
+-- `RUNS=20`;
++- `RUNS=24`;
+ - `WARMUP=2`;
+ - `N_UPDATES=20` rounds inside each process run;
+-- `TARGETS="signer prover verifier raw_agg"`;
++- `TARGETS="signer mldsa_signer prover verifier raw_agg mldsa_raw_agg"`;
+ - `COOLDOWN_SECONDS=2` before every target process;
+ - balanced target ordering (`INTERLEAVE=1`).
+ 
+-Thus the default harness starts each target 22 times: two warm-ups whose data
+-is discarded, followed by 20 measured process runs. Each measured run contains
++Thus the default harness starts each target 26 times: two warm-ups whose data
++is discarded, followed by 24 measured process runs. Each measured run contains
+ 20 update-level observations. Those observations share one process and are not
+ treated as independent replicates; the reported cross-run statistics use each
+ run's median as their unit of analysis.
+ 
+-Before measurement, the default harness runs `committee_fixture` once. That
+-unmeasured process creates the committee, the raw `StatusList` records and their
+-XMSS signatures. `raw_agg` verifies those records directly. `prover` consumes
+-the same signed inputs and emits `SnarkStatusList` records; the fixed verifier
+-corpus is generated from them once and reused by every verifier run. Consequently
+-the measured raw process is a relying-party verifier and the measured prover is
++Before measurement, unmeasured fixture processes create both corpora.
++`committee_fixture` creates the XMSS committee and raw `StatusList` records;
++`raw_agg` verifies them and `prover` consumes the same signed inputs to emit
++`SnarkStatusList` records. `mldsa_fixture` independently creates the
++ML-DSA-65 anchor and `MlDsaStatusList` corpus consumed by `mldsa_raw_agg`.
++Fixture generation and signing are outside verifier/prover timings. Consequently
++each measured raw process is a relying-party verifier and the measured prover is
+ one aggregator, not a hidden committee signer. `BENCH_SELF_CONTAINED=1` retains
+-the older diagnostic mode in which each target generates its own keys and
+-signatures.
++the older diagnostic XMSS process shape for back-comparison.
+ 
+ The default order is a Williams-style balanced crossover sequence rather than a
+ fixed round-robin: across a complete block, target position and immediate
+@@ -443,8 +468,13 @@ processes; it does not assert equal package temperature, so `runs.csv` retains
+ each start time for drift analysis.
+ 
+ Size rows name the serialized object they measure: `signature_size` for one
+-XMSS signature and `record_size` for the complete `StatusList` or
+-`SnarkStatusList`. The optional `combined` target alone reports
++XMSS or ML-DSA signature and `record_size` for the complete `StatusList`,
++`MlDsaStatusList` or `SnarkStatusList`. All three verifier targets report
++separate decode, verify-only and contiguous decode-plus-verify timings. The
++end-to-end interval is used for receiver-cost comparisons and XMSS/SNARK
++break-even. XMSS signer timings separate durable slot burn, cryptographic
++signing and complete protocol cost.
++The optional `combined` target alone reports
+ `proof_size`, because it measures `SnarkStatusList::proof_bytes()` rather than
+ the whole record. Even-sized samples use the conventional median, the arithmetic
+ mean of the two central observations.
+@@ -457,8 +487,9 @@ the highest readable temperature immediately before and after every target
+ process. `drift.csv` compares the first and last quarter of run medians and
+ flags a change above 15%; it never removes or rewrites samples. A strict run
+ also requires a clean Git tree. Exploratory dirty-tree runs preserve
+-`source.patch` and `source-status.txt`, so the recorded commit is not presented
+-as sufficient to reconstruct uncommitted code.
++`source.patch` and `source-status.txt`. The patch omits untracked file contents;
++such pilot runs may not be exactly reconstructible. Publication mode requires a
++clean committed tree.
+ 
+ ### Committee scaling
+ 
+@@ -488,8 +519,9 @@ resource discovery, not for paper results. `STUDY_MODE=publication` defaults to
+ sweeps. The second sweep reverses the committee-size order, so host-time and
+ committee size are not perfectly confounded. Publication mode requires
+ `STRICT_ENV=1`, a clean committed tree, an explicit CPU mask, at least ten runs
+-and at least two sweeps. Its run count must be a multiple of six, completing the
+-Williams design for the three per-point targets. Any session whose early/late
++and at least two sweeps. Its run count must be a multiple of four, completing
++the balanced design for the four per-point targets (`prover`, `verifier`,
++`raw_agg`, `mldsa_raw_agg`). Any session whose early/late
+ medians differ by more than 15% is marked unstable and withheld; no outlier is
+ discarded.
+ 
+@@ -520,27 +552,29 @@ recalculates the hard cap from current availability. It refuses to resume only
+ when the current usable cap has fallen below the admission threshold of the
+ largest recorded N.
+ 
+-Before the sweep, `benchmark.sh` measures the `signer` target once as a separate
+-single-member campaign, using the same run and warm-up counts. It is not repeated
+-for every `(N,t)`: one member's XMSS operation is identical for both publication
+-forms and independent of committee size. The result is kept in `signer.csv` and
+-reported separately rather than multiplied by `t`; those signatures are produced
+-by distinct member machines and may proceed in parallel.
++Before the sweep, `benchmark.sh` measures `signer` and `mldsa_signer` once
++as separate single-member campaigns, using the same run and warm-up counts.
++Neither is repeated for every `(N,t)`: per-member signing cost is independent of
++committee size and must not be multiplied into one process latency. `signer.csv`
++keeps XMSS protocol/slot/crypto costs separate from ML-DSA crypto-only signing.
+ 
+-An unmeasured `committee_fixture` process then generates the signatures once per
+-point. The measured `prover` is therefore one aggregator holding public keys
+-and ready-made signatures—never `N` aggregators or one process retaining all
+-committee secret keys. The raw measurement likewise runs as a verifier-only
+-process over the same signed records.
++At every point, unmeasured XMSS and ML-DSA fixture processes generate their
++respective signed corpora. The measured `prover` is therefore one XMSS
++aggregator holding public keys and ready-made signatures—never `N` aggregators
++or one process retaining all committee secret keys. Both raw measurements are
++verifier-only processes. The report keeps ML-DSA raw results separate from the
++XMSS/SNARK crossover because ML-DSA is a different signature construction, not
++an alternative encoding of the same XMSS quorum.
+ 
+ The top-level output contains:
+ 
+ - `memory-decision.txt` — the announced admission and runtime limits;
+-- `signer.csv` and `signer/benchmark/` — the single-member campaign, measured
+-  once for the complete sweep;
++- `signer.csv` and `signer/benchmark/` — the XMSS and ML-DSA single-member
++  campaigns, measured once for the complete sweep;
+ - `manifest.csv` — completed, stopped and RAM-excluded points;
+-- `scaling.csv` — run-level medians combined across sweeps, wire size, RSS,
+-  paired verification deltas, confidence bounds and derived ratios;
++- `scaling.csv` — run-level medians combined across sweeps, XMSS/SNARK wire
++  size, RSS, paired verification deltas and derived ratios, plus ML-DSA decode,
++  verification, combined time, record size and verifier RSS;
+ - `report.txt` — the first observed wire-size, verification-time and joint
+   crossover;
+ - `Nxxxx-tyyyy/session-XX/benchmark/` — the complete `benchmark.sh` output for
+@@ -548,19 +582,22 @@ The top-level output contains:
+   intervals.
+ 
+ The report calls SNARK verification faster only when the paired 95% confidence
+-interval for `raw_verify - snark_verify` is wholly above zero. Only then does it
++interval for `raw_decode_verify - snark_decode_verify` is wholly above zero. Only then does it
+ report the number of independent relying-party verifications needed to amortize
+ one proof:
+ 
+ ```text
+-ceil(prove_ms / (raw_verify_ms - snark_verify_ms))
++ceil(prove_ms / (raw_decode_verify_ms - snark_decode_verify_ms))
+ ```
+ 
+ This deliberately excludes one-time setup, signing, network transfer and
+ fixture generation; those costs have different owners and must not be folded
+ into one latency figure. Break-even is withheld if any paired run has no
+ positive verification-time saving; that run is not silently discarded.
+-Speedup and break-even Q1/Q3 remain in `scaling.csv`.
++Speedup and break-even Q1/Q3 remain in `scaling.csv`. Sessions are checked for
++complete runs and samples; inherited per-target run overrides are rejected.
++The paired interval assumes independent repetitions on this host and session,
++not a crossover established across days or machines.
+ The first favorable N is only the first observed grid point: a final study must
+ refine the interval around it rather than call it the exact crossover.
+ 
+diff --git a/benchmark.sh b/benchmark.sh
+index 5f67614..0493005 100755
+--- a/benchmark.sh
++++ b/benchmark.sh
+@@ -5,10 +5,15 @@
+ # actually run it. No target is ever charged for another role's work:
+ #   signer    ONE committee member, one signature + one durable slot burn per
+ #             round                                 (src/bin/signer.rs)
++#   mldsa_signer
++#             ONE ML-DSA member, one randomized stateless signature per round
++#                                                   (mldsa/src/bin/mldsa_signer.rs)
+ #   prover    the aggregator: N updates, prove only (src/bin/prover.rs)
+ #   verifier  a relying party: verifies a FIXED artifact corpus
+ #                                                   (src/bin/verifier.rs)
+-# plus the baseline the SNARK has to beat:
++# plus the raw alternatives:
++#   mldsa_raw_agg
++#             decode + verify an ML-DSA StatusList (mldsa/src/bin/mldsa_raw_agg.rs)
+ #   raw_agg   crude multisig, NO SNARK              (src/bin/raw_agg.rs)
+ #             verify scales with t, unlike the constant-time SNARK verify, and
+ #             record_size is the complete StatusList on the wire
+@@ -18,9 +23,9 @@
+ # deploys. It stays available as `TARGETS="... combined"` when an independent
+ # second reading of prove time is wanted — that is what it is for.
+ #
+-# Only `signer` reports a `sign` row, and that is the point. In production nobody
+-# produces t signatures: each member signs ONCE per round on its own machine and
+-# broadcasts, and the aggregator receives t signatures and produces none. A `sign`
++# Only the two signer targets report a `sign` row. In production nobody produces
++# t signatures: each member signs ONCE per round on its own machine and broadcasts,
++# and the aggregator receives t signatures and produces none. A `sign`
+ # figure taken from a process that signs t times is the summed work of t machines
+ # billed to one, and describes no process that exists. By default a separate,
+ # unmeasured fixture process creates the signed inputs once; the measured prover
+@@ -35,7 +40,7 @@
+ #   summary.csv  aggregate statistics, machine-readable
+ #   summary.txt  the same table, human-readable
+ #   drift.csv    early/late regime diagnostic; observations are never removed
+-#   source.patch / source-status.txt  exact dirty-tree disclosure, when present
++#   source.patch / source-status.txt  tracked diff and dirty paths; untracked contents omitted
+ #
+ # The unit of analysis for per-update metrics is the PER-RUN MEDIAN (n = RUNS),
+ # not the pooled sample: updates within one process share allocator and cache
+@@ -69,11 +74,12 @@ export LC_ALL=C
+ cd "$(dirname "${BASH_SOURCE[0]}")"
+ REPO="$PWD"
+ 
+-RUNS="${RUNS:-20}"
++RUNS="${RUNS:-24}"
+ WARMUP="${WARMUP:-2}"
+-TARGETS="${TARGETS:-signer prover verifier raw_agg}"
++TARGETS="${TARGETS:-signer mldsa_signer prover verifier raw_agg mldsa_raw_agg}"
+ OUTDIR="${OUTDIR:-bench-$(date +%Y%m%d-%H%M%S)}"
+ BENCH_INPUT_DIR="${BENCH_INPUT_DIR:-}"
++MLDSA_INPUT_DIR="${MLDSA_INPUT_DIR:-}"
+ BENCH_SELF_CONTAINED="${BENCH_SELF_CONTAINED:-0}"
+ COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-2}"
+ 
+@@ -83,6 +89,7 @@ COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-2}"
+ # recompiles this crate (not the pinned leanVM tree) when either value changes.
+ DEFAULT_N="$(sed -n 's/^pub const DEFAULT_N_MEMBERS: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+ DEFAULT_T="$(sed -n 's/^pub const DEFAULT_T: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
++BENCH_UPDATES="$(sed -n 's/^pub const N_UPDATES: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+ if { [ -n "${DROT_BENCH_N:-}" ] && [ -z "${DROT_BENCH_T:-}" ]; } ||
+    { [ -z "${DROT_BENCH_N:-}" ] && [ -n "${DROT_BENCH_T:-}" ]; }; then
+   echo "DROT_BENCH_N and DROT_BENCH_T must be set together" >&2
+@@ -104,6 +111,10 @@ if [ -n "$BENCH_INPUT_DIR" ] && [ ! -d "$BENCH_INPUT_DIR" ]; then
+   echo "BENCH_INPUT_DIR is not a directory: $BENCH_INPUT_DIR" >&2
+   exit 1
+ fi
++if [ -n "$MLDSA_INPUT_DIR" ] && [ ! -d "$MLDSA_INPUT_DIR" ]; then
++  echo "MLDSA_INPUT_DIR is not a directory: $MLDSA_INPUT_DIR" >&2
++  exit 1
++fi
+ 
+ case "$RUNS" in ''|*[!0-9]*|0) echo "RUNS must be a positive integer" >&2; exit 1 ;; esac
+ case "$WARMUP" in ''|*[!0-9]*) echo "WARMUP must be a non-negative integer" >&2; exit 1 ;; esac
+@@ -139,8 +150,14 @@ PIN_CPUS="${PIN_CPUS:-}"
+ read -r -a TARGET_LIST <<<"$TARGETS"
+ [ "${#TARGET_LIST[@]}" -gt 0 ] || { echo "TARGETS must not be empty" >&2; exit 1; }
+ declare -A SEEN_TARGETS=()
++NEED_ROOT=0
++NEED_MLDSA=0
+ for target in "${TARGET_LIST[@]}"; do
+-  case "$target" in signer|prover|verifier|raw_agg|combined) ;; *) echo "unknown target: $target" >&2; exit 1 ;; esac
++  case "$target" in
++    signer|prover|verifier|raw_agg|combined) NEED_ROOT=1 ;;
++    mldsa_signer|mldsa_raw_agg) NEED_MLDSA=1 ;;
++    *) echo "unknown target: $target" >&2; exit 1 ;;
++  esac
+   [ -z "${SEEN_TARGETS[$target]:-}" ] || { echo "duplicate target: $target" >&2; exit 1; }
+   SEEN_TARGETS[$target]=1
+ done
+@@ -188,6 +205,9 @@ if [ "$STRICT_ENV" = 1 ]; then
+   [ "$GOVERNORS" = performance ] || { echo "STRICT: every target CPU governor must be 'performance', got '$GOVERNORS'" >&2; fatal=1; }
+   [ -n "$TIME_BIN" ]             || { echo "STRICT: /usr/bin/time -v required for the RSS cross-check" >&2; fatal=1; }
+   [ -f Cargo.lock ]               || { echo "STRICT: Cargo.lock required for a reproducible dependency set" >&2; fatal=1; }
++  if [ "$NEED_MLDSA" = 1 ]; then
++    [ -f mldsa/Cargo.lock ] || { echo "STRICT: mldsa/Cargo.lock required for reproducible ML-DSA binaries" >&2; fatal=1; }
++  fi
+   [ "$REQUIRE_CLEAN_TREE" = 0 ] || [ "$GIT_DIRTY" = no ] || {
+     echo "STRICT: the Git working tree is dirty; commit the benchmark candidate first" >&2
+     fatal=1
+@@ -196,6 +216,7 @@ if [ "$STRICT_ENV" = 1 ]; then
+ fi
+ 
+ BIN_DIR="$REPO/target/release"
++MLDSA_BIN_DIR="$REPO/mldsa/target/release"
+ SCRATCH="$(mktemp -d)"
+ trap 'rm -rf "$SCRATCH"' EXIT
+ 
+@@ -216,10 +237,18 @@ SOURCE_PATCH_SHA256="$(sha256sum "$SOURCE_PATCH" 2>/dev/null | awk '{print $1}')
+ 
+ # ---------------------------------------------------------------- build ----
+ echo "building --release ..."
+-cargo build --release --locked >/dev/null 2>&1
+-for b in signer prover verifier decentralized-root-of-trust raw_agg committee_fixture; do
+-  [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
+-done
++if [ "$NEED_ROOT" = 1 ]; then
++  cargo build --release --locked >/dev/null 2>&1
++  for b in signer prover verifier decentralized-root-of-trust raw_agg committee_fixture; do
++    [ -x "$BIN_DIR/$b" ] || { echo "missing binary: $BIN_DIR/$b"; exit 1; }
++  done
++fi
++if [ "$NEED_MLDSA" = 1 ]; then
++  cargo build --manifest-path mldsa/Cargo.toml --release --locked >/dev/null 2>&1
++  for b in mldsa_signer mldsa_raw_agg mldsa_fixture; do
++    [ -x "$MLDSA_BIN_DIR/$b" ] || { echo "missing binary: $MLDSA_BIN_DIR/$b"; exit 1; }
++  done
++fi
+ 
+ AUTO_FIXTURE=0
+ if [ "$BENCH_SELF_CONTAINED" = 0 ] && [ -z "$BENCH_INPUT_DIR" ]; then
+@@ -233,6 +262,12 @@ if [ "$BENCH_SELF_CONTAINED" = 0 ] && [ -z "$BENCH_INPUT_DIR" ]; then
+     esac
+   done
+ fi
++AUTO_MLDSA_FIXTURE=0
++if [ -n "${SEEN_TARGETS[mldsa_raw_agg]:-}" ] && [ -z "$MLDSA_INPUT_DIR" ]; then
++  MLDSA_INPUT_DIR="$SCRATCH/mldsa-fixture"
++  AUTO_MLDSA_FIXTURE=1
++fi
++
+ if [ -n "$BENCH_INPUT_DIR" ]; then
+   INPUT_MODE=fixture
+ elif [ "$BENCH_SELF_CONTAINED" = 1 ]; then
+@@ -240,6 +275,11 @@ elif [ "$BENCH_SELF_CONTAINED" = 1 ]; then
+ else
+   INPUT_MODE=target-native
+ fi
++if [ -n "$MLDSA_INPUT_DIR" ]; then
++  MLDSA_INPUT_MODE=fixture
++else
++  MLDSA_INPUT_MODE=not-selected
++fi
+ 
+ # ------------------------------------------------------ environment ----
+ sysread() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "n/a"; }
+@@ -322,11 +362,13 @@ temp_now_c() {
+   echo "source patch     : $(basename "$SOURCE_PATCH")"
+   echo "leanVM rev       : $(sed -n 's/.*leanEthereum\/leanVM.git", rev = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+   echo "Cargo.lock       : $(test -f Cargo.lock && echo present || echo MISSING)"
++  echo "ML-DSA Cargo.lock: $(test -f mldsa/Cargo.lock && echo present || echo MISSING)"
+   echo
+   echo "## Parameters (src/params.rs)"
+   grep -E '^pub const' src/params.rs | sed 's/^/  /'
+   echo "  resolved N_MEMBERS = $BENCH_N"
+   echo "  resolved T         = $BENCH_T"
++  echo "  resolved N_UPDATES = $BENCH_UPDATES"
+   echo
+   echo "## Benchmark configuration"
+   echo "runs (default)   : $RUNS measured, $WARMUP warmup(s) discarded"
+@@ -337,8 +379,10 @@ temp_now_c() {
+   done
+   echo "targets          : $TARGETS"
+   echo "committee        : N=$BENCH_N t=$BENCH_T"
+-  echo "signed inputs    : ${BENCH_INPUT_DIR:-generated inside each target}"
+-  echo "input mode       : $INPUT_MODE"
++  echo "XMSS inputs      : ${BENCH_INPUT_DIR:-generated inside each target}"
++  echo "XMSS input mode  : $INPUT_MODE"
++  echo "ML-DSA inputs    : ${MLDSA_INPUT_DIR:-<target not selected>}"
++  echo "ML-DSA input mode: $MLDSA_INPUT_MODE"
+   echo "cooldown         : ${COOLDOWN_SECONDS}s before every target process"
+   echo "kernel RSS probe : ${TIME_BIN:-unavailable (self-reported VmHWM only)}"
+   echo
+@@ -362,7 +406,8 @@ echo "cooldown  : ${COOLDOWN_SECONDS}s before each target process"
+ [ "$gov" = performance ] || echo "WARNING   : target CPU governors '$gov' are not uniformly performance -> inflated variance"
+ [ -n "$TIME_BIN" ] || echo "WARNING   : /usr/bin/time absent -> no independent kernel RSS cross-check"
+ [ -f Cargo.lock ] || echo "WARNING   : Cargo.lock missing -> dependency resolution is not reproducible"
+-[ "$GIT_DIRTY" = no ] || echo "WARNING   : dirty source tree; source.patch is required to reconstruct this run"
++[ "$NEED_MLDSA" = 0 ] || [ -f mldsa/Cargo.lock ] || echo "WARNING   : mldsa/Cargo.lock missing -> ML-DSA dependency resolution is not reproducible"
++[ "$GIT_DIRTY" = no ] || echo "WARNING   : dirty source tree; source.patch omits untracked contents, so this run may not be reconstructible"
+ echo
+ 
+ # The default workload separates the roles faithfully: one unmeasured process
+@@ -376,6 +421,18 @@ if [ "$AUTO_FIXTURE" = 1 ]; then
+   echo "  raw StatusList inputs: $BENCH_INPUT_DIR"
+   echo
+ fi
++if [ "$AUTO_MLDSA_FIXTURE" = 1 ]; then
++  echo "generating one unmeasured ML-DSA committee fixture ..."
++  "$MLDSA_BIN_DIR/mldsa_fixture" "$MLDSA_INPUT_DIR" "$BENCH_N" "$BENCH_T" "$BENCH_UPDATES" >/dev/null
++  echo "  ML-DSA StatusList inputs: $MLDSA_INPUT_DIR"
++  echo
++fi
++if [ -n "${SEEN_TARGETS[mldsa_raw_agg]:-}" ] &&
++   ! printf 'N=%s\nt=%s\nupdates=%s\n' "$BENCH_N" "$BENCH_T" "$BENCH_UPDATES" |
++     cmp -s - "$MLDSA_INPUT_DIR/manifest.txt"; then
++  echo "ML-DSA fixture does not match requested N=$BENCH_N t=$BENCH_T updates=$BENCH_UPDATES" >&2
++  exit 1
++fi
+ 
+ # ----------------------------------------------------- fixed corpus ----
+ # The verifier must see the SAME workload on every run, so its input is
+@@ -415,7 +472,7 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
+ # the fixed-cost columns comparable across targets: `raw_agg` leaves `setup_ms`
+ # empty because it has no circuit, which is the result, rather than borrowing the
+ # column for its keygen and making the SNARK look like the cheaper setup.
+-echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures,load1_start,load1_end,freq_start_mhz,freq_end_mhz,temp_start_c,temp_end_c' > "$RUNS_CSV"
++echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures,load1_start,load1_end,freq_start_mhz,freq_end_mhz,temp_start_c,temp_end_c,decode_med_ms,decode_mean_ms,decode_sd_ms,decode_min_ms,decode_max_ms,decode_total_ms,decode_verify_med_ms,decode_verify_mean_ms,decode_verify_sd_ms,decode_verify_min_ms,decode_verify_max_ms,decode_verify_total_ms,slot_burn_med_ms,slot_burn_total_ms,sign_crypto_med_ms,sign_crypto_total_ms' > "$RUNS_CSV"
+ 
+ # Column indices into runs.csv, named once. Every awk gate and every summary row
+ # below addresses columns through these, so inserting a column is one edit here
+@@ -427,6 +484,9 @@ C_PROVE_MED=14;  C_PROVE_TOT=19
+ C_VERIFY_MED=20; C_VERIFY_TOT=25
+ C_ARTIFACT=26;   C_RSS_SETUP=27;  C_RSS_MAX=28
+ C_PEAK=29;       C_KERNEL=30;     C_FAIL=31
++C_DECODE_MED=38; C_DECODE_TOT=43
++C_DECODE_VERIFY_MED=44; C_DECODE_VERIFY_TOT=49
++C_SLOT_BURN_MED=50; C_SIGN_CRYPTO_MED=52
+ 
+ RUN_T_START=""
+ RUN_LOAD_START=""; RUN_LOAD_END=""
+@@ -438,6 +498,7 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
+   local -a cmd
+   case "$target" in
+     signer)   cmd=("$BIN_DIR/signer") ;;
++    mldsa_signer) cmd=("$MLDSA_BIN_DIR/mldsa_signer" "$BENCH_UPDATES") ;;
+     prover)
+       rm -rf "$SCRATCH/pout"
+       if [ -n "$BENCH_INPUT_DIR" ]; then
+@@ -449,6 +510,7 @@ run_once() { # $1 target -> prints stdout of the run to $SCRATCH/out.txt
+     verifier) cmd=("$BIN_DIR/verifier" "$CORPUS") ;;
+     combined) cmd=("$BIN_DIR/decentralized-root-of-trust") ;;
+     raw_agg)  cmd=("$BIN_DIR/raw_agg") ;;
++    mldsa_raw_agg) cmd=("$MLDSA_BIN_DIR/mldsa_raw_agg" "$MLDSA_INPUT_DIR" "$BENCH_UPDATES") ;;
+     *) echo "unknown target: $target" >&2; exit 1 ;;
+   esac
+   # Pinning wraps the binary, not the harness: leanVM reads the affinity mask once
+@@ -477,6 +539,8 @@ emit_run_row() { # $1 target  $2 run index
+   local target="$1" run="$2" kmax; kmax="$(kernel_maxrss_mb)"
+   local tag
+   case "$target" in
++    mldsa_signer) tag='^MLDSA_SIGNER ' ;;
++    mldsa_raw_agg) tag='^MLDSA_RAW_AGG ' ;;
+     signer) tag='^SIGNER ' ;; prover) tag='^PROVER ' ;; verifier) tag='^VERIFIER ' ;;
+     combined) tag='^BENCH ' ;; raw_agg) tag='^RAW_AGG ' ;;
+   esac
+@@ -494,6 +558,9 @@ emit_run_row() { # $1 target  $2 run index
+     sg_med=""; sg_mean=""; sg_sd=""; sg_lo=""; sg_hi=""; sg_tot=""
+     pv_med=""; pv_mean=""; pv_sd=""; pv_lo=""; pv_hi=""; pv_tot=""
+     vf_med=""; vf_mean=""; vf_sd=""; vf_lo=""; vf_hi=""; vf_tot=""
++    dc_med=""; dc_mean=""; dc_sd=""; dc_lo=""; dc_hi=""; dc_tot=""
++    dv_med=""; dv_mean=""; dv_sd=""; dv_lo=""; dv_hi=""; dv_tot=""
++    rb_med=""; rb_tot=""; cr_med=""; cr_tot=""
+     if (t=="signer") {
+       # The only target that reports `sign`, and the only one whose keygen and
+       # slot state are ONE key and ONE counter rather than the whole committee.
+@@ -502,9 +569,19 @@ emit_run_row() { # $1 target  $2 run index
+       keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_rounds"]
+       sg_med=v["sign_med_ms"]; sg_mean=v["sign_mean_ms"]; sg_sd=v["sign_sd_ms"]
+       sg_lo=v["sign_min_ms"]; sg_hi=v["sign_max_ms"]; sg_tot=v["sign_total_ms"]
++      rb_med=v["reserve_med_ms"]; rb_tot=v["reserve_total_ms"]
++      cr_med=v["crypto_med_ms"]; cr_tot=v["crypto_total_ms"]
+       pb=v["sig_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_rounds_max_mb"]; pk=v["peak_rss_mb"]
+       # Every round self-verifies; a missing key means the run told us nothing.
+       f=(v["failures"]=="")?1:v["failures"]
++    } else if (t=="mldsa_signer") {
++      # ML-DSA is stateless: there is one key but no durable slot counter.
++      keygen=v["keygen_ms"]; n=v["n_rounds"]
++      sg_med=v["sign_med_ms"]; sg_mean=v["sign_mean_ms"]; sg_sd=v["sign_sd_ms"]
++      sg_lo=v["sign_min_ms"]; sg_hi=v["sign_max_ms"]; sg_tot=v["sign_total_ms"]
++      cr_med=sg_med; cr_tot=sg_tot
++      pb=v["sig_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_rounds_max_mb"]; pk=v["peak_rss_mb"]
++      f=(v["failures"]=="")?1:v["failures"]
+     } else if (t=="prover") {
+       # Aggregator. It signs to have something to aggregate, but does not time it:
+       # those t signatures come from t machines in a deployment, one each.
+@@ -517,6 +594,10 @@ emit_run_row() { # $1 target  $2 run index
+       setup=v["setup_ms"]; n=v["n_verified"]
+       vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
+       vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
++      dc_med=v["decode_med_ms"]; dc_mean=v["decode_mean_ms"]; dc_sd=v["decode_sd_ms"]
++      dc_lo=v["decode_min_ms"]; dc_hi=v["decode_max_ms"]; dc_tot=v["decode_total_ms"]
++      dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
++      dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
+       # An absent `failures=` key yields "", which awk would later coerce to 0 —
+       # a silent pass for the one target that reports real accept/reject verdicts.
+       # Missing means "this run told us nothing", which is a failure, not a zero.
+@@ -532,8 +613,24 @@ emit_run_row() { # $1 target  $2 run index
+       keygen=v["keygen_ms"]; slotstate=v["slot_state_ms"]; n=v["n_updates"]
+       vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
+       vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
++      dc_med=v["decode_med_ms"]; dc_mean=v["decode_mean_ms"]; dc_sd=v["decode_sd_ms"]
++      dc_lo=v["decode_min_ms"]; dc_hi=v["decode_max_ms"]; dc_tot=v["decode_total_ms"]
++      dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
++      dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
+       pb=v["record_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+       f=(v["tamper_rejected"]=="1")?0:1
++    } else if (t=="mldsa_raw_agg") {
++      # Fixture I/O is outside all timed regions. Decode, cryptographic verify,
++      # and their contiguous per-record total stay distinct throughout the output schema.
++      n=v["n_updates"]
++      dc_med=v["decode_med_ms"]; dc_mean=v["decode_mean_ms"]; dc_sd=v["decode_sd_ms"]
++      dc_lo=v["decode_min_ms"]; dc_hi=v["decode_max_ms"]; dc_tot=v["decode_total_ms"]
++      vf_med=v["verify_med_ms"]; vf_mean=v["verify_mean_ms"]; vf_sd=v["verify_sd_ms"]
++      vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
++      dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
++      dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
++      pb=v["record_med_bytes"]; rs=v["rss_anchor_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
++      f=(v["tamper_rejected"]=="1")?0:1
+     } else {
+       # `updates_total_ms` is the whole loop (sign + prove + verify + printing);
+       # the phase totals are what compare with the prover column. Prove and verify
+@@ -546,12 +643,15 @@ emit_run_row() { # $1 target  $2 run index
+       pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+       f=(v["sec_ok"]=="1")?0:1
+     }
+-    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
++    printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+       t,r,ts,setup,keygen,slotstate,n,
+       sg_med,sg_mean,sg_sd,sg_lo,sg_hi,sg_tot,
+       pv_med,pv_mean,pv_sd,pv_lo,pv_hi,pv_tot,
+       vf_med,vf_mean,vf_sd,vf_lo,vf_hi,vf_tot,
+-      pb,rs,rm,pk,k,f,ls,le,fs,fe,cs,ce
++      pb,rs,rm,pk,k,f,ls,le,fs,fe,cs,ce,
++      dc_med,dc_mean,dc_sd,dc_lo,dc_hi,dc_tot,
++      dv_med,dv_mean,dv_sd,dv_lo,dv_hi,dv_tot,
++      rb_med,rb_tot,cr_med,cr_tot
+   }' <<<"$line" >> "$RUNS_CSV"
+ 
+   # Raw per-update samples.
+@@ -559,13 +659,25 @@ emit_run_row() { # $1 target  $2 run index
+     /^SAMPLE / {
+       delete v; for (i=2;i<=NF;i++){ split($i,kv,"="); v[kv[1]]=kv[2] }
+       if (v["target"]=="signer") {
+-        printf "%s,%d,%s,sign,%s,%s,%s\n",   t,r,v["idx"],v["sign_ms"],  v["bytes"],v["rss_mb"]
++        printf "%s,%d,%s,sign_protocol,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["bytes"],v["rss_mb"]
++        printf "%s,%d,%s,slot_burn,%s,%s,%s\n", t,r,v["idx"],v["reserve_ms"],v["bytes"],v["rss_mb"]
++        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["crypto_ms"],v["bytes"],v["rss_mb"]
++      } else if (v["target"]=="mldsa_signer") {
++        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["sig_bytes"],v["rss_mb"]
+       } else if (v["target"]=="prover") {
+         printf "%s,%d,%s,prove,%s,%s,%s\n",  t,r,v["idx"],v["prove_ms"], v["bytes"],v["rss_mb"]
+       } else if (v["target"]=="verifier") {
++        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
+         printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
++        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
+       } else if (v["target"]=="raw_agg") {
++        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
++        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
++        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
++      } else if (v["target"]=="mldsa_raw_agg") {
++        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
+         printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
++        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
+       }
+     }' "$SCRATCH/out.txt" >> "$SAMPLES"
+ }
+@@ -627,7 +739,7 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
+     echo
+     echo "ABORT: $target run $((i - tw)) reported a security-expectation failure" >&2
+     echo "(or an unparseable failure count). Numbers withheld." >&2
+-    grep -E '^(SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
++    grep -E '^(SIGNER|MLDSA_SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG|MLDSA_RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
+     exit 1
+   fi
+   if [ "$(count_bad_item_counts)" -gt 0 ]; then
+@@ -635,7 +747,13 @@ do_one() { # $1 target  $2 1-based index within that target's schedule
+     echo "ABORT: $target run $((i - tw)) measured 0 items, or a different number of" >&2
+     echo "items than earlier runs of the same target. A per-run median is only" >&2
+     echo "meaningful over a fixed workload. Numbers withheld." >&2
+-    grep -E '^(SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
++    grep -E '^(SIGNER|MLDSA_SIGNER|PROVER|VERIFIER|BENCH|RAW_AGG|MLDSA_RAW_AGG) ' "$SCRATCH/out.txt" >&2 || true
++    exit 1
++  fi
++  if ! awk -F, -v targets="$target" -v expected_runs="$((i - tw))" \
++      -v expected_items="$BENCH_UPDATES" -v allow_extra=1 \
++      -f tools/validate_benchmark_csv.awk "$RUNS_CSV" "$SAMPLES"; then
++    echo "ABORT: $target run $((i - tw)) has incomplete or malformed measurements" >&2
+     exit 1
+   fi
+ }
+@@ -715,6 +833,17 @@ else
+   done
+ fi
+ 
++# Validate every target and every expected sample before aggregating statistics.
++# Standalone runs may intentionally use different RUNS_<target> counts.
++run_counts=""
++for target in "${TARGET_LIST[@]}"; do
++  runs_var="RUNS_$target"
++  run_counts+="${run_counts:+ }$target:${!runs_var:-$RUNS}"
++done
++awk -F, -v targets="$TARGETS" -v run_counts="$run_counts" -v expected_runs="$RUNS" \
++    -v expected_items="$BENCH_UPDATES" -f tools/validate_benchmark_csv.awk \
++    "$RUNS_CSV" "$SAMPLES" || { echo "ABORT: incomplete campaign; numbers withheld" >&2; exit 1; }
++
+ # ---------------------------------------------------------- aggregate ----
+ # Descriptive stats on stdin (one number per line):
+ #   n min q1 median q3 max mean sd cv% ci95_halfwidth
+@@ -758,16 +887,27 @@ for target in "${TARGET_LIST[@]}"; do
+   emit "$target" setup            ms    "$C_SETUP"
+   emit "$target" keygen           ms    "$C_KEYGEN"
+   emit "$target" slot_state       ms    "$C_SLOTSTATE"
+-  emit "$target" sign_per_item    ms    "$C_SIGN_MED"
+-  emit "$target" sign_total       ms    "$C_SIGN_TOT"
++  if [ "$target" = signer ]; then
++    emit "$target" sign_protocol_per_item ms "$C_SIGN_MED"
++    emit "$target" sign_protocol_total ms "$C_SIGN_TOT"
++    emit "$target" slot_burn_per_item ms "$C_SLOT_BURN_MED"
++    emit "$target" sign_crypto_per_item ms "$C_SIGN_CRYPTO_MED"
++  elif [ "$target" = mldsa_signer ]; then
++    emit "$target" sign_crypto_per_item ms "$C_SIGN_MED"
++    emit "$target" sign_crypto_total ms "$C_SIGN_TOT"
++  fi
+   emit "$target" prove_per_item   ms    "$C_PROVE_MED"
+   emit "$target" prove_total      ms    "$C_PROVE_TOT"
+   emit "$target" verify_per_item  ms    "$C_VERIFY_MED"
+   emit "$target" verify_total     ms    "$C_VERIFY_TOT"
++  emit "$target" decode_per_item  ms    "$C_DECODE_MED"
++  emit "$target" decode_total     ms    "$C_DECODE_TOT"
++  emit "$target" decode_verify_per_item ms "$C_DECODE_VERIFY_MED"
++  emit "$target" decode_verify_total ms  "$C_DECODE_VERIFY_TOT"
+   case "$target" in
+-    signer)   emit "$target" signature_size bytes "$C_ARTIFACT" ;;
++    signer|mldsa_signer) emit "$target" signature_size bytes "$C_ARTIFACT" ;;
+     prover)   emit "$target" record_size    bytes "$C_ARTIFACT" ;;
+-    raw_agg)  emit "$target" record_size    bytes "$C_ARTIFACT" ;;
++    raw_agg|mldsa_raw_agg) emit "$target" record_size bytes "$C_ARTIFACT" ;;
+     combined) emit "$target" proof_size     bytes "$C_ARTIFACT" ;;
+   esac
+   emit "$target" rss_after_setup  MB    "$C_RSS_SETUP"
+@@ -798,9 +938,13 @@ drift_metric() { # target metric column
+ }
+ for target in "${TARGET_LIST[@]}"; do
+   case "$target" in
+-    signer) drift_metric "$target" sign_per_item "$C_SIGN_MED" ;;
++    signer) drift_metric "$target" sign_protocol_per_item "$C_SIGN_MED" ;;
++    mldsa_signer) drift_metric "$target" sign_crypto_per_item "$C_SIGN_MED" ;;
+     prover) drift_metric "$target" prove_per_item "$C_PROVE_MED" ;;
+-    verifier|raw_agg) drift_metric "$target" verify_per_item "$C_VERIFY_MED" ;;
++    verifier|raw_agg) drift_metric "$target" decode_verify_per_item "$C_DECODE_VERIFY_MED" ;;
++    mldsa_raw_agg)
++      drift_metric "$target" decode_verify_per_item "$C_DECODE_VERIFY_MED"
++      ;;
+     combined)
+       drift_metric "$target" prove_per_item "$C_PROVE_MED"
+       drift_metric "$target" verify_per_item "$C_VERIFY_MED"
+@@ -814,27 +958,44 @@ label() {
+   case "$1:$2" in
+     signer:keygen)           echo "keygen (1 key, once)" ;;
+     signer:slot_state)       echo "slot state (1 counter)" ;;
+-    signer:sign_per_item)    echo "sign / round (1 member)" ;;
+-    signer:sign_total)       echo "sign total / run" ;;
+-    signer:signature_size)   echo "signature size" ;;
+-    raw_agg:verify_per_item) echo "verify / update (raw)" ;;
+-    raw_agg:record_size)     echo "StatusList size" ;;
++    signer:sign_protocol_per_item) echo "XMSS protocol sign / round" ;;
++    signer:slot_burn_per_item) echo "XMSS durable slot burn" ;;
++    signer:sign_crypto_per_item) echo "XMSS crypto sign / round" ;;
++    mldsa_signer:keygen)     echo "keygen ML-DSA (1 key)" ;;
++    mldsa_signer:sign_crypto_per_item) echo "ML-DSA crypto sign / round" ;;
++    signer:sign_protocol_total) echo "XMSS protocol sign total" ;;
++    mldsa_signer:sign_crypto_total) echo "ML-DSA crypto sign total" ;;
++    signer:signature_size)   echo "XMSS signature size" ;;
++    mldsa_signer:signature_size) echo "ML-DSA signature size" ;;
++    raw_agg:verify_per_item) echo "verify-only XMSS / update" ;;
++    raw_agg:decode_per_item) echo "decode XMSS / update" ;;
++    raw_agg:decode_verify_per_item) echo "XMSS decode + verify" ;;
++    verifier:verify_per_item) echo "SNARK verify-only / update" ;;
++    verifier:decode_per_item) echo "SNARK decode / update" ;;
++    verifier:decode_verify_per_item) echo "SNARK decode + verify" ;;
++    mldsa_raw_agg:verify_per_item) echo "verify-only ML-DSA" ;;
++    mldsa_raw_agg:decode_per_item) echo "decode ML-DSA / update" ;;
++    mldsa_raw_agg:decode_verify_per_item) echo "decode + verify ML-DSA" ;;
++    raw_agg:record_size)     echo "XMSS StatusList size" ;;
++    mldsa_raw_agg:record_size) echo "ML-DSA StatusList size" ;;
+     prover:record_size)      echo "SnarkStatusList size" ;;
+     *:setup)                 echo "setup (circuit, once)" ;;
+     *:keygen)                echo "keygen (N keys, once)" ;;
+     *:slot_state)            echo "slot state (counters)" ;;
+-    *:sign_per_item)         echo "sign / round" ;;
+-    *:sign_total)            echo "sign total / run" ;;
+     *:prove_per_item)        echo "prove / update" ;;
+     *:prove_total)           echo "prove total / run" ;;
+     *:verify_per_item)       echo "verify / update" ;;
+     *:verify_total)          echo "verify total / run" ;;
++    *:decode_total)          echo "decode total / run" ;;
++    *:decode_verify_total)   echo "decode + verify total" ;;
+     *:proof_size)            echo "proof size" ;;
+     # RSS is expanded once, in the header legend above; these four then use the
+     # acronym alone, which is what keeps the varying part of each label visible.
+     # The first one is named after whatever fixed cost the target actually paid:
+     # signer and raw_agg build no circuit, so for them the column is post-keygen.
+     signer:rss_after_setup)  echo "RSS after keygen" ;;
++    mldsa_signer:rss_after_setup) echo "RSS after keygen" ;;
++    mldsa_raw_agg:rss_after_setup) echo "RSS after anchor" ;;
+     raw_agg:rss_after_setup)
+       [ -n "$BENCH_INPUT_DIR" ] && echo "RSS after anchor" || echo "RSS after keygen"
+       ;;
+@@ -853,7 +1014,8 @@ label() {
+   echo "governor  : $gov"
+   echo "threads   : $EFFECTIVE_THREADS${PIN_CPUS:+ (pinned to $PIN_CPUS)}"
+   echo "committee : N=$BENCH_N, t=$BENCH_T"
+-  echo "input     : $INPUT_MODE"
++  echo "XMSS input: $INPUT_MODE"
++  echo "MLDSA input: $MLDSA_INPUT_MODE"
+   echo "order     : $([ "$INTERLEAVE" = 1 ] && echo 'Williams-style balanced across targets' || echo 'contiguous blocks per target')"
+   echo "cooldown  : ${COOLDOWN_SECONDS}s before each target process"
+   echo "runs      : n=$RUNS measured, $WARMUP warmup(s) discarded (default;"
+@@ -951,8 +1113,8 @@ label() {
+   echo "    highest readable host temperature before and after every process. Empty"
+   echo "    telemetry fields mean the kernel exposed no portable sensor. drift.csv"
+   echo "    flags >15% early/late shifts but never removes observations."
+-  [ "$GIT_DIRTY" = no ] || echo "  * The tree was dirty. source.patch and source-status.txt are part of the result;"
+-  [ "$GIT_DIRTY" = no ] || echo "    without them the commit id does not reconstruct the measured source."
++  [ "$GIT_DIRTY" = no ] || echo "  * The tree was dirty. source.patch records tracked changes only; untracked"
++  [ "$GIT_DIRTY" = no ] || echo "    contents are omitted, so this run may not be exactly reconstructible."
+   echo "  * A prover process calls zk_alloc::enable_arena(), which sets"
+   echo "    M_TRIM_THRESHOLD=-1: its RSS never decreases, so 'peak' means"
+   echo "    'high-water mark of a monotonic curve'. A verify-only process keeps"
+@@ -971,8 +1133,12 @@ label() {
+     echo "    so the SNARK's extra fixed cost is the setup row alone, and raw_agg has no"
+     echo "    setup row. Comparing raw keygen with SNARK setup inverts the answer."
+   else
+-    echo "    No fixture-capable target was selected; signer and combined use their"
+-    echo "    native process shape."
++    echo "    No XMSS fixture-capable target was selected; XMSS signer and combined"
++    echo "    use their native process shape."
++  fi
++  if [ "$MLDSA_INPUT_MODE" = fixture ]; then
++    echo "  * ML-DSA key generation and quorum signing ran in a separate fixture"
++    echo "    process. mldsa_raw_agg measures only record decode and verification."
+   fi
+   echo "  * Per-update samples within a run are not independent (shared allocator"
+   echo "    and cache state). The table's unit is the per-run median; samples.csv"
+@@ -985,9 +1151,11 @@ label() {
+   echo "    total != n x per-update whenever the phase is skewed. Signing is: it"
+   echo "    has stragglers several times the median, and its total runs visibly"
+   echo "    above n x median. Verification is near-deterministic and does match."
+-  echo "  * Exactly one target reports 'sign': signer, which measures ONE member"
+-  echo "    doing ONE signature per round, preceded by its durable slot burn (write"
+-  echo "    the inactive journal generation + sync_data) through SignerNode."
++  echo "  * Each signer target measures ONE member doing ONE signature per round."
++  echo "    XMSS includes its durable slot burn (inactive journal generation plus"
++  echo "    sync_data) through SignerNode. ML-DSA is stateless and randomized, so"
++  echo "    it has no slot counter or persistence cost. Its crypto-sign row is not"
++  echo "    a complete signer protocol cost: one-statement-per-version state is absent."
+   if [ "$INPUT_MODE" = fixture ]; then
+     echo "    The measured prover/raw verifier receive t signatures prepared by the"
+     echo "    fixture process; neither produces signatures or holds secret keys."
+@@ -997,7 +1165,8 @@ label() {
+   else
+     echo "    No measured aggregator or raw verifier was selected in this campaign."
+   fi
+-  echo "  * signer's keygen and slot-state rows are for ONE key and ONE counter."
++  echo "  * Each keygen row is for ONE key. Only the XMSS signer has a slot-state"
++  echo "    row, for ONE durable counter."
+   if [ "$INPUT_MODE" = fixture ]; then
+     echo "    The fixture-mode prover/raw verifier report neither: the committee paid"
+     echo "    those costs outside the measured aggregator and verifier processes."
+@@ -1007,11 +1176,10 @@ label() {
+   else
+     echo "    No committee-wide keygen or slot-state row is present in this campaign."
+   fi
+-  echo "  * A member's signing cost is IDENTICAL on both published forms: same key,"
+-  echo "    same 32-byte message, same derived slot. What the two paths differ in is"
+-  echo "    only how the quorum is evidenced (t signatures + bitmap vs one proof)"
+-  echo "    and what a relying party pays to check it. So the signer row applies"
+-  echo "    unchanged to the SNARK and the raw path alike."
++  echo "  * The XMSS signer cost applies unchanged to XMSS raw and PQ-SNARK records:"
++  echo "    those forms use the same XMSS statement, key and derived slot. ML-DSA is"
++  echo "    a separate raw alternative and its signer cost must not be substituted"
++  echo "    into the XMSS-based proof path."
+ 
+   # Derived from THIS sweep, never remembered. Keeping historical figures here
+   # would make them look like results of the current run.
+diff --git a/committee-scaling-benchmark.sh b/committee-scaling-benchmark.sh
+index a4e52bd..fe39f18 100755
+--- a/committee-scaling-benchmark.sh
++++ b/committee-scaling-benchmark.sh
+@@ -2,12 +2,12 @@
+ # Committee-size scaling study built on top of benchmark.sh.
+ #
+ # This file deliberately does not reimplement measurement or statistics.
+-# It first invokes benchmark.sh once for the single-member signer role. Then,
++# It first invokes benchmark.sh once for the XMSS and ML-DSA signer roles. Then,
+ # for every admitted (N,t) point, it:
+-#   1. builds this crate with compile-time benchmark-only N/t overrides;
+-#   2. generates committee signatures in an unmeasured fixture process;
+-#   3. invokes benchmark.sh for one aggregator, one SNARK verifier and the raw
+-#      verifier baseline;
++#   1. builds both crates, with benchmark-only N/t overrides for XMSS;
++#   2. generates XMSS and ML-DSA signatures in unmeasured fixture processes;
++#   3. invokes benchmark.sh for one aggregator, one SNARK verifier and raw XMSS
++#      and ML-DSA verifier alternatives;
+ #   4. enforces one host-wide RAM/swap/time budget around every stage;
+ #   5. combines benchmark.sh's summary.csv files into a scaling report.
+ #
+@@ -49,6 +49,7 @@ MAX_SWAP_GROWTH_MB="${MAX_SWAP_GROWTH_MB:-64}"
+ HARD_MEMORY_LIMIT="${HARD_MEMORY_LIMIT:-required}"
+ MIN_FREE_DISK_MB="${MIN_FREE_DISK_MB:-8192}"
+ OUTDIR="${OUTDIR:-$REPO/committee-scaling-$(date +%Y%m%d-%H%M%S)}"
++BENCH_UPDATES="$(sed -n 's/^pub const N_UPDATES: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
+ 
+ # These are conservative admission thresholds for the usable benchmark budget,
+ # not claims about leanVM's exact memory curve. The live guard below remains the
+@@ -74,6 +75,18 @@ positive_integer() {
+     ''|*[!0-9]*|0) echo "$1 must be a positive integer, got '$2'" >&2; exit 1 ;;
+   esac
+ }
++for target in signer mldsa_signer prover verifier raw_agg mldsa_raw_agg; do
++  for prefix in RUNS WARMUP; do
++    override="${prefix}_${target}"
++    if [ "${!override+x}" ]; then
++      echo "scaling requires one balanced run count; unset $override and use $prefix instead" >&2
++      exit 1
++    fi
++  done
++done
++
++positive_integer BENCH_UPDATES "$BENCH_UPDATES"
++[ "$BENCH_UPDATES" -le 64 ] || { echo "N_UPDATES=$BENCH_UPDATES exceeds the ML-DSA fixture limit 64" >&2; exit 1; }
+ positive_integer RUNS "$RUNS"
+ positive_integer SWEEP_REPEATS "$SWEEP_REPEATS"
+ case "$WARMUP" in ''|*[!0-9]*) echo "WARMUP must be a non-negative integer" >&2; exit 1 ;; esac
+@@ -93,8 +106,8 @@ positive_integer RAM_FOR_N1500_MB "$RAM_FOR_N1500_MB"
+ 
+ if [ "$STUDY_MODE" = publication ]; then
+   [ "$RUNS" -ge 10 ] || { echo "publication mode requires RUNS >= 10" >&2; exit 1; }
+-  [ $((RUNS % 6)) -eq 0 ] || {
+-    echo "publication mode requires RUNS to be a multiple of 6 for the complete three-target Williams design" >&2
++  [ $((RUNS % 4)) -eq 0 ] || {
++    echo "publication mode requires RUNS to be a multiple of 4 for the complete four-target Williams design" >&2
+     exit 1
+   }
+   [ "$SWEEP_REPEATS" -ge 2 ] || { echo "publication mode requires SWEEP_REPEATS >= 2" >&2; exit 1; }
+@@ -224,16 +237,20 @@ if [ "$RESUME" = 1 ] && [ -f "$CONFIG_FILE" ]; then
+ fi
+ 
+ current_config() {
+-  echo "schema=3"
++  echo "schema=5"
+   echo "study_mode=$STUDY_MODE"
+   echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo n/a)"
+   echo "git_dirty=$(test -n "$(git status --porcelain 2>/dev/null)" && echo yes || echo no)"
+   echo "source_patch_sha=$(git diff --binary HEAD 2>/dev/null | sha256sum | awk '{print $1}')"
+   echo "cargo_lock_sha=$(sha256sum Cargo.lock 2>/dev/null | awk '{print $1}')"
++  echo "mldsa_cargo_lock_sha=$(sha256sum mldsa/Cargo.lock 2>/dev/null | awk '{print $1}')"
+   echo "benchmark_sha=$(sha256sum benchmark.sh | awk '{print $1}')"
+   echo "scaling_sha=$(sha256sum committee-scaling-benchmark.sh | awk '{print $1}')"
++  echo "validator_sha=$(sha256sum tools/validate_benchmark_csv.awk | awk '{print $1}')"
++  echo "untracked_sha=$(git ls-files -z --others --exclude-standard | sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}')"
+   echo "host=$(hostname)"
+   echo "cpu=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
++  echo "updates=$BENCH_UPDATES"
+   echo "runs=$RUNS"
+   echo "warmup=$WARMUP"
+   echo "sweep_repeats=$SWEEP_REPEATS"
+@@ -437,29 +454,46 @@ summary_rss() {
+   echo "$value"
+ }
+ 
++validate_campaign() { # directory, space-separated targets
++  local dir="$1" targets="$2"
++  [ -s "$dir/runs.csv" ] && [ -s "$dir/samples.csv" ] || return 1
++  awk -F, -v targets="$targets" -v expected_runs="$RUNS" \
++      -v expected_items="$BENCH_UPDATES" \
++      -f "$REPO/tools/validate_benchmark_csv.awk" \
++      "$dir/runs.csv" "$dir/samples.csv"
++}
++
+ STOP_FURTHER=0
+ STOP_REASON=""
+ OVERALL_STATUS=0
+ 
+ # Signing is independent of committee size: each member produces one signature
+-# for the same message and slot regardless of N or t. Measure that role once as
++# per update regardless of N or t. Measure XMSS and ML-DSA once each as
+ # a complete benchmark.sh campaign, preserving repeated runs and confidence
+ # intervals without redundantly charging it to every scaling point. N=5,t=4 is
+-# only the compile-time anchor for this invocation; the signer binary uses
+-# neither parameter.
++# only the compile-time anchor for this invocation; neither signer binary uses
++# those committee parameters.
+ mkdir -p "$SIGNER_BENCHMARK_DIR"
+ if [ -f "$SIGNER_DIR/status.txt" ] &&
+    [ "$(sed -n '1p' "$SIGNER_DIR/status.txt")" = complete ] &&
+    [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
+-  echo "RESUME: single-member signer benchmark already complete"
+-elif run_guarded "single-member signer benchmark" "$SIGNER_DIR/benchmark.log" \
++  if validate_campaign "$SIGNER_BENCHMARK_DIR" "signer mldsa_signer"; then
++    echo "RESUME: single-member signer benchmark already complete"
++  else
++    write_status "$SIGNER_DIR" benchmark_failed "stored signer measurements are incomplete or malformed"
++    STOP_FURTHER=1; STOP_REASON="stored signer measurements failed validation"; OVERALL_STATUS=1
++  fi
++elif run_guarded "single-member signer benchmarks" "$SIGNER_DIR/benchmark.log" \
+     env DROT_BENCH_N=5 DROT_BENCH_T=4 \
+-    RUNS="$RUNS" WARMUP="$WARMUP" TARGETS="signer" \
++    RUNS="$RUNS" WARMUP="$WARMUP" TARGETS="signer mldsa_signer" \
+     STRICT_ENV="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
+     COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
+     OUTDIR="$SIGNER_BENCHMARK_DIR" "$REPO/benchmark.sh"; then
+   if [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
+-    if [ "$STUDY_MODE" = publication ] && [ ! -s "$SIGNER_BENCHMARK_DIR/drift.csv" ]; then
++    if ! validate_campaign "$SIGNER_BENCHMARK_DIR" "signer mldsa_signer"; then
++      write_status "$SIGNER_DIR" benchmark_failed "signer measurements are incomplete or malformed"
++      STOP_FURTHER=1; STOP_REASON="signer measurements failed validation"; OVERALL_STATUS=1
++    elif [ "$STUDY_MODE" = publication ] && [ ! -s "$SIGNER_BENCHMARK_DIR/drift.csv" ]; then
+       write_status "$SIGNER_DIR" "benchmark_failed" "benchmark.sh produced no drift.csv"
+       STOP_FURTHER=1; STOP_REASON="single-member signer benchmark produced no drift diagnostic"; OVERALL_STATUS=1
+     elif [ "$STUDY_MODE" = publication ] &&
+@@ -501,6 +535,7 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
+     point_name="N$(printf '%04d' "$n")-t$(printf '%04d' "$t")"
+     point_dir="$OUTDIR/$point_name"
+     fixture_dir="$point_dir/fixture"
++    mldsa_fixture_dir="$point_dir/mldsa-fixture"
+     session_dir="$point_dir/session-$(printf '%02d' "$sweep")"
+     benchmark_dir="$session_dir/benchmark"
+     mkdir -p "$fixture_dir" "$benchmark_dir"
+@@ -511,14 +546,19 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
+     fi
+     if [ -f "$session_dir/status.txt" ] && [ "$(sed -n '1p' "$session_dir/status.txt")" = complete ] &&
+        [ -s "$benchmark_dir/summary.csv" ]; then
+-      echo "RESUME: $point_name session $sweep already complete"
++      if validate_campaign "$benchmark_dir" "prover verifier raw_agg mldsa_raw_agg"; then
++        echo "RESUME: $point_name session $sweep already complete"
++      else
++        write_status "$session_dir" benchmark_failed "stored measurements are incomplete or malformed"
++        STOP_FURTHER=1; STOP_REASON="$point_name stored measurements failed validation"; OVERALL_STATUS=1
++      fi
+       continue
+     fi
+ 
+     echo
+     echo "======================================================================"
+     echo "POINT $point_name, sweep $sweep/$SWEEP_REPEATS"
+-    echo "one aggregator, one SNARK verifier, one raw verifier"
++    echo "one aggregator, one SNARK verifier, one raw XMSS verifier, one raw ML-DSA verifier"
+     echo "quorum policy: t=floor(2N/3)+1 -> t=$t"
+     echo "guard: cgroup/poll RSS <= $MEMORY_LIMIT_MB MB, available >= $RESERVE_MB MB, disk >= $MIN_FREE_DISK_MB MB"
+     echo "======================================================================"
+@@ -530,6 +570,13 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
+       continue
+     fi
+ 
++    if ! run_guarded "$point_name/s$sweep ML-DSA build" "$session_dir/mldsa-build.log" \
++        cargo build --manifest-path "$REPO/mldsa/Cargo.toml" --release --locked; then
++      write_status "$session_dir" "build_failed" "$GUARD_REASON"
++      STOP_FURTHER=1; STOP_REASON="$point_name ML-DSA build did not complete safely"; OVERALL_STATUS=1
++      continue
++    fi
++
+     if [ ! -f "$point_dir/fixture.complete" ]; then
+       if ! run_guarded "$point_name fixture" "$point_dir/fixture.log" \
+           env DROT_BENCH_N="$n" DROT_BENCH_T="$t" \
+@@ -541,10 +588,26 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
+       printf 'complete\n' > "$point_dir/fixture.complete"
+     fi
+ 
++    if [ ! -f "$point_dir/mldsa-fixture.complete" ]; then
++      if [ -e "$mldsa_fixture_dir" ]; then
++        write_status "$session_dir" "fixture_failed" "incomplete ML-DSA fixture exists at $mldsa_fixture_dir; use a new OUTDIR or inspect and remove it explicitly"
++        STOP_FURTHER=1; STOP_REASON="$point_name has an incomplete ML-DSA fixture"; OVERALL_STATUS=2
++        continue
++      fi
++      if ! run_guarded "$point_name ML-DSA fixture" "$point_dir/mldsa-fixture.log" \
++          "$REPO/mldsa/target/release/mldsa_fixture" \
++          "$mldsa_fixture_dir" "$n" "$t" "$BENCH_UPDATES"; then
++        write_status "$session_dir" "fixture_failed" "$GUARD_REASON"
++        STOP_FURTHER=1; STOP_REASON="$point_name ML-DSA fixture did not complete safely"; OVERALL_STATUS=2
++        continue
++      fi
++      printf 'complete\n' > "$point_dir/mldsa-fixture.complete"
++    fi
++
+     if ! run_guarded "$point_name/s$sweep benchmark" "$session_dir/benchmark.log" \
+-        env DROT_BENCH_N="$n" DROT_BENCH_T="$t" BENCH_INPUT_DIR="$fixture_dir" \
++        env DROT_BENCH_N="$n" DROT_BENCH_T="$t" BENCH_INPUT_DIR="$fixture_dir" MLDSA_INPUT_DIR="$mldsa_fixture_dir" \
+         BENCH_SELF_CONTAINED=0 RUNS="$RUNS" WARMUP="$WARMUP" \
+-        TARGETS="prover verifier raw_agg" STRICT_ENV="$STRICT_ENV" \
++        TARGETS="prover verifier raw_agg mldsa_raw_agg" STRICT_ENV="$STRICT_ENV" \
+         REQUIRE_CLEAN_TREE="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
+         COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
+         OUTDIR="$benchmark_dir" "$REPO/benchmark.sh"; then
+@@ -558,6 +621,11 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
+       STOP_FURTHER=1; STOP_REASON="$point_name benchmark produced no summary"; OVERALL_STATUS=1
+       continue
+     fi
++    if ! validate_campaign "$benchmark_dir" "prover verifier raw_agg mldsa_raw_agg"; then
++      write_status "$session_dir" benchmark_failed "measurements are incomplete or malformed"
++      STOP_FURTHER=1; STOP_REASON="$point_name measurements failed validation"; OVERALL_STATUS=1
++      continue
++    fi
+     if [ "$STUDY_MODE" = publication ] && [ ! -s "$benchmark_dir/drift.csv" ]; then
+       write_status "$session_dir" "benchmark_failed" "benchmark.sh produced no drift.csv"
+       STOP_FURTHER=1; STOP_REASON="$point_name benchmark produced no drift diagnostic"; OVERALL_STATUS=1
+@@ -585,7 +653,12 @@ for n in "${SELECTED_SIZES[@]}"; do
+   for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
+     session_dir="$point_dir/session-$(printf '%02d' "$sweep")"
+     if [ -f "$session_dir/status.txt" ] && [ "$(sed -n '1p' "$session_dir/status.txt")" = complete ]; then
+-      complete=$((complete + 1))
++      if validate_campaign "$session_dir/benchmark" "prover verifier raw_agg mldsa_raw_agg"; then
++        complete=$((complete + 1))
++      else
++        write_status "$session_dir" benchmark_failed "measurements failed final validation"
++        OVERALL_STATUS=1
++      fi
+     fi
+   done
+   if [ "$complete" -eq "$SWEEP_REPEATS" ]; then
+@@ -610,7 +683,7 @@ done
+ if [ -f "$SIGNER_DIR/status.txt" ] &&
+    [ "$(sed -n '1p' "$SIGNER_DIR/status.txt")" = complete ] &&
+    [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
+-  awk -F, 'NR == 1 || $1 == "signer"' "$SIGNER_BENCHMARK_DIR/summary.csv" > "$SIGNER_CSV"
++  awk -F, 'NR == 1 || $1 == "signer" || $1 == "mldsa_signer"' "$SIGNER_BENCHMARK_DIR/summary.csv" > "$SIGNER_CSV"
+ else
+   echo 'target,metric,unit,n,min,q1,median,q3,max,mean,sd,cv_pct,ci95_halfwidth' > "$SIGNER_CSV"
+ fi
+@@ -668,8 +741,8 @@ paired_values() { # point_dir delta|speedup|break_even|nonpositive
+     [ -f "$file" ] || continue
+     awk -F, -v mode="$mode" '
+       NR>1 && $1=="prover"   {p[$2]=$14}
+-      NR>1 && $1=="verifier" {v[$2]=$20}
+-      NR>1 && $1=="raw_agg"  {r[$2]=$20}
++      NR>1 && $1=="verifier" {v[$2]=$44}
++      NR>1 && $1=="raw_agg"  {r[$2]=$44}
+       END {for(i in p) if((i in v)&&(i in r)) {
+         d=r[i]-v[i]
+         if(mode=="delta") print d
+@@ -683,7 +756,7 @@ paired_values() { # point_dir delta|speedup|break_even|nonpositive
+   done
+ }
+ 
+-echo 'n,t,observations,prover_setup_ms,prove_ms,snark_verify_ms,raw_verify_ms,verify_delta_mean_ms,verify_delta_ci95_low,verify_delta_ci95_high,verify_advantage_confirmed,verify_speedup_median,verify_speedup_q1,verify_speedup_q3,snark_record_bytes,raw_record_bytes,wire_reduction_pct,break_even_median,break_even_q1,break_even_q3,prover_peak_mb,snark_verifier_peak_mb,raw_verifier_peak_mb,point_dir' > "$SCALING_CSV"
++echo 'n,t,observations,prover_setup_ms,prove_ms,snark_decode_verify_ms,raw_decode_verify_ms,verify_delta_mean_ms,verify_delta_ci95_low,verify_delta_ci95_high,verify_advantage_confirmed,verify_speedup_median,verify_speedup_q1,verify_speedup_q3,snark_record_bytes,raw_record_bytes,wire_reduction_pct,break_even_median,break_even_q1,break_even_q3,prover_peak_mb,snark_verifier_peak_mb,raw_verifier_peak_mb,point_dir,mldsa_decode_ms,mldsa_verify_ms,mldsa_decode_verify_ms,mldsa_record_bytes,mldsa_verifier_peak_mb,snark_decode_ms,snark_verify_only_ms,raw_decode_ms,raw_verify_only_ms' > "$SCALING_CSV"
+ for n in "${SELECTED_SIZES[@]}"; do
+   t="$(threshold_for "$n")"
+   point_name="N$(printf '%04d' "$n")-t$(printf '%04d' "$t")"
+@@ -693,19 +766,37 @@ for n in "${SELECTED_SIZES[@]}"; do
+ 
+   setup_stats="$(point_values "$point_dir" prover 4 | stats)"
+   prove_stats="$(point_values "$point_dir" prover 14 | stats)"
+-  sv_stats="$(point_values "$point_dir" verifier 20 | stats)"
+-  rv_stats="$(point_values "$point_dir" raw_agg 20 | stats)"
++  sv_stats="$(point_values "$point_dir" verifier 44 | stats)"
++  rv_stats="$(point_values "$point_dir" raw_agg 44 | stats)"
++  sd_stats="$(point_values "$point_dir" verifier 38 | stats)"
++  so_stats="$(point_values "$point_dir" verifier 20 | stats)"
++  rd_stats="$(point_values "$point_dir" raw_agg 38 | stats)"
++  ro_stats="$(point_values "$point_dir" raw_agg 20 | stats)"
+   sb_stats="$(point_values "$point_dir" prover 26 | stats)"
+   rb_stats="$(point_values "$point_dir" raw_agg 26 | stats)"
+   pr_stats="$(point_values "$point_dir" prover 30 | stats)"
+   sr_stats="$(point_values "$point_dir" verifier 30 | stats)"
+   rr_stats="$(point_values "$point_dir" raw_agg 30 | stats)"
++  md_stats="$(point_values "$point_dir" mldsa_raw_agg 38 | stats)"
++  mv_stats="$(point_values "$point_dir" mldsa_raw_agg 20 | stats)"
++  mt_stats="$(point_values "$point_dir" mldsa_raw_agg 44 | stats)"
++  mb_stats="$(point_values "$point_dir" mldsa_raw_agg 26 | stats)"
++  mr_stats="$(point_values "$point_dir" mldsa_raw_agg 30 | stats)"
+   delta_stats="$(paired_values "$point_dir" delta | stats)"
+   speed_stats="$(paired_values "$point_dir" speedup | stats)"
+   be_stats="$(paired_values "$point_dir" break_even | stats)"
+   nonpositive_deltas="$(paired_values "$point_dir" nonpositive | awk 'END{print NR+0}')"
+ 
+   observations="$(awk '{print $1}' <<<"$prove_stats")"
++  delta_count="$(awk '{print $1}' <<<"$delta_stats")"
++  speed_count="$(awk '{print $1}' <<<"$speed_stats")"
++  expected_observations=$((RUNS * SWEEP_REPEATS))
++  if [ "$observations" -ne "$expected_observations" ] ||
++     [ "$delta_count" -ne "$expected_observations" ] ||
++     [ "$speed_count" -ne "$expected_observations" ]; then
++    echo "incomplete paired observations for $point_name: prove=$observations delta=$delta_count speedup=$speed_count expected=$expected_observations" >&2
++    exit 1
++  fi
+   prover_setup="$(awk '{print $4}' <<<"$setup_stats")"
+   prove="$(awk '{print $4}' <<<"$prove_stats")"
+   snark_verify="$(awk '{print $4}' <<<"$sv_stats")"
+@@ -730,13 +821,32 @@ for n in "${SELECTED_SIZES[@]}"; do
+   prover_rss="$(awk '{print $4}' <<<"$pr_stats")"
+   snark_verifier_rss="$(awk '{print $4}' <<<"$sr_stats")"
+   raw_verifier_rss="$(awk '{print $4}' <<<"$rr_stats")"
+-
+-  printf '%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
++  mldsa_decode="$(awk '{print $4}' <<<"$md_stats")"
++  mldsa_verify="$(awk '{print $4}' <<<"$mv_stats")"
++  mldsa_total="$(awk '{print $4}' <<<"$mt_stats")"
++  mldsa_bytes="$(awk '{print $4}' <<<"$mb_stats")"
++  mldsa_rss="$(awk '{print $4}' <<<"$mr_stats")"
++  snark_decode="$(awk '{print $4}' <<<"$sd_stats")"
++  snark_verify_only="$(awk '{print $4}' <<<"$so_stats")"
++  raw_decode="$(awk '{print $4}' <<<"$rd_stats")"
++  raw_verify_only="$(awk '{print $4}' <<<"$ro_stats")"
++
++  printf '%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+     "$n" "$t" "$observations" "$prover_setup" "$prove" "$snark_verify" "$raw_verify" \
+     "$delta_mean" "$delta_low" "$delta_high" "$advantage" "$speed" "$speed_q1" "$speed_q3" \
+     "$snark_bytes" "$raw_bytes" "$wire_reduction" "$break_even" "$break_even_q1" "$break_even_q3" \
+-    "$prover_rss" "$snark_verifier_rss" "$raw_verifier_rss" "$point_dir" >> "$SCALING_CSV"
++    "$prover_rss" "$snark_verifier_rss" "$raw_verifier_rss" "$point_dir" \
++    "$mldsa_decode" "$mldsa_verify" "$mldsa_total" "$mldsa_bytes" "$mldsa_rss" \
++    "$snark_decode" "$snark_verify_only" "$raw_decode" "$raw_verify_only" >> "$SCALING_CSV"
+ done
++awk -F, '
++  NR == 1 { expected = NF; next }
++  NF != expected {
++    printf "scaling.csv row %d has %d columns; expected %d\n", NR, NF, expected > "/dev/stderr"
++    bad = 1
++  }
++  END { exit bad }
++' "$SCALING_CSV"
+ 
+ {
+   echo "COMMITTEE SCALING REPORT"
+@@ -746,36 +856,55 @@ done
+   echo "policy    : t=floor(2N/3)+1 (strict two-thirds supermajority)"
+   echo "runs      : $RUNS measured + $WARMUP warmup per target, across $SWEEP_REPEATS complete sweep(s)"
+   echo "cooldown  : $COOLDOWN_SECONDS seconds before every measured process"
+-  echo "roles     : one signer campaign; per point, one aggregator, one SNARK verifier and one raw verifier"
++  echo "roles     : two single-member signers; per point, one aggregator and three relying-party verifiers"
+   echo "RAM plan  : ${AVAILABLE_MB} MB initially available; ${MEMORY_LIMIT_MB} MB process cap; selected N<=${MAX_SELECTED_N}"
+   echo "hard cap  : $HARD_LIMIT_BACKEND"
+   [ "$STUDY_MODE" = pilot ] && echo "status    : EXPLORATORY PILOT — do not publish as a final measurement campaign"
+   echo
+-  echo "SINGLE-MEMBER SIGNER — MEASURED ONCE FOR THE WHOLE SWEEP"
++  echo "SINGLE-MEMBER SIGNERS — MEASURED ONCE FOR THE WHOLE SWEEP"
+   if [ -s "$SIGNER_CSV" ] && [ "$(awk 'END { print NR }' "$SIGNER_CSV")" -gt 1 ]; then
+-    signer_n="$(awk -F, 'NR > 1 && $2 == "sign_per_item" { print $4; exit }' "$SIGNER_CSV")"
++    signer_n="$(awk -F, 'NR > 1 && $1 == "signer" && $2 == "sign_protocol_per_item" { print $4; exit }' "$SIGNER_CSV")"
+     signer_keygen="$(summary_value "$SIGNER_CSV" signer keygen)"
+     signer_slot_state="$(summary_value "$SIGNER_CSV" signer slot_state)"
+-    signer_sign="$(summary_value "$SIGNER_CSV" signer sign_per_item)"
++    signer_sign="$(summary_value "$SIGNER_CSV" signer sign_protocol_per_item)"
++    signer_burn="$(summary_value "$SIGNER_CSV" signer slot_burn_per_item)"
++    signer_crypto="$(summary_value "$SIGNER_CSV" signer sign_crypto_per_item)"
+     signer_bytes="$(summary_value "$SIGNER_CSV" signer signature_size)"
+     signer_rss="$(summary_rss "$SIGNER_CSV" signer)"
+-    printf "  key generation (one key) : %.2f ms\n" "$signer_keygen"
+-    printf "  durable slot state       : %.2f ms\n" "$signer_slot_state"
+-    printf "  sign / round             : %.2f ms (median of %s run medians)\n" "$signer_sign" "$signer_n"
+-    printf "  signature size           : %.0f bytes\n" "$signer_bytes"
+-    printf "  signer peak RSS          : %.1f MB\n" "$signer_rss"
+-    echo "  applies unchanged to every (N,t) point and to both publication forms"
+-    echo "  N=5,t=4 is only this invocation's compilation anchor; signer uses neither"
++    mldsa_n="$(awk -F, 'NR > 1 && $1 == "mldsa_signer" && $2 == "sign_crypto_per_item" { print $4; exit }' "$SIGNER_CSV")"
++    mldsa_keygen="$(summary_value "$SIGNER_CSV" mldsa_signer keygen)"
++    mldsa_sign="$(summary_value "$SIGNER_CSV" mldsa_signer sign_crypto_per_item)"
++    mldsa_bytes="$(summary_value "$SIGNER_CSV" mldsa_signer signature_size)"
++    mldsa_signer_rss="$(summary_rss "$SIGNER_CSV" mldsa_signer)"
++    printf "  XMSS keygen (one key)    : %.2f ms\n" "$signer_keygen"
++    printf "  XMSS durable slot state  : %.2f ms\n" "$signer_slot_state"
++    printf "  XMSS protocol sign       : %.2f ms (median of %s run medians)\n" "$signer_sign" "$signer_n"
++    printf "    durable slot burn      : %.2f ms; cryptographic sign %.2f ms\n" "$signer_burn" "$signer_crypto"
++    printf "  XMSS signature size      : %.0f bytes; peak RSS %.1f MB\n" "$signer_bytes" "$signer_rss"
++    printf "  ML-DSA keygen (one key)  : %.2f ms\n" "$mldsa_keygen"
++    printf "  ML-DSA crypto sign only  : %.2f ms (median of %s run medians)\n" "$mldsa_sign" "$mldsa_n"
++    printf "  ML-DSA signature size    : %.0f bytes; peak RSS %.1f MB\n" "$mldsa_bytes" "$mldsa_signer_rss"
++    echo "  XMSS protocol cost includes durable burn; ML-DSA has no"
++    echo "  one-statement-per-version state and is NOT a comparable protocol cost"
++    echo "  both per-member measurements are independent of N and t"
++    echo "  N=5,t=4 is only this invocation's compilation anchor; neither signer uses it"
+   else
+     echo "  unavailable: see signer/status.txt and signer/benchmark.log"
+   fi
+   echo
+   printf '%6s %6s %5s %11s %11s %11s %9s %12s %12s %10s %11s\n' \
+-    N t obs prove_ms snark_v_ms raw_v_ms speedup snark_bytes raw_bytes confirmed break_even
++    N t obs prove_ms snark_e2e raw_e2e speedup snark_bytes raw_bytes confirmed break_even
+   if [ -s "$SCALING_CSV" ]; then
+     awk -F, 'NR>1 {printf "%6d %6d %5d %11.2f %11.2f %11.2f %8.2fx %12.0f %12.0f %10s %11s\n",$1,$2,$3,$5,$6,$7,$12,$15,$16,($11==1?"yes":"no"),($18==""?"-":sprintf("%.1f",$18))}' "$SCALING_CSV"
+   fi
+   echo
++  echo "RAW VERIFIER PHASES — E2E IS ONE CONTIGUOUS DECODE + VERIFY TIMER"
++  printf '%6s %6s %10s %10s %10s %10s %10s %10s %12s %12s\n' \
++    N t xmss_dec xmss_ver xmss_e2e mldsa_dec mldsa_ver mldsa_e2e xmss_bytes mldsa_bytes
++  if [ -s "$SCALING_CSV" ]; then
++    awk -F, 'NR>1 {printf "%6d %6d %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f %12.0f %12.0f\n",$1,$2,$32,$33,$7,$25,$26,$27,$16,$28}' "$SCALING_CSV"
++  fi
++  echo
+   size_cross="$(awk -F, 'NR>1 && $16+0>$15+0 {print $1; exit}' "$SCALING_CSV")"
+   verify_cross="$(awk -F, 'NR>1 && $11==1 {print $1; exit}' "$SCALING_CSV")"
+   joint_cross="$(awk -F, 'NR>1 && $16+0>$15+0 && $11==1 {print $1; exit}' "$SCALING_CSV")"
+@@ -786,11 +915,13 @@ done
+   echo
+   echo "break_even is the number of independent relying-party verifications needed"
+   echo "for saved verification time to repay one proof:"
+-  echo "  ceil(prove_ms / (raw_verify_ms - snark_verify_ms))."
++  echo "  ceil(prove_ms / (raw_decode_verify_ms - snark_decode_verify_ms))."
+   echo "It excludes one-time setup, signing (identical for both forms), network cost"
+   echo "and fixture generation. The table reports break-even only when the paired"
+   echo "95% CI for raw_verify - snark_verify is wholly above zero and every paired"
+-  echo "run saved verification time. scaling.csv also contains Q1/Q3 for speedup"
++  echo "run saved end-to-end verification time. The paired CI treats repeated runs"
++  echo "as independent within this host/session; it does not establish an effect"
++  echo "across days or machines. scaling.csv contains Q1/Q3 for speedup"
+   echo "and break-even. No timing samples are discarded."
+   echo
+   echo "RESOURCE OUTCOME"
+diff --git a/demo/Cargo.lock b/demo/Cargo.lock
+index 9df6aab..b4f95f5 100644
+--- a/demo/Cargo.lock
++++ b/demo/Cargo.lock
+@@ -624,6 +624,12 @@ version = "1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+ 
++[[package]]
++name = "cmov"
++version = "0.5.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
++
+ [[package]]
+ name = "colorchoice"
+ version = "1.0.5"
+@@ -648,6 +654,12 @@ version = "0.9.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+ 
++[[package]]
++name = "const-oid"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
++
+ [[package]]
+ name = "const_format"
+ version = "0.2.36"
+@@ -736,7 +748,18 @@ version = "0.2.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
+ dependencies = [
++ "getrandom 0.4.3",
+  "hybrid-array",
++ "rand_core 0.10.1",
++]
++
++[[package]]
++name = "ctutils"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
++dependencies = [
++ "cmov",
+ ]
+ 
+ [[package]]
+@@ -825,7 +848,17 @@ version = "0.7.10"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+ dependencies = [
+- "const-oid",
++ "const-oid 0.9.6",
++ "zeroize",
++]
++
++[[package]]
++name = "der"
++version = "0.8.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a878c850e9e421b20262e9b41f9c860e4785fa07541c266b62ff9d1ef998a80a"
++dependencies = [
++ "const-oid 0.10.2",
+  "zeroize",
+ ]
+ 
+@@ -888,7 +921,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+ dependencies = [
+  "block-buffer 0.10.4",
+- "const-oid",
++ "const-oid 0.9.6",
+  "crypto-common 0.1.7",
+  "subtle",
+ ]
+@@ -908,6 +941,7 @@ name = "drot-demo"
+ version = "0.1.0"
+ dependencies = [
+  "decentralized-root-of-trust",
++ "drot-mldsa",
+  "ethereum_ssz",
+  "ethereum_ssz_derive",
+  "leanvm",
+@@ -917,6 +951,18 @@ dependencies = [
+  "sha3 0.10.9",
+ ]
+ 
++[[package]]
++name = "drot-mldsa"
++version = "0.1.0"
++dependencies = [
++ "ethereum_ssz",
++ "ethereum_ssz_derive",
++ "getrandom 0.4.3",
++ "ml-dsa",
++ "sha3 0.10.9",
++ "typenum",
++]
++
+ [[package]]
+ name = "dyn-clone"
+ version = "1.0.20"
+@@ -929,12 +975,12 @@ version = "0.16.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
+ dependencies = [
+- "der",
++ "der 0.7.10",
+  "digest 0.10.7",
+  "elliptic-curve",
+  "rfc6979",
+- "signature",
+- "spki",
++ "signature 2.2.0",
++ "spki 0.7.3",
+ ]
+ 
+ [[package]]
+@@ -967,7 +1013,7 @@ dependencies = [
+  "ff",
+  "generic-array",
+  "group",
+- "pkcs8",
++ "pkcs8 0.10.2",
+  "rand_core 0.6.4",
+  "sec1",
+  "subtle",
+@@ -1277,7 +1323,9 @@ version = "0.4.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+ dependencies = [
++ "ctutils",
+  "typenum",
++ "zeroize",
+ ]
+ 
+ [[package]]
+@@ -1590,6 +1638,35 @@ version = "2.8.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+ 
++[[package]]
++name = "ml-dsa"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "add6b9d92e496f16f4526d68ff29da1483aba4b119baeab8bed3b9e3544a6f3d"
++dependencies = [
++ "const-oid 0.10.2",
++ "crypto-common 0.2.2",
++ "ctutils",
++ "hybrid-array",
++ "module-lattice",
++ "pkcs8 0.11.0",
++ "shake",
++ "signature 3.0.0",
++ "zeroize",
++]
++
++[[package]]
++name = "module-lattice"
++version = "0.2.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c61b87c9683ab7cb1c6871d261ad5479b6b10ceb52c4352aaca3b5d35a8febe"
++dependencies = [
++ "ctutils",
++ "hybrid-array",
++ "num-traits",
++ "zeroize",
++]
++
+ [[package]]
+ name = "nu-ansi-term"
+ version = "0.50.3"
+@@ -1723,8 +1800,18 @@ version = "0.10.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
+ dependencies = [
+- "der",
+- "spki",
++ "der 0.7.10",
++ "spki 0.7.3",
++]
++
++[[package]]
++name = "pkcs8"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
++dependencies = [
++ "der 0.8.2",
++ "spki 0.8.0",
+ ]
+ 
+ [[package]]
+@@ -2121,9 +2208,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
+ dependencies = [
+  "base16ct",
+- "der",
++ "der 0.7.10",
+  "generic-array",
+- "pkcs8",
++ "pkcs8 0.10.2",
+  "subtle",
+  "zeroize",
+ ]
+@@ -2287,6 +2374,17 @@ dependencies = [
+  "cfg-if",
+ ]
+ 
++[[package]]
++name = "shake"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
++dependencies = [
++ "digest 0.11.3",
++ "keccak 0.2.1",
++ "sponge-cursor",
++]
++
+ [[package]]
+ name = "sharded-slab"
+ version = "0.1.7"
+@@ -2312,6 +2410,16 @@ dependencies = [
+  "rand_core 0.6.4",
+ ]
+ 
++[[package]]
++name = "signature"
++version = "3.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
++dependencies = [
++ "digest 0.11.3",
++ "rand_core 0.10.1",
++]
++
+ [[package]]
+ name = "slab"
+ version = "0.4.12"
+@@ -2342,9 +2450,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+ dependencies = [
+  "base64ct",
+- "der",
++ "der 0.7.10",
+ ]
+ 
++[[package]]
++name = "spki"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
++dependencies = [
++ "base64ct",
++ "der 0.8.2",
++]
++
++[[package]]
++name = "sponge-cursor"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
++
+ [[package]]
+ name = "static_assertions"
+ version = "1.1.0"
+diff --git a/demo/Cargo.toml b/demo/Cargo.toml
+index b317663..8b7a534 100644
+--- a/demo/Cargo.toml
++++ b/demo/Cargo.toml
+@@ -1,7 +1,7 @@
+ # Standalone crate, deliberately outside the measured one.
+ #
+-# The library and the four benchmark binaries are the artifact this project
+-# publishes and measures; the demo adds networking, container orchestration and
++# The root and ML-DSA protocol crates are the artifacts this project measures;
++# the demo adds networking, container orchestration and
+ # a credential format, none of which belong in that surface. Keeping it a
+ # separate package means the demo cannot change what the benchmark builds.
+ #
+@@ -17,6 +17,7 @@ publish = false
+ 
+ [dependencies]
+ decentralized-root-of-trust = { path = ".." }
++drot-mldsa = { path = "../mldsa" }
+ leanvm = { git = "https://github.com/leanEthereum/leanVM.git", rev = "73a5f5dcd34d8dfe76a32a44dce0c0f87c86feeb" }
+ 
+ # Same wire discipline as the protocol objects: every message on the network has
+diff --git a/demo/README.md b/demo/README.md
+index 77a9d2c..ad72db6 100644
+--- a/demo/README.md
++++ b/demo/README.md
+@@ -1,17 +1,16 @@
+ # Container demos
+ 
+-Two runs of the same ten-node network, differing in one decision: what the
+-aggregator publishes once it has a quorum.
++Three runs of the same ten-node topology, distinguished by signature scheme and
++published quorum form.
+ 
+-* **raw** lets any member aggregate, then publishes the `t` XMSS signatures and a
+-  bitmap naming their signers.
+-* **snark** publishes one aggregated proof, produced by a configured aggregator subset.
++* **raw** publishes `t` XMSS signatures and their signer bitmap.
++* **snark** aggregates that XMSS quorum into one leanVM proof; only a configured
++  prover subset may coordinate these rounds.
++* **mldsa** publishes `t` raw FIPS 204 ML-DSA-65 signatures and their bitmap.
+ 
+-The protocol flow is otherwise the same: same committee, same threshold, same
+-credential, same shared storage, same relying party. In SNARK mode the aggregator
+-role is restricted to a small prover subset, so only those members pay
+-`setup_prover()`; all ten members still sign proposals. The publication and
+-verification reports remain the comparison points the demo prints.
++All modes use `N = 10`, `t = 7`, the same credential lifecycle, storage
++fixture and relying-party anti-rollback rule. ML-DSA uses its own committee
++anchor and signed-statement format; it is not fed into the XMSS SNARK path.
+ 
+ ```
+ ./demo.sh raw   up        # build, start 1 bootstrap + 10 members + node A
+@@ -21,22 +20,28 @@ verification reports remain the comparison points the demo prints.
+ ./demo.sh raw   crash     # kill a member mid-protocol, watch it re-align
+ ./demo.sh raw   down      # stop and delete the volumes
+ 
+-./demo.sh snark up        # the same network, publishing one proof instead
++./demo.sh snark up        # XMSS quorum aggregated into one proof
+ ./demo.sh snark round
++
++./demo.sh mldsa up        # raw ML-DSA-65 quorum
++./demo.sh mldsa round
++./demo.sh mldsa revoke
++./demo.sh mldsa verify
++./demo.sh mldsa down
+ ```
+ 
+-The two demos share the `172.28.0.0/24` subnet, so only one runs at a time.
+-`up` tears the other one down first.
++The three demos share the `172.28.0.0/24` subnet, so only one runs at a time.
++`up` tears the other two down first.
+ 
+ ## Topology
+ 
+ | container | address | role |
+ |---|---|---|
+ | `bootstrap` | 172.28.0.5 | assembles the anchor, then exits |
+-| `signer-0` … `signer-9` | 172.28.0.11 … .20 | committee members, `N = 10`, `t = 7`; in SNARK mode `0`, `4`, `8` are also aggregators |
++| `signer-0` … `signer-9` | 172.28.0.11 … .20 | committee members, `N = 10`, `t = 7`; raw and ML-DSA allow every member to aggregate, while SNARK restricts aggregation to `0`, `4`, `8` |
+ | `holder` | 172.28.0.30 | node A, the relying party; resident, verifies on demand |
+ | `trigger` | assigned | asks node A for one round; run on demand |
+-| `probe` | assigned | double-sign probe; run on demand |
++| `probe` | assigned | XMSS double-sign probe and shared-volume utility; run on demand |
+ 
+ Three volumes, and the split between them is the design:
+ 
+@@ -47,8 +52,9 @@ Three volumes, and the split between them is the design:
+   secure VDR would return. It does not implement distributed storage,
+   replication, consensus or canonicality; the node still authenticates the
+   record locally.
+-* `signer-<i>-state/` is **private to one member**: its durable slot counter.
+-  Sharing it would destroy the property it exists to provide.
++* `signer-<i>-state/` exists in the XMSS modes only and is **private to one
++  member**: it holds the durable one-time-slot counter. ML-DSA is stateless and
++  therefore has no corresponding slot-counter volume.
+ 
+ ## What a round looks like
+ 
+@@ -66,21 +72,25 @@ grow, shrink, or become empty. There is no one-entry transition rule.
+ 2. The aggregator constructs the next complete `(version, list)` snapshot and
+    proposes it to all ten members. The protocol permits any number of additions
+    and removals in the same version; `round` and `revoke` merely drive one simple
+-   operation each. The aggregator does **not** propose a slot: every member
+-   derives that itself through `Committee::slot_for`.
+-3. Each member burns the derived slot durably, signs the exact snapshot, and
+-   answers. A member whose slot is already spent abstains, which is a normal
+-   outcome. The demo approves every requested lifecycle operation; a deployment
+-   supplies its own issuance and revocation policy.
++   operation each. In the XMSS modes the aggregator does **not** propose a slot:
++   every member derives it through `Committee::slot_for`. ML-DSA has no slot.
++3. Each member signs the exact canonical statement. XMSS members first burn the
++   derived leaf slot durably and abstain if it is already spent. ML-DSA members
++   use randomized FIPS 204 signing and need no one-time state. The demo approves
++   every requested lifecycle operation; a deployment supplies its own policy.
++   ML-DSA itself does not prevent a member from signing two different statements
++   for one version. The demo does not implement a durable anti-equivocation rule;
++   it assumes the external VDR supplies one canonical current record.
+ 4. The aggregator counts signatures until the seventh arrives. Each one is
+    verified against the anchor's key at that index before it is counted, so the
+    address map decides *where* to look and never *whether* the signature is
+    good.
+-5. It builds the record (bitmap from those indices, or one aggregated proof) and
+-   atomically replaces the demo's single current-record fixture.
+-6. Node A fetches that one record and hands the bytes to a
+-   `RawNode` or a `SnarkNode`, which decodes, verifies against the anchor, and
+-   only then lets the version move its anti-rollback mark. Node A requires the
++5. It builds the selected record: raw XMSS, aggregated XMSS, or raw ML-DSA. It
++   then atomically replaces the demo's single current-record fixture.
++6. Node A fetches that record, decodes and verifies it against the mode's anchor,
++   and only then lets the authenticated version move its anti-rollback mark.
++   The ML-DSA node preserves the same verify-before-gate ordering as `RawNode`
++   and `SnarkNode`. Node A requires the
+    issued credential's fingerprint to be present, or the revoked credential's
+    fingerprint to be absent.
+ 
+@@ -88,13 +98,14 @@ grow, shrink, or become empty. There is no one-entry transition rule.
+ 
+ Node A prints the two figures worth comparing.
+ 
+-**Size.** The raw record is `t` signatures and a rounding error, so it grows by
+-1208 bytes per additional signer. The SNARK record is a proof whose size does
+-not move with `t` at all. The breakdown makes that structural rather than
+-asserted.
++**Size.** Raw records grow linearly with `t`: 1208 bytes per XMSS signature
++or 3309 bytes per ML-DSA-65 signature, plus bitmap and framing. The SNARK record
++replaces the XMSS signatures with one aggregate proof. The printed breakdown
++reports the complete serialized record rather than only its cryptographic body.
+ 
+ **Memory.** The raw verifier has no setup: it holds an anchor and calls
+-`leanvm::xmss::verify` `t` times. In SNARK mode, node A loads the verifier once and the
++`leanvm::xmss::verify` `t` times; the ML-DSA raw verifier performs `t`
++FIPS 204 verifications. In SNARK mode, node A loads the verifier once and the
+ aggregator subset loads the prover once per aggregator process. The first cost is
+ visible in node A's startup log; the second is visible in the selected members'
+ startup logs. Each round then prints proof generation and verification costs.
+@@ -145,10 +156,16 @@ victim is also an aggregator, so restart includes a fresh `setup_prover()`.
+ The probe exits `0` when a member signs and `3` when it abstains, so the script
+ asserts each step rather than leaving it to be read out of a log.
+ 
++This scenario is deliberately unavailable in `mldsa` mode. It tests the
++stateful one-time-leaf safety property of XMSS; ML-DSA safely signs repeatedly
++and has no durable leaf counter to recover. Treating a normal ML-DSA restart as
++the same test would produce a meaningless security claim.
++
+ ## Deliberate simplifications
+ 
+-These are demo shortcuts. None of them weakens the protocol code, which is used
+-unmodified from the parent crate.
++These are demo shortcuts. The XMSS paths use the parent crate's node types; the
++ML-DSA path uses the independent `drot-mldsa` signer, committee, record and
++verifier APIs with the same external freshness gate.
+ 
+ * **Fixed addresses.** The aggregator turns a peer into a committee index by
+   looking it up in a compile-time table. A real deployment authenticates peers
+diff --git a/demo/docker/Dockerfile b/demo/docker/Dockerfile
+index 81aee4f..300bd0b 100644
+--- a/demo/docker/Dockerfile
++++ b/demo/docker/Dockerfile
+@@ -1,4 +1,4 @@
+-# One image, four binaries, ten containers.
++# One image for the XMSS raw/SNARK and ML-DSA demo roles.
+ #
+ # Every node in the demo runs the same image and differs only by environment,
+ # which is the point: there is no privileged coordinator to build separately.
+@@ -11,7 +11,7 @@ COPY . .
+ # The demo is its own crate, so this never rebuilds the measured one into
+ # something the benchmark did not produce. `--release` is not optional: the
+ # leanVM prover is unusable at `opt-level = 0`.
+-RUN cargo build --release --manifest-path demo/Cargo.toml --bins
++RUN cargo build --release --locked --jobs 2 --manifest-path demo/Cargo.toml --bins
+ 
+ FROM debian:bookworm-slim
+ 
+@@ -23,6 +23,9 @@ COPY --from=builder /src/demo/target/release/bootstrap /usr/local/bin/bootstrap
+ COPY --from=builder /src/demo/target/release/signer    /usr/local/bin/signer
+ COPY --from=builder /src/demo/target/release/holder    /usr/local/bin/holder
+ COPY --from=builder /src/demo/target/release/probe     /usr/local/bin/probe
++COPY --from=builder /src/demo/target/release/mldsa_bootstrap /usr/local/bin/mldsa-bootstrap
++COPY --from=builder /src/demo/target/release/mldsa_signer    /usr/local/bin/mldsa-signer
++COPY --from=builder /src/demo/target/release/mldsa_holder    /usr/local/bin/mldsa-holder
+ 
+ # The prover uses a very deep stack. The repository's `.cargo/config.toml` sets
+ # this for cargo-launched processes; a container runs the binary directly, so it
+diff --git a/demo/docker/demo.sh b/demo/docker/demo.sh
+index 50fa452..593fef2 100755
+--- a/demo/docker/demo.sh
++++ b/demo/docker/demo.sh
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+ #
+-# Driver for the two container demos.
++# Driver for the three container demos.
+ #
+ #   ./demo.sh raw   up        build the image and start the network + node A
+ #   ./demo.sh raw   round     node A asks for a credential, then verifies it
+@@ -10,10 +10,11 @@
+ #   ./demo.sh raw   logs      follow every node
+ #   ./demo.sh raw   down      stop the network and delete its volumes
+ #
+-# `snark` in place of `raw` runs the same network publishing one aggregated
+-# proof instead of the signatures. Only the configured prover subset can
+-# aggregate SNARK rounds; the other members still sign. The two share a subnet,
+-# so `up` tears the other one down first.
++# `mldsa` runs the same raw-quorum workflow with ML-DSA-65 keys and records.
++#
++# `snark` publishes one aggregate instead of raw XMSS signatures. Only the
++# configured prover subset can aggregate those rounds. All three modes share one
++# subnet, so `up` tears down the other two first.
+ #
+ # Node A is resident: `up` starts it, it does its one-time setup there, and
+ # `round`, `revoke` and `verify` only send it a trigger. That is why the SNARK setup cost
+@@ -26,13 +27,11 @@ MODE="${1:-raw}"
+ CMD="${2:-help}"
+ 
+ case "$MODE" in
+-  raw)   OTHER=snark ;;
+-  snark) OTHER=raw ;;
+-  *) echo "usage: $0 {raw|snark} {up|round|revoke|verify|crash|logs|ps|down}" >&2; exit 2 ;;
++  raw|snark|mldsa) ;;
++  *) echo "usage: $0 {raw|snark|mldsa} {up|round|revoke|verify|crash|logs|ps|down}" >&2; exit 2 ;;
+ esac
+ 
+ COMPOSE=(docker compose -f "$HERE/compose.$MODE.yml")
+-OTHER_COMPOSE=(docker compose -f "$HERE/compose.$OTHER.yml")
+ 
+ # The default victim is one of the SNARK aggregators, so the SNARK crash scenario
+ # also exercises prover setup after restart. Override with VICTIM=<index>.
+@@ -123,8 +122,11 @@ case "$CMD" in
+     ;;
+ 
+   up)
+-    say "clearing the $OTHER demo, which shares this subnet"
+-    "${OTHER_COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
++    say "clearing the other demos, which share this subnet"
++    for other in raw snark mldsa; do
++      [ "$other" = "$MODE" ] && continue
++      docker compose -f "$HERE/compose.$other.yml" down --remove-orphans >/dev/null 2>&1 || true
++    done
+     if docker volume inspect "drot-${MODE}_holder-state" >/dev/null 2>&1; then
+       export HOLDER_STATE_MODE=open
+       say "opening node A's existing anti-rollback state"
+@@ -169,6 +171,12 @@ case "$CMD" in
+     ;;
+ 
+   crash)
++    if [ "$MODE" = mldsa ]; then
++      echo "the crash scenario is XMSS-only: ML-DSA has no one-time leaf slot or durable slot counter" >&2
++      echo "use mldsa round/revoke/verify; do not interpret this omission as a failed ML-DSA safety test" >&2
++      exit 2
++    fi
++
+     # Does a durable slot burn survive the machine it was made on?
+     #
+     # The member signs, is killed without warning, comes back, and is asked to
+diff --git a/demo/src/wire.rs b/demo/src/wire.rs
+index 09c63b0..9bbf646 100644
+--- a/demo/src/wire.rs
++++ b/demo/src/wire.rs
+@@ -167,3 +167,15 @@ pub fn request(
+     send(&mut stream, kind, payload)?;
+     recv(&mut stream)
+ }
++
++/// An ML-DSA member's answer to a proposal.
++///
++/// The fixed-size signature is carried as bytes because the FIPS 204 type does
++/// not implement SSZ. The receiver reconstructs it and rejects malformed or
++/// non-canonical encodings before counting the contribution.
++#[derive(SszEncode, SszDecode)]
++pub struct MlDsaSignatureReply {
++    /// Exactly one 3309-byte signature when signing succeeded; empty otherwise.
++    pub signature: Vec<Vec<u8>>,
++    pub reason: Vec<u8>,
++}
+diff --git a/mldsa/.gitignore b/mldsa/.gitignore
+index ed768f3..bfa7e22 100644
+--- a/mldsa/.gitignore
++++ b/mldsa/.gitignore
+@@ -1,2 +1,2 @@
+ /target/
+-Cargo.lock
+\ No newline at end of file
++# Cargo.lock is tracked because this crate builds benchmark executables.
+diff --git a/mldsa/README.md b/mldsa/README.md
+index 3edabb4..94d5960 100644
+--- a/mldsa/README.md
++++ b/mldsa/README.md
+@@ -3,8 +3,8 @@
+ This independent crate implements the ML-DSA-65 raw form of a committee-signed
+ status list: a signer, a canonical SSZ trust anchor, a canonical SSZ record,
+ and a stateless quorum verifier. Local anti-rollback protection is the caller's
+-responsibility. The measurement binaries can be run directly; the repository's
+-benchmark scripts do not yet include them.
++responsibility. The measurement binaries can be run directly or through
++`benchmark.sh` and `committee-scaling-benchmark.sh`.
+ 
+ ```rust
+ use drot_mldsa::status_list::MlDsaStatusList;
+@@ -35,7 +35,10 @@ not consume an XMSS leaf or need a slot journal. A status-list signer uses
+ Signing a precomputed digest with the generic signer is ordinary ML-DSA over
+ those digest bytes, not the standardized HashML-DSA mode. The seed is private
+ key material; its durable, access-controlled storage is left to the embedding
+-application.
++application. ML-DSA permits a key to sign conflicting statements for the same
++version. This crate authenticates a quorum but does not enforce a
++one-statement-per-version signer policy; deployments that require that property
++must implement it separately.
+ 
+ ## Trust anchor and record
+ 
+@@ -115,13 +118,14 @@ The signer binary measures one member's ML-DSA signing operation per update;
+ statement construction, self-verification and key generation are outside its
+ `sign_ms` samples. The raw verifier reports `decode_ms` (SSZ plus signature
+ decoding), `verify_ms` (bitmap, threshold and cryptographic checks), and
+-`total_ms` as the sum of those two timed intervals. File I/O and
++`total_ms` from one continuous interval around decode and verification. File I/O and
+ fixture creation are outside every timed verifier sample. `bytes` is the
+ complete serialized record; `sig_bytes` is the fixed size of one signature
+ (3,309 B), and `signatures_bytes` is the aggregate signature payload `t × 3,309`
+ B. Runtime and memory measurements require Linux `/proc/self/status`. These
+-binaries emit raw samples; this crate does not produce a combined comparison
+-report.
++binaries emit raw samples; `benchmark.sh` and
++`committee-scaling-benchmark.sh` organize comparisons with the XMSS raw and
++XMSS/SNARK paths.
+ 
+ The dependency is pinned to RustCrypto `ml-dsa` 0.1.1 with key zeroization
+ enabled. Its maintainers state that this implementation has not been
+diff --git a/mldsa/src/bin/mldsa_raw_agg.rs b/mldsa/src/bin/mldsa_raw_agg.rs
+index ab0cb71..7e04eb4 100644
+--- a/mldsa/src/bin/mldsa_raw_agg.rs
++++ b/mldsa/src/bin/mldsa_raw_agg.rs
+@@ -116,15 +116,15 @@ fn main() {
+     for index in 0..updates {
+         let path = directory.join(format!("update-{index:05}.ssz"));
+         let bytes = read_bounded(&path, MAX_RECORD_BYTES as u64);
+-        let decode_start = Instant::now();
++        let total_start = Instant::now();
+         let record = MlDsaStatusList::from_bytes(&bytes).expect("invalid fixture record");
+-        let decode_time = decode_start.elapsed();
+-        assert_eq!(record.version(), index as u32, "fixture version mismatch");
+-        assert_eq!(record.signer_count(), threshold, "fixture quorum mismatch");
++        let decode_time = total_start.elapsed();
+         let verify_start = Instant::now();
+         let accepted = verifier.verify_status_list(&record);
+         let verify_time = verify_start.elapsed();
+-        let total_time = decode_time + verify_time;
++        let total_time = total_start.elapsed();
++        assert_eq!(record.version(), index as u32, "fixture version mismatch");
++        assert_eq!(record.signer_count(), threshold, "fixture quorum mismatch");
+         assert!(accepted, "honest fixture failed ML-DSA verification");
+ 
+         let rss = support::rss_mb("VmRSS:");
+@@ -160,9 +160,11 @@ fn main() {
+     println!(
+         "MLDSA_RAW_AGG n_members={n} t={threshold} n_updates={} \
+          decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
++         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
+          verify_med_ms={:.3} verify_mean_ms={:.3} verify_sd_ms={:.3} \
+          verify_min_ms={:.3} verify_max_ms={:.3} verify_total_ms={:.3} \
+          total_med_ms={:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
++         total_min_ms={:.3} total_max_ms={:.3} total_total_ms={:.3} \
+          record_med_bytes={:.3} sig_bytes={SIGNATURE_BYTES} \
+          signatures_bytes={} rss_anchor_mb={rss_anchor} \
+          rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
+@@ -171,6 +173,9 @@ fn main() {
+         decode.median,
+         decode.mean,
+         decode.sd,
++        decode.min,
++        decode.max,
++        decode.total,
+         verify.median,
+         verify.mean,
+         verify.sd,
+@@ -180,6 +185,9 @@ fn main() {
+         total.median,
+         total.mean,
+         total.sd,
++        total.min,
++        total.max,
++        total.total,
+         size.median,
+         threshold * SIGNATURE_BYTES,
+         support::rss_mb("VmHWM:")
+diff --git a/mldsa/src/committee.rs b/mldsa/src/committee.rs
+index b877352..c2049c0 100644
+--- a/mldsa/src/committee.rs
++++ b/mldsa/src/committee.rs
+@@ -41,7 +41,8 @@ pub struct Committee {
+     anchor_id: [u8; ANCHOR_ID_BYTES],
+ }
+ 
+-fn encode_public_key(public_key: &PublicKey) -> [u8; PUBLIC_KEY_BYTES] {
++/// Return the canonical FIPS 204 encoding of one ML-DSA-65 public key.
++pub fn encode_public_key(public_key: &PublicKey) -> [u8; PUBLIC_KEY_BYTES] {
+     let encoded = public_key.encode();
+     let encoded_bytes: &[u8] = encoded.as_ref();
+     let mut bytes = [0u8; PUBLIC_KEY_BYTES];
+@@ -49,7 +50,8 @@ fn encode_public_key(public_key: &PublicKey) -> [u8; PUBLIC_KEY_BYTES] {
+     bytes
+ }
+ 
+-fn decode_public_key(bytes: &[u8; PUBLIC_KEY_BYTES]) -> Result<PublicKey, String> {
++/// Decode and enforce the canonical FIPS 204 encoding of one public key.
++pub fn decode_public_key(bytes: &[u8; PUBLIC_KEY_BYTES]) -> Result<PublicKey, String> {
+     let encoded = EncodedVerifyingKey::<MlDsa65>::try_from(bytes.as_slice())
+         .map_err(|_| "invalid ML-DSA-65 public-key length".to_string())?;
+     let public_key = PublicKey::decode(&encoded);
+diff --git a/mldsa/src/lib.rs b/mldsa/src/lib.rs
+index b0fa9be..648f374 100644
+--- a/mldsa/src/lib.rs
++++ b/mldsa/src/lib.rs
+@@ -8,6 +8,6 @@ pub mod signer;
+ pub mod status_list;
+ pub mod verifier;
+ 
+-pub use committee::Committee;
++pub use committee::{Committee, PUBLIC_KEY_BYTES, decode_public_key, encode_public_key};
+ pub use signer::{MlDsa65Signer, PublicKey, Seed, Signature, verify};
+ pub use verifier::RawVerifier;
+diff --git a/src/bin/raw_agg.rs b/src/bin/raw_agg.rs
+index d2aeaea..b4193cb 100644
+--- a/src/bin/raw_agg.rs
++++ b/src/bin/raw_agg.rs
+@@ -45,6 +45,20 @@ fn ms(d: Duration) -> f64 {
+     d.as_secs_f64() * 1000.0
+ }
+ 
++fn measure_verification(
++    bytes: &[u8],
++    verifier: &VerifierNode,
++) -> (bool, Duration, Duration, Duration) {
++    let total_start = Instant::now();
++    let decoded = StatusList::from_bytes(bytes);
++    let decode_time = total_start.elapsed();
++    let verify_start = Instant::now();
++    let accepted = decoded.is_ok_and(|record| verifier.verify_status_list(&record));
++    let verify_time = verify_start.elapsed();
++    let total_time = total_start.elapsed();
++    (accepted, decode_time, verify_time, total_time)
++}
++
+ fn fixture_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+         .unwrap_or_else(|e| panic!("cannot read fixture directory {}: {e}", dir.display()))
+@@ -97,6 +111,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
+         N_UPDATES,
+         "fixture must contain exactly N_UPDATES honest records"
+     );
++    let mut decode_ms = Vec::with_capacity(updates.len());
++    let mut verify_only_ms = Vec::with_capacity(updates.len());
+     let mut verify_ms = Vec::with_capacity(updates.len());
+     let mut record_bytes = Vec::with_capacity(updates.len());
+     let mut rss_updates_max = rss_after_anchor;
+@@ -104,10 +120,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
+     for (index, path) in updates.iter().enumerate() {
+         let bytes = std::fs::read(path)
+             .unwrap_or_else(|e| panic!("cannot read raw fixture {}: {e}", path.display()));
+-        let t_verify = Instant::now();
+-        let accepted =
+-            StatusList::from_bytes(&bytes).is_ok_and(|record| verifier.verify_status_list(&record));
+-        let verify_time = t_verify.elapsed();
++        let (accepted, decode_time, verify_only_time, verify_time) =
++            measure_verification(&bytes, &verifier);
+         assert!(accepted, "an honest fixture failed raw verification");
+         let rss = rss_now_mb();
+         rss_updates_max = rss_updates_max.max(rss);
+@@ -122,11 +136,15 @@ fn run_fixture_verifier(fixture_dir: &Path) {
+         );
+         if emit_samples {
+             println!(
+-                "SAMPLE target=raw_agg idx={index} verify_ms={:.3} bytes={} rss_mb={rss}",
++                "SAMPLE target=raw_agg idx={index} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
++                ms(decode_time),
++                ms(verify_only_time),
+                 ms(verify_time),
+                 bytes.len()
+             );
+         }
++        decode_ms.push(ms(decode_time));
++        verify_only_ms.push(ms(verify_only_time));
+         verify_ms.push(ms(verify_time));
+         record_bytes.push(bytes.len());
+     }
+@@ -170,8 +188,11 @@ fn run_fixture_verifier(fixture_dir: &Path) {
+     let outsider_rejected = !verifier.verify_status_list(&outsider);
+     let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
+ 
+-    let verify = Series::new(verify_ms);
++    let decode = Series::new(decode_ms);
++    let verify = Series::new(verify_only_ms);
++    let total = Series::new(verify_ms);
+     let (vf_min, vf_med, vf_max) = verify.min_med_max();
++    let (total_min, total_med, total_max) = total.min_med_max();
+     let record_med = median_usize(&record_bytes);
+     let per_signature_us = vf_med * 1000.0 / T as f64;
+ 
+@@ -180,7 +201,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
+         "forgeries rejected (tampered / relabelled / short / outsider): \
+          {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected}"
+     );
+-    println!("verify min/med/max      : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
++    println!("verify-only min/med/max : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
++    println!("decode+verify min/med/max: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
+     println!("published record size (median): {record_med:.1} bytes");
+     println!("\nRAM (raw verifier process; no secret keys)");
+     println!("after anchor            : {rss_after_anchor} MB");
+@@ -190,6 +212,10 @@ fn run_fixture_verifier(fixture_dir: &Path) {
+         "\nRAW_AGG n_members={N_MEMBERS} t={T} n_updates={} \
+          verify_med_ms={vf_med:.3} verify_mean_ms={:.3} verify_sd_ms={:.3} \
+          verify_min_ms={vf_min:.3} verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
++         decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
++         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
++         total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
++         total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
+          per_sig_verify_us={per_signature_us:.3} record_med_bytes={record_med:.3} \
+          rss_keygen_mb={rss_after_anchor} rss_updates_max_mb={rss_updates_max} \
+          peak_rss_mb={} tamper_rejected={} fixture_input=1",
+@@ -197,6 +223,15 @@ fn run_fixture_verifier(fixture_dir: &Path) {
+         verify.mean(),
+         verify.stddev(),
+         verify.sum(),
++        decode.median(),
++        decode.mean(),
++        decode.stddev(),
++        decode.min(),
++        decode.max(),
++        decode.sum(),
++        total.mean(),
++        total.stddev(),
++        total.sum(),
+         peak_rss_mb(),
+         all_rejected as u8,
+     );
+@@ -273,6 +308,8 @@ fn main() {
+     // ---- N_UPDATES updates. For each: t signers sign the (list, version) root,
+     //      the signatures plus their bitmap ARE the record, then it is verified. ----
+     let mut list: Vec<[u8; 32]> = Vec::new();
++    let mut decode_ms = Vec::new();
++    let mut verify_only_ms = Vec::new();
+     let mut verify_ms = Vec::new();
+     let mut record_bytes = Vec::new();
+     let mut accepted = 0usize;
+@@ -308,12 +345,8 @@ fn main() {
+         // Verify the way a peer would: decode off the wire, then check against the
+         // anchor alone. Decoding is timed with verification because on an
+         // untrusted transport it is part of the cost an attacker can force.
+-        let t_verify = Instant::now();
+-        let ok = match StatusList::from_bytes(&wire) {
+-            Ok(sl) => verifier.verify_status_list(&sl),
+-            Err(_) => false,
+-        };
+-        let verify_time = t_verify.elapsed();
++        let (ok, decode_time, verify_only_time, verify_time) =
++            measure_verification(&wire, &verifier);
+         assert!(ok, "a legitimate update failed to verify");
+         accepted += 1;
+ 
+@@ -331,11 +364,15 @@ fn main() {
+         );
+         if emit_samples {
+             println!(
+-                "SAMPLE target=raw_agg idx={i} verify_ms={:.3} bytes={} rss_mb={rss}",
++                "SAMPLE target=raw_agg idx={i} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
++                ms(decode_time),
++                ms(verify_only_time),
+                 ms(verify_time),
+                 wire.len()
+             );
+         }
++        decode_ms.push(ms(decode_time));
++        verify_only_ms.push(ms(verify_only_time));
+         verify_ms.push(ms(verify_time));
+         record_bytes.push(wire.len());
+     }
+@@ -419,8 +456,11 @@ fn main() {
+     let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
+ 
+     // ---- Summary ----
+-    let verify = Series::new(verify_ms);
++    let decode = Series::new(decode_ms);
++    let verify = Series::new(verify_only_ms);
++    let total = Series::new(verify_ms);
+     let (vf_min, vf_med, vf_max) = verify.min_med_max();
++    let (total_min, total_med, total_max) = total.min_med_max();
+     let record_med = median_usize(&record_bytes);
+     // Per-signature figure, derived from the median: what checking one signature
+     // costs, which is what makes the number projectable to other values of t.
+@@ -434,7 +474,8 @@ fn main() {
+     println!("\nkeygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
+     println!("slot state ({N_MEMBERS} counters) : {slot_state_time:.2?}   (durable, fsync'd)");
+     println!("--- per update (t={T}): min / median / max ---");
+-    println!("verify   : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms   (incl. wire decode)");
++    println!("verify-only: {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
++    println!("decode+verify: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
+     println!("per signature : verify {per_sig_verify_us:.1} us");
+     println!("published record size (median): {record_med:.1} bytes  ({T} signatures + bitmap)");
+ 
+@@ -454,6 +495,10 @@ fn main() {
+          verify_med_ms={vf_med:.3} \
+          verify_mean_ms={:.3} verify_sd_ms={:.3} verify_min_ms={vf_min:.3} \
+          verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
++         decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
++         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
++         total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
++         total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
+          per_sig_verify_us={per_sig_verify_us:.3} \
+          record_med_bytes={record_med:.3} rss_keygen_mb={rss_after_keygen} \
+          rss_updates_max_mb={rss_updates_max} peak_rss_mb={} tamper_rejected={}",
+@@ -463,6 +508,15 @@ fn main() {
+         verify.mean(),
+         verify.stddev(),
+         verify.sum(),
++        decode.median(),
++        decode.mean(),
++        decode.stddev(),
++        decode.min(),
++        decode.max(),
++        decode.sum(),
++        total.mean(),
++        total.stddev(),
++        total.sum(),
+         peak_rss_mb(),
+         // Must be an integer: benchmark.sh's failure gate tests this field against
+         // "1", and a Rust bool would print "true" and score every run as a
+diff --git a/src/bin/signer.rs b/src/bin/signer.rs
+index ffd1026..f4584c0 100644
+--- a/src/bin/signer.rs
++++ b/src/bin/signer.rs
+@@ -76,6 +76,8 @@ fn main() {
+ 
+     let mut list: Vec<[u8; 32]> = Vec::new();
+     let mut sign_ms = Vec::new();
++    let mut reserve_ms = Vec::new();
++    let mut crypto_ms = Vec::new();
+     let mut failures = 0usize;
+     let mut rss_max = rss_after_keygen;
+ 
+@@ -90,7 +92,9 @@ fn main() {
+         let message = committee.message_for(Algorithms::WotsXmss, &list, version);
+ 
+         let t_sign = Instant::now();
+-        let signature = signer.sign_at(&message, slot).expect("signing failed");
++        let (signature, phases) = signer
++            .sign_at_timed(&message, slot)
++            .expect("signing failed");
+         let sign_time = t_sign.elapsed();
+ 
+         // Not part of a member's job, and not timed: a cheap guard that the run
+@@ -113,15 +117,21 @@ fn main() {
+         );
+         if emit_samples {
+             println!(
+-                "SAMPLE target=signer idx={i} sign_ms={:.3} bytes={} rss_mb={rss}",
++                "SAMPLE target=signer idx={i} sign_ms={:.3} reserve_ms={:.3} crypto_ms={:.3} bytes={} rss_mb={rss}",
+                 ms(sign_time),
++                ms(phases.reserve),
++                ms(phases.crypto),
+                 SIGNATURE_SSZ_LEN
+             );
+         }
+         sign_ms.push(ms(sign_time));
++        reserve_ms.push(ms(phases.reserve));
++        crypto_ms.push(ms(phases.crypto));
+     }
+ 
+     let sign = Series::new(sign_ms);
++    let reserve = Series::new(reserve_ms);
++    let crypto = Series::new(crypto_ms);
+     let (sg_min, sg_med, sg_max) = sign.min_med_max();
+ 
+     println!("\nkeygen (1 key)         : {keygen_time:.2?}");
+@@ -138,7 +148,9 @@ fn main() {
+     println!(
+         "\nSIGNER keygen_ms={:.3} slot_state_ms={:.3} n_rounds={} \
+          sign_med_ms={sg_med:.3} sign_mean_ms={:.3} sign_sd_ms={:.3} sign_min_ms={sg_min:.3} \
+-         sign_max_ms={sg_max:.3} sign_total_ms={:.3} sig_bytes={} \
++         sign_max_ms={sg_max:.3} sign_total_ms={:.3} \
++         reserve_med_ms={:.3} reserve_total_ms={:.3} \
++         crypto_med_ms={:.3} crypto_total_ms={:.3} sig_bytes={} \
+          rss_keygen_mb={rss_after_keygen} rss_rounds_max_mb={rss_max} peak_rss_mb={} \
+          failures={failures}",
+         ms(keygen_time),
+@@ -147,6 +159,10 @@ fn main() {
+         sign.mean(),
+         sign.stddev(),
+         sign.sum(),
++        reserve.median(),
++        reserve.sum(),
++        crypto.median(),
++        crypto.sum(),
+         SIGNATURE_SSZ_LEN,
+         peak_rss_mb(),
+     );
+diff --git a/src/bin/verifier.rs b/src/bin/verifier.rs
+index d5f1406..c941078 100644
+--- a/src/bin/verifier.rs
++++ b/src/bin/verifier.rs
+@@ -127,6 +127,8 @@ fn main() -> ExitCode {
+         anchor.len()
+     );
+ 
++    let mut decode_ts = Vec::new();
++    let mut verify_only_ts = Vec::new();
+     let mut verify_ts = Vec::new();
+     let mut failures = 0usize;
+     let mut rss_max = rss_after_setup;
+@@ -138,16 +140,21 @@ fn main() -> ExitCode {
+         // Decoding is timed with verification: on an untrusted transport it is
+         // part of the cost an attacker can force, and it is not free: leanVM
+         // recomputes the bytecode claim while deserializing.
+-        let t = Instant::now();
+-        let ok = match SnarkStatusList::from_bytes(&bytes) {
+-            Ok(sl) => verifier.verify(&sl),
++        let total_start = Instant::now();
++        let decoded = SnarkStatusList::from_bytes(&bytes);
++        let decode_time = total_start.elapsed();
++        let record = match decoded {
++            Ok(record) => record,
+             Err(e) => {
+                 println!("  {name:<22} DECODE FAILED: {e}");
+                 failures += 1;
+                 continue;
+             }
+         };
+-        let elapsed = t.elapsed();
++        let verify_start = Instant::now();
++        let ok = verifier.verify(&record);
++        let verify_only_time = verify_start.elapsed();
++        let elapsed = total_start.elapsed();
+         let rss = rss_now_mb();
+         rss_max = rss_max.max(rss);
+         if !ok {
+@@ -161,11 +168,15 @@ fn main() -> ExitCode {
+         );
+         if emit_samples {
+             println!(
+-                "SAMPLE target=verifier idx={idx} verify_ms={:.3} bytes={} rss_mb={rss}",
++                "SAMPLE target=verifier idx={idx} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
++                ms(decode_time),
++                ms(verify_only_time),
+                 ms(elapsed),
+                 bytes.len()
+             );
+         }
++        decode_ts.push(decode_time);
++        verify_only_ts.push(verify_only_time);
+         verify_ts.push(elapsed);
+     }
+ 
+@@ -286,16 +297,20 @@ fn main() -> ExitCode {
+         }
+     }
+ 
+-    let verify = Series::new(verify_ts.iter().map(|d| ms(*d)));
++    let decode = Series::new(decode_ts.iter().map(|d| ms(*d)));
++    let verify = Series::new(verify_only_ts.iter().map(|d| ms(*d)));
++    let total = Series::new(verify_ts.iter().map(|d| ms(*d)));
+     let (vf_min, vf_med, vf_max) = verify.min_med_max();
++    let (total_min, total_med, total_max) = total.min_med_max();
+ 
+     println!("\nsetup_verifier         : {setup_time:.2?}");
+     println!(
+         "verified               : {} updates, {:.1} ms total",
+         verify.len(),
+-        verify.sum()
++        total.sum()
+     );
+-    println!("verify min/med/max     : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
++    println!("verify-only min/med/max: {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
++    println!("decode+verify min/med/max: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
+     println!("\nRAM (verify-only process)");
+     println!("baseline (pre-setup)   : {rss_baseline} MB");
+     println!("after setup (resident) : {rss_after_setup} MB");
+@@ -306,7 +321,11 @@ fn main() -> ExitCode {
+     println!(
+         "\nVERIFIER setup_ms={:.3} n_verified={} verify_med_ms={vf_med:.3} \
+          verify_mean_ms={:.3} verify_sd_ms={:.3} verify_min_ms={vf_min:.3} \
+-         verify_max_ms={vf_max:.3} verify_total_ms={:.3} anchor_bytes={} \
++         verify_max_ms={vf_max:.3} verify_total_ms={:.3} \
++         decode_med_ms={:.3} decode_mean_ms={:.3} decode_sd_ms={:.3} \
++         decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
++         total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
++         total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} anchor_bytes={} \
+          rss_setup_mb={rss_after_setup} rss_verify_max_mb={rss_max} peak_rss_mb={} \
+          failures={failures}",
+         ms(setup_time),
+@@ -314,6 +333,15 @@ fn main() -> ExitCode {
+         verify.mean(),
+         verify.stddev(),
+         verify.sum(),
++        decode.median(),
++        decode.mean(),
++        decode.stddev(),
++        decode.min(),
++        decode.max(),
++        decode.sum(),
++        total.mean(),
++        total.stddev(),
++        total.sum(),
+         anchor.len(),
+         peak_rss_mb()
+     );
+diff --git a/src/node/signer.rs b/src/node/signer.rs
+index 97e0807..1b4ce4f 100644
+--- a/src/node/signer.rs
++++ b/src/node/signer.rs
+@@ -6,6 +6,7 @@
+ //! guarantee that it is spent *forward only*.
+ 
+ use leanvm::xmss::{MESSAGE_LEN, XmssPublicKey, XmssSecretKey, XmssSignature, sign};
++use std::time::{Duration, Instant};
+ 
+ use crate::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
+ 
+@@ -43,6 +44,14 @@ pub struct SignerNode {
+     a_slot_counter: AtomicSlotCounter,
+ }
+ 
++/// Timings of one successful protocol-assigned XMSS signature.
++/// The slot has already been durably burned before `crypto` begins.
++#[derive(Debug, Clone, Copy)]
++pub struct SignAtTimings {
++    pub reserve: Duration,
++    pub crypto: Duration,
++}
++
+ impl SignerNode {
+     pub fn new(pk: XmssPublicKey, sk: XmssSecretKey, a_slot_counter: AtomicSlotCounter) -> Self {
+         Self {
+@@ -109,10 +118,39 @@ impl SignerNode {
+         message: &[u8; MESSAGE_LEN],
+         slot: u32,
+     ) -> Result<XmssSignature, SignerNodeError> {
++        self.sign_at_inner(message, slot, false)
++            .map(|(signature, _)| signature)
++    }
++
++    /// Measures the durable reservation and randomized XMSS operation without
++    /// exposing a signing path that can bypass the counter.
++    pub fn sign_at_timed(
++        &mut self,
++        message: &[u8; MESSAGE_LEN],
++        slot: u32,
++    ) -> Result<(XmssSignature, SignAtTimings), SignerNodeError> {
++        let (signature, timings) = self.sign_at_inner(message, slot, true)?;
++        Ok((signature, timings.expect("timings requested")))
++    }
++
++    fn sign_at_inner(
++        &mut self,
++        message: &[u8; MESSAGE_LEN],
++        slot: u32,
++        measure: bool,
++    ) -> Result<(XmssSignature, Option<SignAtTimings>), SignerNodeError> {
++        let reserve_start = measure.then(Instant::now);
+         self.a_slot_counter.reserve_at(slot)?;
++        let reserve = reserve_start.map(|start| start.elapsed());
++        let crypto_start = measure.then(Instant::now);
+         let mut rng = leanvm::rand::rng();
+-        sign(&mut rng, &self.sk, message, slot)
+-            .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))
++        let signature = sign(&mut rng, &self.sk, message, slot)
++            .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))?;
++        let timings = reserve.map(|reserve| SignAtTimings {
++            reserve,
++            crypto: crypto_start.expect("timings requested").elapsed(),
++        });
++        Ok((signature, timings))
+     }
+ }
+ 

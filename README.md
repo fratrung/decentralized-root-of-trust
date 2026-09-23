@@ -292,10 +292,24 @@ Raw quorum path:
 cargo run --release --bin raw_agg
 ```
 
-Single committee member:
+Single XMSS committee member:
 
 ```sh
 cargo run --release --bin signer
+```
+
+The independent [`mldsa/`](mldsa/) crate implements the parallel raw-quorum
+construction with FIPS 204 ML-DSA-65. It exposes a stateless signer, an SSZ
+committee anchor, an SSZ `MlDsaStatusList` carrying a signer bitmap and raw
+signatures, and a verifier that keeps decoding separate from authorization.
+The canonical statement binds the algorithm, committee-derived anchor identifier,
+version and ordered fingerprint list, and is passed directly to ML-DSA.Sign with
+the empty FIPS 204 context; it is not application-prehashed. This path is not an
+input to leanVM's XMSS aggregate and does not produce a SNARK.
+
+```sh
+cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_signer
+cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_raw_agg
 ```
 
 Small local walkthrough:
@@ -354,8 +368,17 @@ network.
 ./demo/docker/demo.sh raw down
 ```
 
-Replace `raw` with `snark` to publish aggregated records. See
-[`demo/README.md`](demo/README.md) for the topology and scenario details.
+Use `snark` to publish aggregated XMSS records, or `mldsa` to publish the
+raw ML-DSA-65 quorum form:
+
+```sh
+./demo/docker/demo.sh mldsa up
+./demo/docker/demo.sh mldsa round
+```
+
+The `crash` scenario is intentionally available only for `raw` and `snark`:
+it tests durable XMSS one-time-slot burning, a property ML-DSA does not have.
+See [`demo/README.md`](demo/README.md) for the topology and scenario details.
 
 ## Tests
 
@@ -394,47 +417,49 @@ The current catalog contains 25 mutations. Each removes or weakens one
 security-relevant check and must be detected by the test suite.
 
 GitHub Actions runs formatting, Clippy with warnings denied, the mutation
-catalog consistency check, and the complete tests for both the root crate and
-the independent `demo/` crate. It uses one Linux job so the expensive leanVM
+catalog consistency check, and the complete tests for the root, `mldsa/` and
+`demo/` crates. It uses one Linux job so the expensive leanVM
 build is shared by all checks in that run. Benchmarks, container scenarios and
 the full mutation campaign remain explicit local jobs; they are intentionally
 excluded from pull-request CI.
 
 ## Benchmark
 
-The benchmark harness measures the signer, prover, verifier and raw-verification
-roles as separate processes:
+The benchmark harness runs six isolated targets: an XMSS protocol signer, an
+ML-DSA cryptographic signer, the XMSS prover and verifier, and two raw
+relying-party verifiers. ML-DSA signing has no persistent one-statement-per-version
+state yet, so its cost is not a protocol-level equivalent of the XMSS signer.
 
 ```sh
 ./benchmark.sh
 RUNS=30 WARMUP=3 ./benchmark.sh
-TARGETS="signer prover verifier raw_agg" ./benchmark.sh
+TARGETS="signer mldsa_signer prover verifier raw_agg mldsa_raw_agg" ./benchmark.sh
 ```
 
 Defaults:
 
-- `RUNS=20`;
+- `RUNS=24`;
 - `WARMUP=2`;
 - `N_UPDATES=20` rounds inside each process run;
-- `TARGETS="signer prover verifier raw_agg"`;
+- `TARGETS="signer mldsa_signer prover verifier raw_agg mldsa_raw_agg"`;
 - `COOLDOWN_SECONDS=2` before every target process;
 - balanced target ordering (`INTERLEAVE=1`).
 
-Thus the default harness starts each target 22 times: two warm-ups whose data
-is discarded, followed by 20 measured process runs. Each measured run contains
+Thus the default harness starts each target 26 times: two warm-ups whose data
+is discarded, followed by 24 measured process runs. Each measured run contains
 20 update-level observations. Those observations share one process and are not
 treated as independent replicates; the reported cross-run statistics use each
 run's median as their unit of analysis.
 
-Before measurement, the default harness runs `committee_fixture` once. That
-unmeasured process creates the committee, the raw `StatusList` records and their
-XMSS signatures. `raw_agg` verifies those records directly. `prover` consumes
-the same signed inputs and emits `SnarkStatusList` records; the fixed verifier
-corpus is generated from them once and reused by every verifier run. Consequently
-the measured raw process is a relying-party verifier and the measured prover is
+Before measurement, unmeasured fixture processes create both corpora.
+`committee_fixture` creates the XMSS committee and raw `StatusList` records;
+`raw_agg` verifies them and `prover` consumes the same signed inputs to emit
+`SnarkStatusList` records. `mldsa_fixture` independently creates the
+ML-DSA-65 anchor and `MlDsaStatusList` corpus consumed by `mldsa_raw_agg`.
+Fixture generation and signing are outside verifier/prover timings. Consequently
+each measured raw process is a relying-party verifier and the measured prover is
 one aggregator, not a hidden committee signer. `BENCH_SELF_CONTAINED=1` retains
-the older diagnostic mode in which each target generates its own keys and
-signatures.
+the older diagnostic XMSS process shape for back-comparison.
 
 The default order is a Williams-style balanced crossover sequence rather than a
 fixed round-robin: across a complete block, target position and immediate
@@ -443,8 +468,13 @@ processes; it does not assert equal package temperature, so `runs.csv` retains
 each start time for drift analysis.
 
 Size rows name the serialized object they measure: `signature_size` for one
-XMSS signature and `record_size` for the complete `StatusList` or
-`SnarkStatusList`. The optional `combined` target alone reports
+XMSS or ML-DSA signature and `record_size` for the complete `StatusList`,
+`MlDsaStatusList` or `SnarkStatusList`. All three verifier targets report
+separate decode, verify-only and contiguous decode-plus-verify timings. The
+end-to-end interval is used for receiver-cost comparisons and XMSS/SNARK
+break-even. XMSS signer timings separate durable slot burn, cryptographic
+signing and complete protocol cost.
+The optional `combined` target alone reports
 `proof_size`, because it measures `SnarkStatusList::proof_bytes()` rather than
 the whole record. Even-sized samples use the conventional median, the arithmetic
 mean of the two central observations.
@@ -457,8 +487,9 @@ the highest readable temperature immediately before and after every target
 process. `drift.csv` compares the first and last quarter of run medians and
 flags a change above 15%; it never removes or rewrites samples. A strict run
 also requires a clean Git tree. Exploratory dirty-tree runs preserve
-`source.patch` and `source-status.txt`, so the recorded commit is not presented
-as sufficient to reconstruct uncommitted code.
+`source.patch` and `source-status.txt`. The patch omits untracked file contents;
+such pilot runs may not be exactly reconstructible. Publication mode requires a
+clean committed tree.
 
 ### Committee scaling
 
@@ -488,8 +519,9 @@ resource discovery, not for paper results. `STUDY_MODE=publication` defaults to
 sweeps. The second sweep reverses the committee-size order, so host-time and
 committee size are not perfectly confounded. Publication mode requires
 `STRICT_ENV=1`, a clean committed tree, an explicit CPU mask, at least ten runs
-and at least two sweeps. Its run count must be a multiple of six, completing the
-Williams design for the three per-point targets. Any session whose early/late
+and at least two sweeps. Its run count must be a multiple of four, completing
+the balanced design for the four per-point targets (`prover`, `verifier`,
+`raw_agg`, `mldsa_raw_agg`). Any session whose early/late
 medians differ by more than 15% is marked unstable and withheld; no outlier is
 discarded.
 
@@ -520,27 +552,29 @@ recalculates the hard cap from current availability. It refuses to resume only
 when the current usable cap has fallen below the admission threshold of the
 largest recorded N.
 
-Before the sweep, `benchmark.sh` measures the `signer` target once as a separate
-single-member campaign, using the same run and warm-up counts. It is not repeated
-for every `(N,t)`: one member's XMSS operation is identical for both publication
-forms and independent of committee size. The result is kept in `signer.csv` and
-reported separately rather than multiplied by `t`; those signatures are produced
-by distinct member machines and may proceed in parallel.
+Before the sweep, `benchmark.sh` measures `signer` and `mldsa_signer` once
+as separate single-member campaigns, using the same run and warm-up counts.
+Neither is repeated for every `(N,t)`: per-member signing cost is independent of
+committee size and must not be multiplied into one process latency. `signer.csv`
+keeps XMSS protocol/slot/crypto costs separate from ML-DSA crypto-only signing.
 
-An unmeasured `committee_fixture` process then generates the signatures once per
-point. The measured `prover` is therefore one aggregator holding public keys
-and ready-made signatures—never `N` aggregators or one process retaining all
-committee secret keys. The raw measurement likewise runs as a verifier-only
-process over the same signed records.
+At every point, unmeasured XMSS and ML-DSA fixture processes generate their
+respective signed corpora. The measured `prover` is therefore one XMSS
+aggregator holding public keys and ready-made signatures—never `N` aggregators
+or one process retaining all committee secret keys. Both raw measurements are
+verifier-only processes. The report keeps ML-DSA raw results separate from the
+XMSS/SNARK crossover because ML-DSA is a different signature construction, not
+an alternative encoding of the same XMSS quorum.
 
 The top-level output contains:
 
 - `memory-decision.txt` — the announced admission and runtime limits;
-- `signer.csv` and `signer/benchmark/` — the single-member campaign, measured
-  once for the complete sweep;
+- `signer.csv` and `signer/benchmark/` — the XMSS and ML-DSA single-member
+  campaigns, measured once for the complete sweep;
 - `manifest.csv` — completed, stopped and RAM-excluded points;
-- `scaling.csv` — run-level medians combined across sweeps, wire size, RSS,
-  paired verification deltas, confidence bounds and derived ratios;
+- `scaling.csv` — run-level medians combined across sweeps, XMSS/SNARK wire
+  size, RSS, paired verification deltas and derived ratios, plus ML-DSA decode,
+  verification, combined time, record size and verifier RSS;
 - `report.txt` — the first observed wire-size, verification-time and joint
   crossover;
 - `Nxxxx-tyyyy/session-XX/benchmark/` — the complete `benchmark.sh` output for
@@ -548,19 +582,22 @@ The top-level output contains:
   intervals.
 
 The report calls SNARK verification faster only when the paired 95% confidence
-interval for `raw_verify - snark_verify` is wholly above zero. Only then does it
+interval for `raw_decode_verify - snark_decode_verify` is wholly above zero. Only then does it
 report the number of independent relying-party verifications needed to amortize
 one proof:
 
 ```text
-ceil(prove_ms / (raw_verify_ms - snark_verify_ms))
+ceil(prove_ms / (raw_decode_verify_ms - snark_decode_verify_ms))
 ```
 
 This deliberately excludes one-time setup, signing, network transfer and
 fixture generation; those costs have different owners and must not be folded
 into one latency figure. Break-even is withheld if any paired run has no
 positive verification-time saving; that run is not silently discarded.
-Speedup and break-even Q1/Q3 remain in `scaling.csv`.
+Speedup and break-even Q1/Q3 remain in `scaling.csv`. Sessions are checked for
+complete runs and samples; inherited per-target run overrides are rejected.
+The paired interval assumes independent repetitions on this host and session,
+not a crossover established across days or machines.
 The first favorable N is only the first observed grid point: a final study must
 refine the interval around it rather than call it the exact crossover.
 

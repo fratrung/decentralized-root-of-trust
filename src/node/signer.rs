@@ -6,6 +6,7 @@
 //! guarantee that it is spent *forward only*.
 
 use leanvm::xmss::{MESSAGE_LEN, XmssPublicKey, XmssSecretKey, XmssSignature, sign};
+use std::time::{Duration, Instant};
 
 use crate::state::slot_counter::{AtomicSlotCounter, AtomicSlotCounterError};
 
@@ -41,6 +42,14 @@ pub struct SignerNode {
     pk: XmssPublicKey,
     sk: XmssSecretKey,
     a_slot_counter: AtomicSlotCounter,
+}
+
+/// Timings of one successful protocol-assigned XMSS signature.
+/// The slot has already been durably burned before `crypto` begins.
+#[derive(Debug, Clone, Copy)]
+pub struct SignAtTimings {
+    pub reserve: Duration,
+    pub crypto: Duration,
 }
 
 impl SignerNode {
@@ -109,10 +118,39 @@ impl SignerNode {
         message: &[u8; MESSAGE_LEN],
         slot: u32,
     ) -> Result<XmssSignature, SignerNodeError> {
+        self.sign_at_inner(message, slot, false)
+            .map(|(signature, _)| signature)
+    }
+
+    /// Measures the durable reservation and randomized XMSS operation without
+    /// exposing a signing path that can bypass the counter.
+    pub fn sign_at_timed(
+        &mut self,
+        message: &[u8; MESSAGE_LEN],
+        slot: u32,
+    ) -> Result<(XmssSignature, SignAtTimings), SignerNodeError> {
+        let (signature, timings) = self.sign_at_inner(message, slot, true)?;
+        Ok((signature, timings.expect("timings requested")))
+    }
+
+    fn sign_at_inner(
+        &mut self,
+        message: &[u8; MESSAGE_LEN],
+        slot: u32,
+        measure: bool,
+    ) -> Result<(XmssSignature, Option<SignAtTimings>), SignerNodeError> {
+        let reserve_start = measure.then(Instant::now);
         self.a_slot_counter.reserve_at(slot)?;
+        let reserve = reserve_start.map(|start| start.elapsed());
+        let crypto_start = measure.then(Instant::now);
         let mut rng = leanvm::rand::rng();
-        sign(&mut rng, &self.sk, message, slot)
-            .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))
+        let signature = sign(&mut rng, &self.sk, message, slot)
+            .map_err(|e| SignerNodeError::Sign(format!("{e:?} at slot {slot}")))?;
+        let timings = reserve.map(|reserve| SignAtTimings {
+            reserve,
+            crypto: crypto_start.expect("timings requested").elapsed(),
+        });
+        Ok((signature, timings))
     }
 }
 

@@ -2,12 +2,12 @@
 # Committee-size scaling study built on top of benchmark.sh.
 #
 # This file deliberately does not reimplement measurement or statistics.
-# It first invokes benchmark.sh once for the single-member signer role. Then,
+# It first invokes benchmark.sh once for the XMSS and ML-DSA signer roles. Then,
 # for every admitted (N,t) point, it:
-#   1. builds this crate with compile-time benchmark-only N/t overrides;
-#   2. generates committee signatures in an unmeasured fixture process;
-#   3. invokes benchmark.sh for one aggregator, one SNARK verifier and the raw
-#      verifier baseline;
+#   1. builds both crates, with benchmark-only N/t overrides for XMSS;
+#   2. generates XMSS and ML-DSA signatures in unmeasured fixture processes;
+#   3. invokes benchmark.sh for one aggregator, one SNARK verifier and raw XMSS
+#      and ML-DSA verifier alternatives;
 #   4. enforces one host-wide RAM/swap/time budget around every stage;
 #   5. combines benchmark.sh's summary.csv files into a scaling report.
 #
@@ -49,6 +49,7 @@ MAX_SWAP_GROWTH_MB="${MAX_SWAP_GROWTH_MB:-64}"
 HARD_MEMORY_LIMIT="${HARD_MEMORY_LIMIT:-required}"
 MIN_FREE_DISK_MB="${MIN_FREE_DISK_MB:-8192}"
 OUTDIR="${OUTDIR:-$REPO/committee-scaling-$(date +%Y%m%d-%H%M%S)}"
+BENCH_UPDATES="$(sed -n 's/^pub const N_UPDATES: usize = \([0-9][0-9]*\).*/\1/p' src/params.rs)"
 
 # These are conservative admission thresholds for the usable benchmark budget,
 # not claims about leanVM's exact memory curve. The live guard below remains the
@@ -74,6 +75,18 @@ positive_integer() {
     ''|*[!0-9]*|0) echo "$1 must be a positive integer, got '$2'" >&2; exit 1 ;;
   esac
 }
+for target in signer mldsa_signer prover verifier raw_agg mldsa_raw_agg; do
+  for prefix in RUNS WARMUP; do
+    override="${prefix}_${target}"
+    if [ "${!override+x}" ]; then
+      echo "scaling requires one balanced run count; unset $override and use $prefix instead" >&2
+      exit 1
+    fi
+  done
+done
+
+positive_integer BENCH_UPDATES "$BENCH_UPDATES"
+[ "$BENCH_UPDATES" -le 64 ] || { echo "N_UPDATES=$BENCH_UPDATES exceeds the ML-DSA fixture limit 64" >&2; exit 1; }
 positive_integer RUNS "$RUNS"
 positive_integer SWEEP_REPEATS "$SWEEP_REPEATS"
 case "$WARMUP" in ''|*[!0-9]*) echo "WARMUP must be a non-negative integer" >&2; exit 1 ;; esac
@@ -93,8 +106,8 @@ positive_integer RAM_FOR_N1500_MB "$RAM_FOR_N1500_MB"
 
 if [ "$STUDY_MODE" = publication ]; then
   [ "$RUNS" -ge 10 ] || { echo "publication mode requires RUNS >= 10" >&2; exit 1; }
-  [ $((RUNS % 6)) -eq 0 ] || {
-    echo "publication mode requires RUNS to be a multiple of 6 for the complete three-target Williams design" >&2
+  [ $((RUNS % 4)) -eq 0 ] || {
+    echo "publication mode requires RUNS to be a multiple of 4 for the complete four-target Williams design" >&2
     exit 1
   }
   [ "$SWEEP_REPEATS" -ge 2 ] || { echo "publication mode requires SWEEP_REPEATS >= 2" >&2; exit 1; }
@@ -224,16 +237,20 @@ if [ "$RESUME" = 1 ] && [ -f "$CONFIG_FILE" ]; then
 fi
 
 current_config() {
-  echo "schema=3"
+  echo "schema=5"
   echo "study_mode=$STUDY_MODE"
   echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo n/a)"
   echo "git_dirty=$(test -n "$(git status --porcelain 2>/dev/null)" && echo yes || echo no)"
   echo "source_patch_sha=$(git diff --binary HEAD 2>/dev/null | sha256sum | awk '{print $1}')"
   echo "cargo_lock_sha=$(sha256sum Cargo.lock 2>/dev/null | awk '{print $1}')"
+  echo "mldsa_cargo_lock_sha=$(sha256sum mldsa/Cargo.lock 2>/dev/null | awk '{print $1}')"
   echo "benchmark_sha=$(sha256sum benchmark.sh | awk '{print $1}')"
   echo "scaling_sha=$(sha256sum committee-scaling-benchmark.sh | awk '{print $1}')"
+  echo "validator_sha=$(sha256sum tools/validate_benchmark_csv.awk | awk '{print $1}')"
+  echo "untracked_sha=$(git ls-files -z --others --exclude-standard | sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}')"
   echo "host=$(hostname)"
   echo "cpu=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
+  echo "updates=$BENCH_UPDATES"
   echo "runs=$RUNS"
   echo "warmup=$WARMUP"
   echo "sweep_repeats=$SWEEP_REPEATS"
@@ -437,29 +454,46 @@ summary_rss() {
   echo "$value"
 }
 
+validate_campaign() { # directory, space-separated targets
+  local dir="$1" targets="$2"
+  [ -s "$dir/runs.csv" ] && [ -s "$dir/samples.csv" ] || return 1
+  awk -F, -v targets="$targets" -v expected_runs="$RUNS" \
+      -v expected_items="$BENCH_UPDATES" \
+      -f "$REPO/tools/validate_benchmark_csv.awk" \
+      "$dir/runs.csv" "$dir/samples.csv"
+}
+
 STOP_FURTHER=0
 STOP_REASON=""
 OVERALL_STATUS=0
 
 # Signing is independent of committee size: each member produces one signature
-# for the same message and slot regardless of N or t. Measure that role once as
+# per update regardless of N or t. Measure XMSS and ML-DSA once each as
 # a complete benchmark.sh campaign, preserving repeated runs and confidence
 # intervals without redundantly charging it to every scaling point. N=5,t=4 is
-# only the compile-time anchor for this invocation; the signer binary uses
-# neither parameter.
+# only the compile-time anchor for this invocation; neither signer binary uses
+# those committee parameters.
 mkdir -p "$SIGNER_BENCHMARK_DIR"
 if [ -f "$SIGNER_DIR/status.txt" ] &&
    [ "$(sed -n '1p' "$SIGNER_DIR/status.txt")" = complete ] &&
    [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
-  echo "RESUME: single-member signer benchmark already complete"
-elif run_guarded "single-member signer benchmark" "$SIGNER_DIR/benchmark.log" \
+  if validate_campaign "$SIGNER_BENCHMARK_DIR" "signer mldsa_signer"; then
+    echo "RESUME: single-member signer benchmark already complete"
+  else
+    write_status "$SIGNER_DIR" benchmark_failed "stored signer measurements are incomplete or malformed"
+    STOP_FURTHER=1; STOP_REASON="stored signer measurements failed validation"; OVERALL_STATUS=1
+  fi
+elif run_guarded "single-member signer benchmarks" "$SIGNER_DIR/benchmark.log" \
     env DROT_BENCH_N=5 DROT_BENCH_T=4 \
-    RUNS="$RUNS" WARMUP="$WARMUP" TARGETS="signer" \
+    RUNS="$RUNS" WARMUP="$WARMUP" TARGETS="signer mldsa_signer" \
     STRICT_ENV="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
     COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
     OUTDIR="$SIGNER_BENCHMARK_DIR" "$REPO/benchmark.sh"; then
   if [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
-    if [ "$STUDY_MODE" = publication ] && [ ! -s "$SIGNER_BENCHMARK_DIR/drift.csv" ]; then
+    if ! validate_campaign "$SIGNER_BENCHMARK_DIR" "signer mldsa_signer"; then
+      write_status "$SIGNER_DIR" benchmark_failed "signer measurements are incomplete or malformed"
+      STOP_FURTHER=1; STOP_REASON="signer measurements failed validation"; OVERALL_STATUS=1
+    elif [ "$STUDY_MODE" = publication ] && [ ! -s "$SIGNER_BENCHMARK_DIR/drift.csv" ]; then
       write_status "$SIGNER_DIR" "benchmark_failed" "benchmark.sh produced no drift.csv"
       STOP_FURTHER=1; STOP_REASON="single-member signer benchmark produced no drift diagnostic"; OVERALL_STATUS=1
     elif [ "$STUDY_MODE" = publication ] &&
@@ -501,6 +535,7 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
     point_name="N$(printf '%04d' "$n")-t$(printf '%04d' "$t")"
     point_dir="$OUTDIR/$point_name"
     fixture_dir="$point_dir/fixture"
+    mldsa_fixture_dir="$point_dir/mldsa-fixture"
     session_dir="$point_dir/session-$(printf '%02d' "$sweep")"
     benchmark_dir="$session_dir/benchmark"
     mkdir -p "$fixture_dir" "$benchmark_dir"
@@ -511,14 +546,19 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
     fi
     if [ -f "$session_dir/status.txt" ] && [ "$(sed -n '1p' "$session_dir/status.txt")" = complete ] &&
        [ -s "$benchmark_dir/summary.csv" ]; then
-      echo "RESUME: $point_name session $sweep already complete"
+      if validate_campaign "$benchmark_dir" "prover verifier raw_agg mldsa_raw_agg"; then
+        echo "RESUME: $point_name session $sweep already complete"
+      else
+        write_status "$session_dir" benchmark_failed "stored measurements are incomplete or malformed"
+        STOP_FURTHER=1; STOP_REASON="$point_name stored measurements failed validation"; OVERALL_STATUS=1
+      fi
       continue
     fi
 
     echo
     echo "======================================================================"
     echo "POINT $point_name, sweep $sweep/$SWEEP_REPEATS"
-    echo "one aggregator, one SNARK verifier, one raw verifier"
+    echo "one aggregator, one SNARK verifier, one raw XMSS verifier, one raw ML-DSA verifier"
     echo "quorum policy: t=floor(2N/3)+1 -> t=$t"
     echo "guard: cgroup/poll RSS <= $MEMORY_LIMIT_MB MB, available >= $RESERVE_MB MB, disk >= $MIN_FREE_DISK_MB MB"
     echo "======================================================================"
@@ -527,6 +567,13 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
         env DROT_BENCH_N="$n" DROT_BENCH_T="$t" cargo build --release --locked; then
       write_status "$session_dir" "build_failed" "$GUARD_REASON"
       STOP_FURTHER=1; STOP_REASON="$point_name build did not complete safely"; OVERALL_STATUS=1
+      continue
+    fi
+
+    if ! run_guarded "$point_name/s$sweep ML-DSA build" "$session_dir/mldsa-build.log" \
+        cargo build --manifest-path "$REPO/mldsa/Cargo.toml" --release --locked; then
+      write_status "$session_dir" "build_failed" "$GUARD_REASON"
+      STOP_FURTHER=1; STOP_REASON="$point_name ML-DSA build did not complete safely"; OVERALL_STATUS=1
       continue
     fi
 
@@ -541,10 +588,26 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
       printf 'complete\n' > "$point_dir/fixture.complete"
     fi
 
+    if [ ! -f "$point_dir/mldsa-fixture.complete" ]; then
+      if [ -e "$mldsa_fixture_dir" ]; then
+        write_status "$session_dir" "fixture_failed" "incomplete ML-DSA fixture exists at $mldsa_fixture_dir; use a new OUTDIR or inspect and remove it explicitly"
+        STOP_FURTHER=1; STOP_REASON="$point_name has an incomplete ML-DSA fixture"; OVERALL_STATUS=2
+        continue
+      fi
+      if ! run_guarded "$point_name ML-DSA fixture" "$point_dir/mldsa-fixture.log" \
+          "$REPO/mldsa/target/release/mldsa_fixture" \
+          "$mldsa_fixture_dir" "$n" "$t" "$BENCH_UPDATES"; then
+        write_status "$session_dir" "fixture_failed" "$GUARD_REASON"
+        STOP_FURTHER=1; STOP_REASON="$point_name ML-DSA fixture did not complete safely"; OVERALL_STATUS=2
+        continue
+      fi
+      printf 'complete\n' > "$point_dir/mldsa-fixture.complete"
+    fi
+
     if ! run_guarded "$point_name/s$sweep benchmark" "$session_dir/benchmark.log" \
-        env DROT_BENCH_N="$n" DROT_BENCH_T="$t" BENCH_INPUT_DIR="$fixture_dir" \
+        env DROT_BENCH_N="$n" DROT_BENCH_T="$t" BENCH_INPUT_DIR="$fixture_dir" MLDSA_INPUT_DIR="$mldsa_fixture_dir" \
         BENCH_SELF_CONTAINED=0 RUNS="$RUNS" WARMUP="$WARMUP" \
-        TARGETS="prover verifier raw_agg" STRICT_ENV="$STRICT_ENV" \
+        TARGETS="prover verifier raw_agg mldsa_raw_agg" STRICT_ENV="$STRICT_ENV" \
         REQUIRE_CLEAN_TREE="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
         COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
         OUTDIR="$benchmark_dir" "$REPO/benchmark.sh"; then
@@ -556,6 +619,11 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
     if [ ! -s "$benchmark_dir/summary.csv" ]; then
       write_status "$session_dir" "benchmark_failed" "benchmark.sh produced no summary.csv"
       STOP_FURTHER=1; STOP_REASON="$point_name benchmark produced no summary"; OVERALL_STATUS=1
+      continue
+    fi
+    if ! validate_campaign "$benchmark_dir" "prover verifier raw_agg mldsa_raw_agg"; then
+      write_status "$session_dir" benchmark_failed "measurements are incomplete or malformed"
+      STOP_FURTHER=1; STOP_REASON="$point_name measurements failed validation"; OVERALL_STATUS=1
       continue
     fi
     if [ "$STUDY_MODE" = publication ] && [ ! -s "$benchmark_dir/drift.csv" ]; then
@@ -585,7 +653,12 @@ for n in "${SELECTED_SIZES[@]}"; do
   for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
     session_dir="$point_dir/session-$(printf '%02d' "$sweep")"
     if [ -f "$session_dir/status.txt" ] && [ "$(sed -n '1p' "$session_dir/status.txt")" = complete ]; then
-      complete=$((complete + 1))
+      if validate_campaign "$session_dir/benchmark" "prover verifier raw_agg mldsa_raw_agg"; then
+        complete=$((complete + 1))
+      else
+        write_status "$session_dir" benchmark_failed "measurements failed final validation"
+        OVERALL_STATUS=1
+      fi
     fi
   done
   if [ "$complete" -eq "$SWEEP_REPEATS" ]; then
@@ -610,7 +683,7 @@ done
 if [ -f "$SIGNER_DIR/status.txt" ] &&
    [ "$(sed -n '1p' "$SIGNER_DIR/status.txt")" = complete ] &&
    [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
-  awk -F, 'NR == 1 || $1 == "signer"' "$SIGNER_BENCHMARK_DIR/summary.csv" > "$SIGNER_CSV"
+  awk -F, 'NR == 1 || $1 == "signer" || $1 == "mldsa_signer"' "$SIGNER_BENCHMARK_DIR/summary.csv" > "$SIGNER_CSV"
 else
   echo 'target,metric,unit,n,min,q1,median,q3,max,mean,sd,cv_pct,ci95_halfwidth' > "$SIGNER_CSV"
 fi
@@ -668,8 +741,8 @@ paired_values() { # point_dir delta|speedup|break_even|nonpositive
     [ -f "$file" ] || continue
     awk -F, -v mode="$mode" '
       NR>1 && $1=="prover"   {p[$2]=$14}
-      NR>1 && $1=="verifier" {v[$2]=$20}
-      NR>1 && $1=="raw_agg"  {r[$2]=$20}
+      NR>1 && $1=="verifier" {v[$2]=$44}
+      NR>1 && $1=="raw_agg"  {r[$2]=$44}
       END {for(i in p) if((i in v)&&(i in r)) {
         d=r[i]-v[i]
         if(mode=="delta") print d
@@ -683,7 +756,7 @@ paired_values() { # point_dir delta|speedup|break_even|nonpositive
   done
 }
 
-echo 'n,t,observations,prover_setup_ms,prove_ms,snark_verify_ms,raw_verify_ms,verify_delta_mean_ms,verify_delta_ci95_low,verify_delta_ci95_high,verify_advantage_confirmed,verify_speedup_median,verify_speedup_q1,verify_speedup_q3,snark_record_bytes,raw_record_bytes,wire_reduction_pct,break_even_median,break_even_q1,break_even_q3,prover_peak_mb,snark_verifier_peak_mb,raw_verifier_peak_mb,point_dir' > "$SCALING_CSV"
+echo 'n,t,observations,prover_setup_ms,prove_ms,snark_decode_verify_ms,raw_decode_verify_ms,verify_delta_mean_ms,verify_delta_ci95_low,verify_delta_ci95_high,verify_advantage_confirmed,verify_speedup_median,verify_speedup_q1,verify_speedup_q3,snark_record_bytes,raw_record_bytes,wire_reduction_pct,break_even_median,break_even_q1,break_even_q3,prover_peak_mb,snark_verifier_peak_mb,raw_verifier_peak_mb,point_dir,mldsa_decode_ms,mldsa_verify_ms,mldsa_decode_verify_ms,mldsa_record_bytes,mldsa_verifier_peak_mb,snark_decode_ms,snark_verify_only_ms,raw_decode_ms,raw_verify_only_ms' > "$SCALING_CSV"
 for n in "${SELECTED_SIZES[@]}"; do
   t="$(threshold_for "$n")"
   point_name="N$(printf '%04d' "$n")-t$(printf '%04d' "$t")"
@@ -693,19 +766,37 @@ for n in "${SELECTED_SIZES[@]}"; do
 
   setup_stats="$(point_values "$point_dir" prover 4 | stats)"
   prove_stats="$(point_values "$point_dir" prover 14 | stats)"
-  sv_stats="$(point_values "$point_dir" verifier 20 | stats)"
-  rv_stats="$(point_values "$point_dir" raw_agg 20 | stats)"
+  sv_stats="$(point_values "$point_dir" verifier 44 | stats)"
+  rv_stats="$(point_values "$point_dir" raw_agg 44 | stats)"
+  sd_stats="$(point_values "$point_dir" verifier 38 | stats)"
+  so_stats="$(point_values "$point_dir" verifier 20 | stats)"
+  rd_stats="$(point_values "$point_dir" raw_agg 38 | stats)"
+  ro_stats="$(point_values "$point_dir" raw_agg 20 | stats)"
   sb_stats="$(point_values "$point_dir" prover 26 | stats)"
   rb_stats="$(point_values "$point_dir" raw_agg 26 | stats)"
   pr_stats="$(point_values "$point_dir" prover 30 | stats)"
   sr_stats="$(point_values "$point_dir" verifier 30 | stats)"
   rr_stats="$(point_values "$point_dir" raw_agg 30 | stats)"
+  md_stats="$(point_values "$point_dir" mldsa_raw_agg 38 | stats)"
+  mv_stats="$(point_values "$point_dir" mldsa_raw_agg 20 | stats)"
+  mt_stats="$(point_values "$point_dir" mldsa_raw_agg 44 | stats)"
+  mb_stats="$(point_values "$point_dir" mldsa_raw_agg 26 | stats)"
+  mr_stats="$(point_values "$point_dir" mldsa_raw_agg 30 | stats)"
   delta_stats="$(paired_values "$point_dir" delta | stats)"
   speed_stats="$(paired_values "$point_dir" speedup | stats)"
   be_stats="$(paired_values "$point_dir" break_even | stats)"
   nonpositive_deltas="$(paired_values "$point_dir" nonpositive | awk 'END{print NR+0}')"
 
   observations="$(awk '{print $1}' <<<"$prove_stats")"
+  delta_count="$(awk '{print $1}' <<<"$delta_stats")"
+  speed_count="$(awk '{print $1}' <<<"$speed_stats")"
+  expected_observations=$((RUNS * SWEEP_REPEATS))
+  if [ "$observations" -ne "$expected_observations" ] ||
+     [ "$delta_count" -ne "$expected_observations" ] ||
+     [ "$speed_count" -ne "$expected_observations" ]; then
+    echo "incomplete paired observations for $point_name: prove=$observations delta=$delta_count speedup=$speed_count expected=$expected_observations" >&2
+    exit 1
+  fi
   prover_setup="$(awk '{print $4}' <<<"$setup_stats")"
   prove="$(awk '{print $4}' <<<"$prove_stats")"
   snark_verify="$(awk '{print $4}' <<<"$sv_stats")"
@@ -730,13 +821,32 @@ for n in "${SELECTED_SIZES[@]}"; do
   prover_rss="$(awk '{print $4}' <<<"$pr_stats")"
   snark_verifier_rss="$(awk '{print $4}' <<<"$sr_stats")"
   raw_verifier_rss="$(awk '{print $4}' <<<"$rr_stats")"
+  mldsa_decode="$(awk '{print $4}' <<<"$md_stats")"
+  mldsa_verify="$(awk '{print $4}' <<<"$mv_stats")"
+  mldsa_total="$(awk '{print $4}' <<<"$mt_stats")"
+  mldsa_bytes="$(awk '{print $4}' <<<"$mb_stats")"
+  mldsa_rss="$(awk '{print $4}' <<<"$mr_stats")"
+  snark_decode="$(awk '{print $4}' <<<"$sd_stats")"
+  snark_verify_only="$(awk '{print $4}' <<<"$so_stats")"
+  raw_decode="$(awk '{print $4}' <<<"$rd_stats")"
+  raw_verify_only="$(awk '{print $4}' <<<"$ro_stats")"
 
-  printf '%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$n" "$t" "$observations" "$prover_setup" "$prove" "$snark_verify" "$raw_verify" \
     "$delta_mean" "$delta_low" "$delta_high" "$advantage" "$speed" "$speed_q1" "$speed_q3" \
     "$snark_bytes" "$raw_bytes" "$wire_reduction" "$break_even" "$break_even_q1" "$break_even_q3" \
-    "$prover_rss" "$snark_verifier_rss" "$raw_verifier_rss" "$point_dir" >> "$SCALING_CSV"
+    "$prover_rss" "$snark_verifier_rss" "$raw_verifier_rss" "$point_dir" \
+    "$mldsa_decode" "$mldsa_verify" "$mldsa_total" "$mldsa_bytes" "$mldsa_rss" \
+    "$snark_decode" "$snark_verify_only" "$raw_decode" "$raw_verify_only" >> "$SCALING_CSV"
 done
+awk -F, '
+  NR == 1 { expected = NF; next }
+  NF != expected {
+    printf "scaling.csv row %d has %d columns; expected %d\n", NR, NF, expected > "/dev/stderr"
+    bad = 1
+  }
+  END { exit bad }
+' "$SCALING_CSV"
 
 {
   echo "COMMITTEE SCALING REPORT"
@@ -746,34 +856,53 @@ done
   echo "policy    : t=floor(2N/3)+1 (strict two-thirds supermajority)"
   echo "runs      : $RUNS measured + $WARMUP warmup per target, across $SWEEP_REPEATS complete sweep(s)"
   echo "cooldown  : $COOLDOWN_SECONDS seconds before every measured process"
-  echo "roles     : one signer campaign; per point, one aggregator, one SNARK verifier and one raw verifier"
+  echo "roles     : two single-member signers; per point, one aggregator and three relying-party verifiers"
   echo "RAM plan  : ${AVAILABLE_MB} MB initially available; ${MEMORY_LIMIT_MB} MB process cap; selected N<=${MAX_SELECTED_N}"
   echo "hard cap  : $HARD_LIMIT_BACKEND"
   [ "$STUDY_MODE" = pilot ] && echo "status    : EXPLORATORY PILOT — do not publish as a final measurement campaign"
   echo
-  echo "SINGLE-MEMBER SIGNER — MEASURED ONCE FOR THE WHOLE SWEEP"
+  echo "SINGLE-MEMBER SIGNERS — MEASURED ONCE FOR THE WHOLE SWEEP"
   if [ -s "$SIGNER_CSV" ] && [ "$(awk 'END { print NR }' "$SIGNER_CSV")" -gt 1 ]; then
-    signer_n="$(awk -F, 'NR > 1 && $2 == "sign_per_item" { print $4; exit }' "$SIGNER_CSV")"
+    signer_n="$(awk -F, 'NR > 1 && $1 == "signer" && $2 == "sign_protocol_per_item" { print $4; exit }' "$SIGNER_CSV")"
     signer_keygen="$(summary_value "$SIGNER_CSV" signer keygen)"
     signer_slot_state="$(summary_value "$SIGNER_CSV" signer slot_state)"
-    signer_sign="$(summary_value "$SIGNER_CSV" signer sign_per_item)"
+    signer_sign="$(summary_value "$SIGNER_CSV" signer sign_protocol_per_item)"
+    signer_burn="$(summary_value "$SIGNER_CSV" signer slot_burn_per_item)"
+    signer_crypto="$(summary_value "$SIGNER_CSV" signer sign_crypto_per_item)"
     signer_bytes="$(summary_value "$SIGNER_CSV" signer signature_size)"
     signer_rss="$(summary_rss "$SIGNER_CSV" signer)"
-    printf "  key generation (one key) : %.2f ms\n" "$signer_keygen"
-    printf "  durable slot state       : %.2f ms\n" "$signer_slot_state"
-    printf "  sign / round             : %.2f ms (median of %s run medians)\n" "$signer_sign" "$signer_n"
-    printf "  signature size           : %.0f bytes\n" "$signer_bytes"
-    printf "  signer peak RSS          : %.1f MB\n" "$signer_rss"
-    echo "  applies unchanged to every (N,t) point and to both publication forms"
-    echo "  N=5,t=4 is only this invocation's compilation anchor; signer uses neither"
+    mldsa_n="$(awk -F, 'NR > 1 && $1 == "mldsa_signer" && $2 == "sign_crypto_per_item" { print $4; exit }' "$SIGNER_CSV")"
+    mldsa_keygen="$(summary_value "$SIGNER_CSV" mldsa_signer keygen)"
+    mldsa_sign="$(summary_value "$SIGNER_CSV" mldsa_signer sign_crypto_per_item)"
+    mldsa_bytes="$(summary_value "$SIGNER_CSV" mldsa_signer signature_size)"
+    mldsa_signer_rss="$(summary_rss "$SIGNER_CSV" mldsa_signer)"
+    printf "  XMSS keygen (one key)    : %.2f ms\n" "$signer_keygen"
+    printf "  XMSS durable slot state  : %.2f ms\n" "$signer_slot_state"
+    printf "  XMSS protocol sign       : %.2f ms (median of %s run medians)\n" "$signer_sign" "$signer_n"
+    printf "    durable slot burn      : %.2f ms; cryptographic sign %.2f ms\n" "$signer_burn" "$signer_crypto"
+    printf "  XMSS signature size      : %.0f bytes; peak RSS %.1f MB\n" "$signer_bytes" "$signer_rss"
+    printf "  ML-DSA keygen (one key)  : %.2f ms\n" "$mldsa_keygen"
+    printf "  ML-DSA crypto sign only  : %.2f ms (median of %s run medians)\n" "$mldsa_sign" "$mldsa_n"
+    printf "  ML-DSA signature size    : %.0f bytes; peak RSS %.1f MB\n" "$mldsa_bytes" "$mldsa_signer_rss"
+    echo "  XMSS protocol cost includes durable burn; ML-DSA has no"
+    echo "  one-statement-per-version state and is NOT a comparable protocol cost"
+    echo "  both per-member measurements are independent of N and t"
+    echo "  N=5,t=4 is only this invocation's compilation anchor; neither signer uses it"
   else
     echo "  unavailable: see signer/status.txt and signer/benchmark.log"
   fi
   echo
   printf '%6s %6s %5s %11s %11s %11s %9s %12s %12s %10s %11s\n' \
-    N t obs prove_ms snark_v_ms raw_v_ms speedup snark_bytes raw_bytes confirmed break_even
+    N t obs prove_ms snark_e2e raw_e2e speedup snark_bytes raw_bytes confirmed break_even
   if [ -s "$SCALING_CSV" ]; then
     awk -F, 'NR>1 {printf "%6d %6d %5d %11.2f %11.2f %11.2f %8.2fx %12.0f %12.0f %10s %11s\n",$1,$2,$3,$5,$6,$7,$12,$15,$16,($11==1?"yes":"no"),($18==""?"-":sprintf("%.1f",$18))}' "$SCALING_CSV"
+  fi
+  echo
+  echo "RAW VERIFIER PHASES — E2E IS ONE CONTIGUOUS DECODE + VERIFY TIMER"
+  printf '%6s %6s %10s %10s %10s %10s %10s %10s %12s %12s\n' \
+    N t xmss_dec xmss_ver xmss_e2e mldsa_dec mldsa_ver mldsa_e2e xmss_bytes mldsa_bytes
+  if [ -s "$SCALING_CSV" ]; then
+    awk -F, 'NR>1 {printf "%6d %6d %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f %12.0f %12.0f\n",$1,$2,$32,$33,$7,$25,$26,$27,$16,$28}' "$SCALING_CSV"
   fi
   echo
   size_cross="$(awk -F, 'NR>1 && $16+0>$15+0 {print $1; exit}' "$SCALING_CSV")"
@@ -786,11 +915,13 @@ done
   echo
   echo "break_even is the number of independent relying-party verifications needed"
   echo "for saved verification time to repay one proof:"
-  echo "  ceil(prove_ms / (raw_verify_ms - snark_verify_ms))."
+  echo "  ceil(prove_ms / (raw_decode_verify_ms - snark_decode_verify_ms))."
   echo "It excludes one-time setup, signing (identical for both forms), network cost"
   echo "and fixture generation. The table reports break-even only when the paired"
   echo "95% CI for raw_verify - snark_verify is wholly above zero and every paired"
-  echo "run saved verification time. scaling.csv also contains Q1/Q3 for speedup"
+  echo "run saved end-to-end verification time. The paired CI treats repeated runs"
+  echo "as independent within this host/session; it does not establish an effect"
+  echo "across days or machines. scaling.csv contains Q1/Q3 for speedup"
   echo "and break-even. No timing samples are discarded."
   echo
   echo "RESOURCE OUTCOME"

@@ -1,7 +1,7 @@
 # Standalone crate, deliberately outside the measured one.
 #
-# The library and the four benchmark binaries are the artifact this project
-# publishes and measures; the demo adds networking, container orchestration and
+# The root and ML-DSA protocol crates are the artifacts this project measures;
+# the demo adds networking, container orchestration and
 # a credential format, none of which belong in that surface. Keeping it a
 # separate package means the demo cannot change what the benchmark builds.
 #
@@ -17,6 +17,7 @@ publish = false
 
 [dependencies]
 decentralized-root-of-trust = { path = ".." }
+drot-mldsa = { path = "../mldsa" }
 leanvm = { git = "https://github.com/leanEthereum/leanVM.git", rev = "73a5f5dcd34d8dfe76a32a44dce0c0f87c86feeb" }
 
 # Same wire discipline as the protocol objects: every message on the network has
