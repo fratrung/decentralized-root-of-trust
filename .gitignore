@@ -6,6 +6,7 @@ artifacts/
 
 # Timestamped output directories created by the benchmark harnesses.
 /bench-*/
+/benchmark-*/
 /committee-scaling-*/
 
 # Local scratch binaries: hand-run walkthroughs kept for development, not part of

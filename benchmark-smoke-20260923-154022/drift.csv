@@ -1,7 +1,0 @@
-target,metric,n,window,early_median,late_median,change_pct,status
-signer,sign_protocol_per_item,1,0,,,,insufficient_runs
-mldsa_signer,sign_crypto_per_item,1,0,,,,insufficient_runs
-prover,prove_per_item,1,0,,,,insufficient_runs
-verifier,decode_verify_per_item,1,0,,,,insufficient_runs
-raw_agg,decode_verify_per_item,1,0,,,,insufficient_runs
-mldsa_raw_agg,decode_verify_per_item,1,0,,,,insufficient_runs

@@ -41,7 +41,7 @@ pub fn rss_mb(field: &str) -> usize {
         .expect("missing RSS value")
         .parse()
         .expect("invalid RSS value");
-    kb.div_ceil(1024)
+    kb / 1024
 }
 
 pub struct Summary {
