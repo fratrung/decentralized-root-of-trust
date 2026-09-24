@@ -57,6 +57,7 @@
 #   RUNS=30 WARMUP=3 ./benchmark.sh
 #   TARGETS="prover verifier" RUNS=50 ./benchmark.sh
 #   STRICT_ENV=1 PIN_CPUS=0-7 RUNS=30 ./benchmark.sh   # publication settings
+#   PLOT=1 ./benchmark.sh                  # add SVG figures and a Markdown table
 #   INTERLEAVE=0 ./benchmark.sh           # old block order, for back-comparison
 #
 # Everything this script prints is MEASURED on the host it ran on. It does not
@@ -82,6 +83,7 @@ BENCH_INPUT_DIR="${BENCH_INPUT_DIR:-}"
 MLDSA_INPUT_DIR="${MLDSA_INPUT_DIR:-}"
 BENCH_SELF_CONTAINED="${BENCH_SELF_CONTAINED:-0}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-2}"
+PLOT="${PLOT:-0}"
 
 # Scaling sweeps override the compile-time demo parameters without editing the
 # source tree. Both values must travel together: changing only N or only t would
@@ -119,6 +121,11 @@ fi
 case "$RUNS" in ''|*[!0-9]*|0) echo "RUNS must be a positive integer" >&2; exit 1 ;; esac
 case "$WARMUP" in ''|*[!0-9]*) echo "WARMUP must be a non-negative integer" >&2; exit 1 ;; esac
 case "$COOLDOWN_SECONDS" in ''|*[!0-9]*) echo "COOLDOWN_SECONDS must be a non-negative integer" >&2; exit 1 ;; esac
+case "$PLOT" in 0|1) ;; *) echo "PLOT must be 0 or 1" >&2; exit 1 ;; esac
+if [ "$PLOT" = 1 ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "PLOT=1 requires python3" >&2; exit 1; }
+  python3 "$REPO/tools/plot_benchmarks.py" --help >/dev/null || { echo "PLOT=1 requires a working plot_benchmarks.py" >&2; exit 1; }
+fi
 case "$BENCH_SELF_CONTAINED" in 0|1) ;; *) echo "BENCH_SELF_CONTAINED must be 0 or 1" >&2; exit 1 ;; esac
 if [ "$BENCH_SELF_CONTAINED" = 1 ] && [ -n "$BENCH_INPUT_DIR" ]; then
   echo "BENCH_SELF_CONTAINED=1 conflicts with BENCH_INPUT_DIR" >&2
@@ -1212,3 +1219,6 @@ echo "  $SUMMARY_TXT"
 echo "  $DRIFT_CSV"
 echo "  $SOURCE_STATUS"
 echo "  $SOURCE_PATCH"
+if [ "$PLOT" = 1 ]; then
+  python3 "$REPO/tools/plot_benchmarks.py" "$OUTDIR"
+fi

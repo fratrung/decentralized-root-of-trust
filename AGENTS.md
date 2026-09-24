@@ -46,7 +46,9 @@ cargo fmt --all -- --check                             # formatting gate used by
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked                                    # 73 unit + 10 integration tests; 82 run + 1 ignored
 ./benchmark.sh                                         # defaults: RUNS=24 WARMUP=2; six XMSS/ML-DSA role targets
+PLOT=1 ./benchmark.sh                                  # optional SVG figures and Markdown table in OUTDIR/plots
 ./committee-scaling-benchmark.sh                       # exploratory pilot; hard RAM/disk-gated N/t sweep
+python3 tools/plot_benchmarks.py committee-scaling-<timestamp> # plot a completed or partial scaling campaign
 STUDY_MODE=publication PIN_CPUS=0-7 ./committee-scaling-benchmark.sh # clean-tree, repeated counterbalanced sweep
 PLAN_ONLY=1 ./committee-scaling-benchmark.sh           # persist the host-derived sweep limit only
 tools/mutate.py                                        # mutation testing: 25 checks, each must be caught by a test

@@ -434,6 +434,7 @@ state yet, so its cost is not a protocol-level equivalent of the XMSS signer.
 ./benchmark.sh
 RUNS=30 WARMUP=3 ./benchmark.sh
 TARGETS="signer mldsa_signer prover verifier raw_agg mldsa_raw_agg" ./benchmark.sh
+PLOT=1 ./benchmark.sh
 ```
 
 Defaults:
@@ -443,7 +444,8 @@ Defaults:
 - `N_UPDATES=20` rounds inside each process run;
 - `TARGETS="signer mldsa_signer prover verifier raw_agg mldsa_raw_agg"`;
 - `COOLDOWN_SECONDS=2` before every target process;
-- balanced target ordering (`INTERLEAVE=1`).
+- balanced target ordering (`INTERLEAVE=1`);
+- plotting disabled by default (`PLOT=0`).
 
 Thus the default harness starts each target 26 times: two warm-ups whose data
 is discarded, followed by 24 measured process runs. Each measured run contains
@@ -490,6 +492,21 @@ also requires a clean Git tree. Exploratory dirty-tree runs preserve
 `source.patch` and `source-status.txt`. The patch omits untracked file contents;
 such pilot runs may not be exactly reconstructible. Publication mode requires a
 clean committed tree.
+
+`PLOT=1` runs [`tools/plot_benchmarks.py`](tools/plot_benchmarks.py) after the
+measurements and writes standalone SVG figures plus `plots/overview.md` in the
+output directory. It compares receiver decode plus verification, record and
+signature sizes, signing phases and peak process RSS. The table includes every
+`summary.csv` metric with run count and between-run quartiles; a single run
+receives no uncertainty estimate. Existing results can be plotted without
+rerunning the benchmark:
+
+```sh
+python3 tools/plot_benchmarks.py bench-<timestamp>
+```
+
+The plotting tool requires Python 3.10 or newer, uses only the standard
+library and leaves the source CSV files unchanged.
 
 ### Committee scaling
 
@@ -600,6 +617,18 @@ The paired interval assumes independent repetitions on this host and session,
 not a crossover established across days or machines.
 The first favorable N is only the first observed grid point: a final study must
 refine the interval around it rather than call it the exact crossover.
+
+After a scaling campaign, generate its figures and tables with:
+
+```sh
+python3 tools/plot_benchmarks.py committee-scaling-<timestamp>
+```
+
+The scaling figures show measured `(N,t)` points for receiver time, full record
+size, proving cost, peak RSS and confirmed break-even. `plots/overview.md`
+lists excluded or unfinished points from `manifest.csv` and reports the
+single-member signer campaign separately. Dashed connectors are visual guides
+between observed points, not measurements at intermediate committee sizes.
 
 ## Dependencies
 

@@ -487,7 +487,7 @@ elif run_guarded "single-member signer benchmarks" "$SIGNER_DIR/benchmark.log" \
     env DROT_BENCH_N=5 DROT_BENCH_T=4 \
     RUNS="$RUNS" WARMUP="$WARMUP" TARGETS="signer mldsa_signer" \
     STRICT_ENV="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
-    COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
+    COOLDOWN_SECONDS="$COOLDOWN_SECONDS" PLOT=0 \
     OUTDIR="$SIGNER_BENCHMARK_DIR" "$REPO/benchmark.sh"; then
   if [ -s "$SIGNER_BENCHMARK_DIR/summary.csv" ]; then
     if ! validate_campaign "$SIGNER_BENCHMARK_DIR" "signer mldsa_signer"; then
@@ -609,7 +609,7 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
         BENCH_SELF_CONTAINED=0 RUNS="$RUNS" WARMUP="$WARMUP" \
         TARGETS="prover verifier raw_agg mldsa_raw_agg" STRICT_ENV="$STRICT_ENV" \
         REQUIRE_CLEAN_TREE="$STRICT_ENV" PIN_CPUS="$PIN_CPUS" INTERLEAVE="$INTERLEAVE" \
-        COOLDOWN_SECONDS="$COOLDOWN_SECONDS" \
+        COOLDOWN_SECONDS="$COOLDOWN_SECONDS" PLOT=0 \
         OUTDIR="$benchmark_dir" "$REPO/benchmark.sh"; then
       write_status "$session_dir" "benchmark_failed" "$GUARD_REASON"
       STOP_FURTHER=1; STOP_REASON="$point_name benchmark did not complete safely"; OVERALL_STATUS=2
