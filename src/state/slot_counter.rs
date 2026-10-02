@@ -122,7 +122,12 @@ fn acquire_lock(state_path: &Path) -> Result<File, AtomicSlotCounterError> {
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
-    file.try_lock().map_err(|_| AtomicSlotCounterError::Busy)?;
+    // Only contention is `Busy`. Any other failure is reported as I/O, so an
+    // unusable lock file is not misread as another live holder of this key.
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => AtomicSlotCounterError::Busy,
+        std::fs::TryLockError::Error(e) => AtomicSlotCounterError::Io(e),
+    })?;
     Ok(file)
 }
 
@@ -239,7 +244,7 @@ pub enum AtomicSlotCounterError {
     State(String),
     /// Another process already holds the lock on this key's state.
     Busy,
-    /// The state could not be read or durably written.
+    /// The state could not be locked, read or durably written.
     Io(std::io::Error),
 }
 

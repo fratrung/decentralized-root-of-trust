@@ -20,17 +20,52 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::{Series, median_usize};
+use decentralized_root_of_trust::bench::timing::process_cpu_time;
+use decentralized_root_of_trust::bench::workload::ListSizes;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::params::{KEY_SLOTS, LOG_INV_RATE, N_MEMBERS, N_UPDATES, SLOT, T};
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::{
     Algorithms, SnarkStatusList, StatusList, hash_any,
 };
+use leanvm::AggregateSignature;
 use leanvm::xmss::{XmssPublicKey, XmssSecretKey, XmssSignature, key_gen, sign};
 use rand::RngExt;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+/// The check-5 control: `proof` with one proof-body bit changed. It must still
+/// decode to the very same public claims, so checks 1 to 4 pass by construction
+/// and only the SNARK itself can reject the record. The same construction as
+/// `tests/snark_path.rs`; this binary never verifies, so it asserts only the
+/// shape and leaves the rejection to the verifier.
+fn corrupt_proof_body(proof: &[u8]) -> Vec<u8> {
+    let honest = AggregateSignature::from_bytes(proof).expect("honest aggregate must decode");
+    let mut bytes = proof.to_vec();
+    *bytes.last_mut().expect("aggregate has proof bytes") ^= 1;
+    let spliced = AggregateSignature::from_bytes(&bytes)
+        .expect("changing a proof-body bit must preserve the aggregate shape");
+    assert_eq!(spliced.xmss_signers(), honest.xmss_signers());
+    assert_eq!(spliced.sphincs_signers(), honest.sphincs_signers());
+    let spliced = spliced.to_bytes();
+    assert_ne!(
+        spliced, proof,
+        "the proof-body control must differ from the honest proof"
+    );
+    spliced
+}
+
+/// The verifier corpus's below-quorum control needs `t - 1 >= 1` signatures:
+/// leanVM cannot aggregate an empty signer set. Only corpus generation needs
+/// it, so it is checked there, before any expensive work, and not at compile
+/// time: a `t = 1` build must still produce every other binary, and this one
+/// must still aggregate honest-only fixture updates.
+fn require_corpus_quorum() {
+    if T < 2 {
+        panic!("the verifier corpus needs t >= 2 for its below-quorum control, got t={T}");
+    }
 }
 
 fn write(dir: &Path, name: &str, bytes: &[u8]) {
@@ -93,12 +128,17 @@ fn aggregation_inputs(
 fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
     let honest_only = std::env::var_os("BENCH_HONEST_ONLY").is_some();
+    if !honest_only {
+        require_corpus_quorum();
+    }
     let rss_baseline = rss_now_mb();
 
     println!("prover: setup (pre-signed fixture input)...");
+    let setup_cpu_start = process_cpu_time();
     let t_setup = Instant::now();
     let prover = PQSNARKProverModule::init_prover();
     let setup_time = t_setup.elapsed();
+    let setup_cpu = ms(process_cpu_time().saturating_sub(setup_cpu_start));
     let rss_after_setup = rss_now_mb();
 
     let committee = load_committee(&fixture_dir.join("anchor.bin"));
@@ -119,15 +159,21 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
     let mut prove_ms = Vec::with_capacity(updates.len());
     let mut record_bytes = Vec::with_capacity(updates.len());
     let mut rss_updates_max = rss_after_setup;
+    let mut prove_cpu_ms = Vec::with_capacity(updates.len());
+    let mut list_sizes = ListSizes::default();
 
     for (index, path) in updates.iter().enumerate() {
         let raw = load_raw(path);
+        list_sizes.record(raw.list().len());
         assert_eq!(
             raw.signer_count(),
             T,
             "fixture update must carry one quorum"
         );
         let inputs = aggregation_inputs(&committee, &raw);
+        // Elapsed and CPU: the prover spreads its work over every core it is
+        // given, so its CPU is a multiple of its elapsed time.
+        let cpu_start = process_cpu_time();
         let t_prove = Instant::now();
         let proof = prover.make_proof(
             &committee,
@@ -138,6 +184,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
             LOG_INV_RATE,
         );
         let prove_time = t_prove.elapsed();
+        let prove_cpu = ms(process_cpu_time().saturating_sub(cpu_start));
         let record = SnarkStatusList::new(raw.alg, raw.list_cloned(), raw.version(), proof);
         let bytes = record.to_bytes();
         write(outdir, &format!("update-{index:02}.bin"), &bytes);
@@ -158,12 +205,13 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=prover idx={index} prove_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=prover idx={index} prove_ms={:.3} bytes={} rss_mb={rss} cpu_ms={prove_cpu:.3}",
                 ms(prove_time),
                 bytes.len()
             );
         }
         prove_ms.push(ms(prove_time));
+        prove_cpu_ms.push(prove_cpu);
         record_bytes.push(bytes.len());
     }
 
@@ -177,7 +225,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
         let honest_proof = prover.make_proof(
             &committee,
             honest_attack.alg,
-            honest_inputs,
+            honest_inputs.clone(),
             honest_attack.list(),
             honest_attack.version(),
             LOG_INV_RATE,
@@ -195,14 +243,90 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
             )
             .to_bytes(),
         );
+
+        // Check 5 alone: honest claims over a proof body that no longer verifies.
+        write(
+            outdir,
+            "attack-proofbody.bin",
+            &SnarkStatusList::new(
+                honest_attack.alg,
+                honest_attack.list_cloned(),
+                honest_attack.version(),
+                corrupt_proof_body(&honest_proof),
+            )
+            .to_bytes(),
+        );
+
+        // Check 4 alone: a genuine proof of the right statement at the right
+        // slot, but over t - 1 of the same signatures. Reusing signatures that
+        // already exist asks no key to sign again.
+        let short_proof = prover.make_proof(
+            &committee,
+            honest_attack.alg,
+            honest_inputs.into_iter().take(T - 1).collect(),
+            honest_attack.list(),
+            honest_attack.version(),
+            LOG_INV_RATE,
+        );
+        write(
+            outdir,
+            "attack-short.bin",
+            &SnarkStatusList::new(
+                honest_attack.alg,
+                honest_attack.list_cloned(),
+                honest_attack.version(),
+                short_proof,
+            )
+            .to_bytes(),
+        );
+
+        // Check 3 alone: the attack version's genuine statement, signed by a full
+        // quorum one slot after the one this version derives to.
+        let slot_attack = load_raw(&fixture_dir.join("raw-attack-slot.bin"));
+        let slot_inputs = aggregation_inputs(&committee, &slot_attack);
+        let slot_message =
+            committee.message_for(slot_attack.alg, slot_attack.list(), slot_attack.version());
+        let wrong_slot = committee
+            .slot_for(slot_attack.version() + 1)
+            .expect("slot fixture slot overflow");
+        let slot_proof = prover.aggregate(slot_inputs, slot_message, wrong_slot, LOG_INV_RATE);
+        write(
+            outdir,
+            "attack-slot.bin",
+            &SnarkStatusList::new(
+                slot_attack.alg,
+                slot_attack.list_cloned(),
+                slot_attack.version(),
+                slot_proof,
+            )
+            .to_bytes(),
+        );
+
+        // Slot-consistent, as in the self-contained mode below: the fixture
+        // quorum signed the true latest version at the slot KEY_SLOTS derives
+        // to, so check 3 passes and only check 2 rejects the relabelled record.
+        // `make_proof` derives the slot from the record's own version and so
+        // cannot express this; `aggregate` exists for exactly these fixtures.
+        let version_attack = load_raw(&fixture_dir.join("raw-attack-version.bin"));
+        let version_inputs = aggregation_inputs(&committee, &version_attack);
+        let signed_message = committee.message_for(
+            version_attack.alg,
+            version_attack.list(),
+            version_attack.version(),
+        );
+        let spoof_slot = committee
+            .slot_for(KEY_SLOTS)
+            .expect("version fixture slot overflow");
+        let version_proof =
+            prover.aggregate(version_inputs, signed_message, spoof_slot, LOG_INV_RATE);
         write(
             outdir,
             "attack-version.bin",
             &SnarkStatusList::new(
-                honest_attack.alg,
-                honest_attack.list_cloned(),
+                version_attack.alg,
+                version_attack.list_cloned(),
                 KEY_SLOTS,
-                honest_proof,
+                version_proof,
             )
             .to_bytes(),
         );
@@ -234,12 +358,14 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
 
     let prove = Series::new(prove_ms);
     let (pv_min, pv_med, pv_max) = prove.min_med_max();
+    let prove_cpu = Series::new(prove_cpu_ms);
+    let (prove_cpu_med, prove_cpu_total) = (prove_cpu.median(), prove_cpu.sum());
     let record_med = median_usize(&record_bytes);
 
     if honest_only {
         println!("\n{} honest updates written", prove.len());
     } else {
-        println!("\n{} updates + 3 forgeries written", prove.len());
+        println!("\n{} updates + 6 forgeries written", prove.len());
     }
     println!("setup_prover           : {setup_time:.2?}");
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
@@ -254,7 +380,8 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
          prove_max_ms={pv_max:.3} prove_total_ms={:.3} record_med_bytes={record_med:.3} \
          rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
-         fixture_input=1",
+         fixture_input=1 {list_sizes} setup_cpu_ms={setup_cpu:.3} \
+         prove_cpu_med_ms={prove_cpu_med:.3} prove_cpu_total_ms={prove_cpu_total:.3}",
         ms(setup_time),
         prove.len(),
         prove.mean(),
@@ -275,6 +402,18 @@ fn make_adversarial_proof(
     message: [u8; 32],
     slot: u32,
 ) -> Vec<u8> {
+    let raws = sign_adversarial(keypairs, signers, message, slot);
+    prover.aggregate(raws, message, slot, LOG_INV_RATE)
+}
+
+/// Signs once per listed key at `slot`. Split from aggregation so one set of
+/// signatures can back several controls without any key signing twice there.
+fn sign_adversarial(
+    keypairs: &[(XmssSecretKey, XmssPublicKey)],
+    signers: &[usize],
+    message: [u8; 32],
+    slot: u32,
+) -> Vec<(XmssPublicKey, XmssSignature)> {
     let mut unique = signers.to_vec();
     unique.sort_unstable();
     assert!(
@@ -282,7 +421,7 @@ fn make_adversarial_proof(
         "adversarial fixture must not reuse an XMSS key at one slot"
     );
     let mut rng = leanvm::rand::rng();
-    let raws = signers
+    signers
         .iter()
         .map(|&index| {
             let (secret, public) = &keypairs[index];
@@ -291,8 +430,7 @@ fn make_adversarial_proof(
                 sign(&mut rng, secret, &message, slot).expect("signing failed"),
             )
         })
-        .collect();
-    prover.aggregate(raws, message, slot, LOG_INV_RATE)
+        .collect()
 }
 
 fn main() {
@@ -324,6 +462,9 @@ fn main() {
         run_fixture_prover(outdir, Path::new(&fixture_dir));
         return;
     }
+
+    // Self-contained mode always writes the forgeries.
+    require_corpus_quorum();
 
     // Raw per-update records for the benchmark harness; off by default so
     // interactive runs stay readable.
@@ -374,6 +515,7 @@ fn main() {
     // must never sign twice.
     let mut list: Vec<[u8; 32]> = Vec::new();
     let mut prove_ms = Vec::new();
+    let mut prove_cpu_ms = Vec::new();
     let mut record_bytes = Vec::new();
     let mut rss_updates_max = rss_after_setup;
 
@@ -407,6 +549,7 @@ fn main() {
         // anchor itself and computes the signed message the same way the verifier
         // does. Passing a slot here would be a second place for `genesis + version`
         // to live, which is exactly the drift check 3 exists to catch.
+        let cpu_start = process_cpu_time();
         let t_prove = Instant::now();
         let proof = prover.make_proof(
             &committee,
@@ -417,6 +560,7 @@ fn main() {
             LOG_INV_RATE,
         );
         let prove_time = t_prove.elapsed();
+        let prove_cpu = ms(process_cpu_time().saturating_sub(cpu_start));
 
         let sl = SnarkStatusList::new(Algorithms::WotsXmss, list.clone(), version, proof);
         let bytes = sl.to_bytes();
@@ -443,15 +587,18 @@ fn main() {
         if emit_samples {
             // Tidy per-sample record: one row per update, consumed by benchmark.sh.
             println!(
-                "SAMPLE target=prover idx={i} prove_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=prover idx={i} prove_ms={:.3} bytes={} rss_mb={rss} cpu_ms={prove_cpu:.3}",
                 ms(prove_time),
                 bytes.len()
             );
         }
         prove_ms.push(ms(prove_time));
+        prove_cpu_ms.push(prove_cpu);
         record_bytes.push(bytes.len());
     }
     let prove = Series::new(prove_ms);
+    let prove_cpu = Series::new(prove_cpu_ms);
+    let (prove_cpu_med, prove_cpu_total) = (prove_cpu.median(), prove_cpu.sum());
 
     // ---- Forgeries the verifier must reject. Built here only because this is
     // the process that owns signing keys; conceptually these are the attacker's.
@@ -467,21 +614,80 @@ fn main() {
     let quorum: Vec<usize> = (0..T).collect();
 
     // A) a valid proof of the honest list, attached to a list with an extra row.
-    //    Defeated by check 2 (message binds the list).
-    let good_proof = make_adversarial_proof(
-        &prover,
-        &keypairs,
-        &quorum,
-        committee.message_for(Algorithms::WotsXmss, &list, attack_version),
+    //    Defeated by check 2 (message binds the list). Its signatures also back
+    //    controls D and E below, so no key signs twice at `attack_slot`.
+    let attack_message = committee.message_for(Algorithms::WotsXmss, &list, attack_version);
+    let attack_signatures = sign_adversarial(&keypairs, &quorum, attack_message, attack_slot);
+    let good_proof = prover.aggregate(
+        attack_signatures.clone(),
+        attack_message,
         attack_slot,
+        LOG_INV_RATE,
     );
     let mut tampered = list.clone();
     tampered.push(hash_any(b"FAKE-REVOCATION"));
     write(
         outdir,
         "attack-tampered.bin",
-        &SnarkStatusList::new(Algorithms::WotsXmss, tampered, attack_version, good_proof)
-            .to_bytes(),
+        &SnarkStatusList::new(
+            Algorithms::WotsXmss,
+            tampered,
+            attack_version,
+            good_proof.clone(),
+        )
+        .to_bytes(),
+    );
+
+    // D) honest claims over a proof body that no longer verifies. Check 5 alone.
+    write(
+        outdir,
+        "attack-proofbody.bin",
+        &SnarkStatusList::new(
+            Algorithms::WotsXmss,
+            list.clone(),
+            attack_version,
+            corrupt_proof_body(&good_proof),
+        )
+        .to_bytes(),
+    );
+
+    // E) a genuine proof over t - 1 of A's signatures. Check 4 alone.
+    let short_proof = prover.aggregate(
+        attack_signatures.into_iter().take(T - 1).collect(),
+        attack_message,
+        attack_slot,
+        LOG_INV_RATE,
+    );
+    write(
+        outdir,
+        "attack-short.bin",
+        &SnarkStatusList::new(
+            Algorithms::WotsXmss,
+            list.clone(),
+            attack_version,
+            short_proof,
+        )
+        .to_bytes(),
+    );
+
+    // F) the attack version's genuine statement, signed by a full quorum one
+    //    slot after the one it derives to. Check 3 alone. `attack_version + 1`
+    //    is below KEY_SLOTS by the assertion in params.rs.
+    let wrong_slot = committee
+        .slot_for(attack_version + 1)
+        .expect("slot overflow");
+    let slot_proof =
+        make_adversarial_proof(&prover, &keypairs, &quorum, attack_message, wrong_slot);
+    write(
+        outdir,
+        "attack-slot.bin",
+        &SnarkStatusList::new(
+            Algorithms::WotsXmss,
+            list.clone(),
+            attack_version,
+            slot_proof,
+        )
+        .to_bytes(),
     );
 
     // B) a perfectly valid quorum of keys that are NOT in the committee.
@@ -547,7 +753,7 @@ fn main() {
     );
     let record_med = median_usize(&record_bytes);
 
-    println!("\n{N_UPDATES} updates + 3 forgeries written");
+    println!("\n{N_UPDATES} updates + 6 forgeries written");
     println!("setup_prover           : {setup_time:.2?}");
     println!("keygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
@@ -563,7 +769,8 @@ fn main() {
         "\nPROVER setup_ms={:.3} keygen_ms={:.3} n_updates={} \
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
          prove_max_ms={pv_max:.3} prove_total_ms={:.3} record_med_bytes={record_med:.3} \
-         rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={}",
+         rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
+         prove_cpu_med_ms={prove_cpu_med:.3} prove_cpu_total_ms={prove_cpu_total:.3}",
         ms(setup_time),
         ms(keygen_time),
         prove.len(),

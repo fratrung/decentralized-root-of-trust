@@ -3,12 +3,10 @@
 
 A green suite says nothing on its own. The question that matters is whether each
 check is load-bearing *according to the tests* — and the only way to answer it is
-to break the check and see who complains. This repository has been caught twice
-by exactly that: `snark_verifier_node` had silently lost the slot check, and
-`padding_bits_past_the_committee_are_refused` turned out never to reach the check
-it was named after (it patched a byte in the middle of a signature, so the record
-failed to verify for the wrong reason, and `verify_status_list`'s padding check
-could be deleted with the whole suite still green).
+to break the check and see who complains. Two failure modes this catches: a
+predicate that has lost a check while every existing test still passes, and a
+test that rejects its input for a different reason than the one it is named
+after, so the check it claims to cover can be deleted with the suite still green.
 
     tools/mutate.py                     # every mutant, against the whole suite
     tools/mutate.py list                # names and targets
@@ -29,10 +27,10 @@ handler means Ctrl-C and a crashing `cargo` both still restore. If a restore eve
 fails, the script says so loudly and names the file.
 
 Why Python and not shell: the patterns are Rust source containing `|`, `;`, `{`
-and newlines. Every shell-friendly field separator appears inside them. A first
-version of this tool used `|` and silently truncated four patterns at the first
-closure — `.filter(|sl| ...)` became `.filter(`, which still matched once, so the
-tool reported "ok" while mutating something else entirely.
+and newlines. Every shell-friendly field separator appears inside them: split
+on `|`, a pattern is truncated at its first closure (`.filter(|sl| ...)` becomes
+`.filter(`), which can still match once, so the tool would report "ok" while
+mutating something else entirely.
 """
 
 import os
@@ -132,10 +130,9 @@ MUTANTS = {
             return false;
         }""", "        if false { return false; }"),
     # Not merely canonicity: this is also what keeps `members[i]` in range, since
-    # every index the bitmap yields is below the length it declares. There used to
-    # be a second mutant here, "raw-padding-bits", deleting a sweep for set bits
-    # above member n - 1. An SSZ BitList carries its length in a sentinel bit, so
-    # those bits cannot exist and there is no longer a check to delete.
+    # every index the bitmap yields is below the length it declares. There is no
+    # separate mutant for set bits above member n - 1: an SSZ BitList carries its
+    # length in a sentinel bit, so those bits cannot exist and no check polices them.
     "raw-bitmap-width": ("src/node/raw_verifier.rs", """        if status_list.signer_slots() != n {
             return false;
         }""", "        if false { return false; }"),
@@ -152,9 +149,8 @@ MUTANTS = {
     #
     # The five checks above are the predicate; these are the two places a node
     # decides *what* to check against. Both are on the critical path of every
-    # binary, and `snark_verifier_node` is where a check has actually been lost
-    # before — it once held a second copy of the predicate with the slot check
-    # missing.
+    # binary, and a second copy of the predicate in a node type is exactly where
+    # a check can go missing unnoticed.
     #
     # The prover mutant stands in for "the slot comes from the caller instead of the
     # anchor". That cannot be written as a text swap — the parameter does not exist —
@@ -185,7 +181,11 @@ MUTANTS = {
     # --- the stateful-signature invariants --------------------------------
     "lock-off": (
         "src/state/slot_counter.rs",
-        "    file.try_lock().map_err(|_| AtomicSlotCounterError::Busy)?;\n",
+        """    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => AtomicSlotCounterError::Busy,
+        std::fs::TryLockError::Error(e) => AtomicSlotCounterError::Io(e),
+    })?;
+""",
         "",
     ),
     "create-exists-check": (
@@ -318,7 +318,7 @@ def run_one(ws, name, extra, position=""):
     The name is printed *before* the mutant is applied, not after the verdict.
     A `cargo test` here takes a minute or more, during which the working tree is
     modified; without this the log is silent and the tree looks inexplicably
-    dirty. The last line of the output now always names the mutant currently
+    dirty. The last line of the output always names the mutant currently
     live, which is the first thing anyone asks when they open a mutated file.
     """
     rel, old, new = MUTANTS[name]
@@ -358,12 +358,10 @@ def main():
     ws = Workspace({rel for rel, _, _ in MUTANTS.values()})
     # A Ctrl-C during `cargo test` must not leave a mutated tree behind.
     #
-    # SIGTERM matters just as much and used to be missing: Python's default for it
-    # exits without unwinding, so `finally` never runs and the tree keeps whatever
-    # mutant was applied. That is exactly what a plain `kill` or `pkill` sends, and
-    # it happened — a killed run left `.slot_for(version + 1)` in
-    # `snark_prover_node.rs` and a `>=` in `snark_verifier_node.rs`, staged, ready
-    # to be committed as if they were real code.
+    # SIGTERM matters just as much: Python's default for it exits without
+    # unwinding, so `finally` never runs and the tree keeps whatever mutant was
+    # applied, ready to be committed as if it were real code. That is exactly
+    # what a plain `kill` or `pkill` sends.
     interrupt = lambda *_: (_ for _ in ()).throw(KeyboardInterrupt)
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)

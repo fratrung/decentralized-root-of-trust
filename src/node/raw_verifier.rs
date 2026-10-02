@@ -587,10 +587,10 @@ mod tests {
         // so an outsider cannot be appended alongside a full honest quorum either.
         //
         // Round 1, not 0: members 0 and 1 already signed round 0 above, and round
-        // 0 is slot `GENESIS` for both. Reusing it here would have this test do
-        // exactly what the repeated-signer guard in `snark_prover_node` exists to
-        // forbid. `StatusList::new` rejects on the index alone, so which round the
-        // signatures cover makes no difference to what is being asserted.
+        // 0 is slot `GENESIS` for both. Reusing it here would sign twice with one
+        // key at one XMSS slot, which is never safe. `StatusList::new` rejects on
+        // the index alone, so which round the signatures cover makes no
+        // difference to what is being asserted.
         let mut beyond = quorum(&keys, node.get_committee(), &list, 1, &[0, 1, 2]);
         beyond.push((N, outsider));
         assert!(StatusList::new(Algorithms::WotsXmss, list, 1, N, beyond).is_err());

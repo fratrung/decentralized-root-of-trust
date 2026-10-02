@@ -55,7 +55,25 @@ jobs:
         run: tools/mutate.py check
 
       - name: Check benchmark shell syntax
-        run: bash -n benchmark.sh committee-scaling-benchmark.sh demo/docker/demo.sh
+        run: bash -n benchmark.sh committee-scaling-benchmark.sh tools/freeze_bins.sh tools/cargo_env_fingerprint.sh tools/storage_class.sh tools/mldsa_statement_experiment.sh tools/test_benchmark_workload.sh demo/docker/demo.sh
+
+      - name: Test benchmark CSV validator
+        run: tools/test_benchmark_csv.sh
+
+      - name: Test shared benchmark statistics
+        run: tools/test_stats.sh
+
+      - name: Test balanced benchmark order
+        run: tools/test_balanced_order.sh
+
+      - name: Test benchmark workload checks
+        run: tools/test_benchmark_workload.sh
+
+      - name: Test scaling campaign design checks
+        run: tools/test_scaling_design.sh
+
+      - name: Test benchmark plotting
+        run: python3 tools/test_plot_benchmarks.py
 
       - name: Lint
         run: cargo clippy --all-targets --all-features --locked -- -D warnings

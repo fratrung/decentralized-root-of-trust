@@ -28,15 +28,16 @@ fn signed_record(
     version: u32,
 ) -> MlDsaStatusList {
     let message = committee.statement_for(list, version);
-    let signatures: Vec<(usize, Signature)> = (0..committee.threshold())
-        .map(|offset| {
-            let index = (version as usize + offset) % committee.member_count();
-            let signature = signers[index]
-                .sign(&message)
-                .expect("ML-DSA signing failed");
-            (index, signature)
-        })
-        .collect();
+    let signatures: Vec<(usize, Signature)> =
+        support::quorum_indices(committee.member_count(), committee.threshold(), version)
+            .into_iter()
+            .map(|index| {
+                let signature = signers[index]
+                    .sign(&message)
+                    .expect("ML-DSA signing failed");
+                (index, signature)
+            })
+            .collect();
     MlDsaStatusList::new(list.to_vec(), version, committee.member_count(), signatures)
         .expect("fixture record construction failed")
 }
@@ -62,10 +63,12 @@ fn main() {
     let committee = Committee::new(members, threshold).expect("invalid committee");
     write_new(&outdir.join("anchor.ssz"), &committee.to_bytes());
 
-    let mut list = Vec::with_capacity(updates);
+    let list_entries = support::list_entries_from_env();
+    let mut next_entry = 0;
+    let mut list = Vec::with_capacity(list_entries.unwrap_or(updates));
     let mut first_record = None;
     for version in 0..updates {
-        list.push(support::fingerprint(version as u32));
+        support::advance_list(&mut list, version, list_entries, &mut next_entry);
         let record = signed_record(&committee, &signers, &list, version as u32);
         if version == 0 {
             first_record = Some(record.to_bytes());
@@ -104,6 +107,13 @@ fn main() {
     write_new(
         &outdir.join("attack-outsider.ssz"),
         &outsider_record.to_bytes(),
+    );
+
+    // What this corpus is, for the harness that measures it: list size and
+    // quorum selection. benchmark.sh compares it with the declared workload.
+    write_new(
+        &outdir.join("workload.txt"),
+        support::workload_manifest(list_entries).as_bytes(),
     );
 
     // Written last: its presence means the complete fixture was generated.

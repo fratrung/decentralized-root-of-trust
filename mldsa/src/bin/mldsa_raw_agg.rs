@@ -40,6 +40,30 @@ fn indexed_signatures(record: &MlDsaStatusList) -> Vec<(usize, Signature)> {
         .collect()
 }
 
+/// The signature-validity control: `bytes` with one bit changed in the first
+/// byte of its last signature, the start of the challenge seed c~. Those bytes
+/// are copied verbatim by the FIPS 204 decoder, so the record still decodes
+/// canonically to the same list, version and signer set, and only verifying
+/// that signature can reject it. SSZ puts the fixed-size signatures last.
+fn corrupt_last_signature(bytes: &[u8], honest: &MlDsaStatusList) -> MlDsaStatusList {
+    let mut corrupted = bytes.to_vec();
+    let position = corrupted
+        .len()
+        .checked_sub(SIGNATURE_BYTES)
+        .expect("record has a signature");
+    corrupted[position] ^= 1;
+    let record = MlDsaStatusList::from_bytes(&corrupted)
+        .expect("changing a challenge-seed bit must preserve the record shape");
+    assert!(
+        record.list() == honest.list()
+            && record.version() == honest.version()
+            && record.signer_indices().eq(honest.signer_indices())
+            && record.to_bytes() != bytes,
+        "the signature control must differ from its honest record in a signature only"
+    );
+    record
+}
+
 fn negative_controls(verifier: &RawVerifier, directory: &Path) -> bool {
     let bytes = read_bounded(&directory.join("update-00000.ssz"), MAX_RECORD_BYTES as u64);
     let honest = MlDsaStatusList::from_bytes(&bytes).expect("invalid first fixture record");
@@ -73,15 +97,21 @@ fn negative_controls(verifier: &RawVerifier, directory: &Path) -> bool {
     let outsider =
         MlDsaStatusList::from_bytes(&outsider_bytes).expect("invalid outsider fixture record");
 
+    // ML-DSA is stateless: there is no slot, so the XMSS wrong-slot control has
+    // no counterpart here.
+    let signature = corrupt_last_signature(&bytes, &honest);
+
     let tamper_rejected = !verifier.verify_status_list(&tampered);
     let relabel_rejected = !verifier.verify_status_list(&relabelled);
     let short_rejected = !verifier.verify_status_list(&short);
     let outsider_rejected = !verifier.verify_status_list(&outsider);
+    let signature_rejected = !verifier.verify_status_list(&signature);
     println!(
-        "negative controls (list/version/quorum/outsider): \
-         {tamper_rejected}/{relabel_rejected}/{short_rejected}/{outsider_rejected}"
+        "negative controls (list/version/quorum/outsider/signature): \
+         {tamper_rejected}/{relabel_rejected}/{short_rejected}/{outsider_rejected}/\
+         {signature_rejected}"
     );
-    tamper_rejected && relabel_rejected && short_rejected && outsider_rejected
+    tamper_rejected && relabel_rejected && short_rejected && outsider_rejected && signature_rejected
 }
 
 fn main() {
@@ -94,6 +124,11 @@ fn main() {
     let directory = Path::new(&args[1]);
     let updates = support::parse_count(&args[2], "updates", support::MAX_UPDATES);
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
+    // `ready`: what a relying party pays once per process before it can verify
+    // anything: read and decode the anchor (every member's public key) and
+    // build the verifier. The XMSS and SNARK verifiers bracket the same steps.
+    let ready_cpu_start = support::process_cpu_time();
+    let ready_start = Instant::now();
     let anchor_bytes = read_bounded(&directory.join("anchor.ssz"), MAX_ANCHOR_FILE_BYTES);
     let committee = Committee::from_bytes(&anchor_bytes).expect("invalid fixture anchor");
     let n = committee.member_count();
@@ -106,16 +141,25 @@ fn main() {
         "fixture N/t/update count differs from the requested run"
     );
     let verifier = RawVerifier::new(committee);
+    let ready = support::milliseconds(ready_start.elapsed());
+    let ready_cpu =
+        support::milliseconds(support::process_cpu_time().saturating_sub(ready_cpu_start));
     let rss_anchor = support::rss_mb("VmRSS:");
     let mut rss_updates_max = rss_anchor;
     let mut decode_samples = Vec::with_capacity(updates);
     let mut verify_samples = Vec::with_capacity(updates);
     let mut total_samples = Vec::with_capacity(updates);
     let mut record_bytes = Vec::with_capacity(updates);
+    let mut total_cpu_samples = Vec::with_capacity(updates);
+    let mut list_sizes = support::ListSizes::default();
 
     for index in 0..updates {
         let path = directory.join(format!("update-{index:05}.ssz"));
         let bytes = read_bounded(&path, MAX_RECORD_BYTES as u64);
+        // The same boundary as the XMSS and SNARK receivers (the root crate's
+        // `bench::timing`): the total starts before decoding and ends when the
+        // predicate returns, with `record` still alive until RSS is read below.
+        let cpu_start = support::process_cpu_time();
         let total_start = Instant::now();
         let record = MlDsaStatusList::from_bytes(&bytes).expect("invalid fixture record");
         let decode_time = total_start.elapsed();
@@ -123,9 +167,11 @@ fn main() {
         let accepted = verifier.verify_status_list(&record);
         let verify_time = verify_start.elapsed();
         let total_time = total_start.elapsed();
+        let cpu_ms = support::milliseconds(support::process_cpu_time().saturating_sub(cpu_start));
         assert_eq!(record.version(), index as u32, "fixture version mismatch");
         assert_eq!(record.signer_count(), threshold, "fixture quorum mismatch");
         assert!(accepted, "honest fixture failed ML-DSA verification");
+        list_sizes.record(record.list().len());
 
         let rss = support::rss_mb("VmRSS:");
         rss_updates_max = rss_updates_max.max(rss);
@@ -136,7 +182,7 @@ fn main() {
             println!(
                 "SAMPLE target=mldsa_raw_agg idx={index} decode_ms={decode_ms:.3} \
                  verify_ms={verify_ms:.3} total_ms={total_ms:.3} bytes={} \
-                 sig_bytes={SIGNATURE_BYTES} signatures_bytes={} rss_mb={rss}",
+                 sig_bytes={SIGNATURE_BYTES} signatures_bytes={} rss_mb={rss} cpu_ms={cpu_ms:.3}",
                 bytes.len(),
                 threshold * SIGNATURE_BYTES
             );
@@ -144,6 +190,7 @@ fn main() {
         decode_samples.push(decode_ms);
         verify_samples.push(verify_ms);
         total_samples.push(total_ms);
+        total_cpu_samples.push(cpu_ms);
         record_bytes.push(bytes.len() as f64);
     }
 
@@ -155,6 +202,8 @@ fn main() {
     let decode = support::summary(&decode_samples);
     let verify = support::summary(&verify_samples);
     let total = support::summary(&total_samples);
+    let total_cpu = support::summary(&total_cpu_samples);
+    let (total_cpu_med, total_cpu_total) = (total_cpu.median, total_cpu.total);
     let size = support::summary(&record_bytes);
 
     println!(
@@ -168,7 +217,9 @@ fn main() {
          record_med_bytes={:.3} sig_bytes={SIGNATURE_BYTES} \
          signatures_bytes={} rss_anchor_mb={rss_anchor} \
          rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
-         tamper_rejected=1 fixture_input=1",
+         tamper_rejected=1 fixture_input=1 {list_sizes} \
+         total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3} \
+         ready_ms={ready:.3} ready_cpu_ms={ready_cpu:.3}",
         verify.count,
         decode.median,
         decode.mean,

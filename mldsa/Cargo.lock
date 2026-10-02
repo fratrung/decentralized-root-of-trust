@@ -794,6 +794,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "getrandom 0.4.3",
+ "libc",
  "ml-dsa",
  "sha3 0.10.9",
  "typenum",

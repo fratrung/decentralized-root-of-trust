@@ -3,7 +3,9 @@
 
 No third-party packages are required. The input directory may contain either a
 single fixed-committee benchmark (summary.csv) or a scaling campaign
-(scaling.csv, manifest.csv and signer.csv). Plotting never changes source CSVs.
+(scaling.csv, manifest.csv and signer.csv). A fixed benchmark is plotted only
+when its status.txt says `complete` and outputs.sha256 still matches every file
+it lists. Plotting never changes source CSVs.
 """
 
 from __future__ import annotations
@@ -60,8 +62,10 @@ def value(row: dict[str, str], key: str, *, positive: bool = False) -> float | N
 def shown(number: float | None, unit: str = "") -> str:
     if number is None:
         return "—"
-    if unit in ("bytes", "MB", "count"):
+    if unit in ("bytes", "count"):
         return f"{number:,.0f}"
+    if unit == "MiB":
+        return f"{number:,.1f}"
     if abs(number) >= 100:
         return f"{number:,.1f}"
     if abs(number) >= 1:
@@ -213,6 +217,40 @@ def fingerprint(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def require_complete(folder: Path) -> None:
+    """Refuse a benchmark.sh directory that is not one validated campaign.
+
+    benchmark.sh writes status.txt (`running`, `failed` or `complete`) and, only
+    when complete, outputs.sha256 over every file describing that campaign. A
+    summary.csv alone proves nothing: it must come with `complete` and with
+    hashes that still match, or it may belong to another or an unfinished run.
+    """
+    status_file = folder / "status.txt"
+    if not status_file.is_file():
+        raise ValueError(f"{folder}: no status.txt; not a completed benchmark.sh campaign")
+    lines = status_file.read_text(encoding="utf-8").splitlines()
+    state = lines[0].strip() if lines else ""
+    if state != "complete":
+        detail = lines[1].strip() if len(lines) > 1 else ""
+        raise ValueError(f"{folder}: campaign status is {state or 'empty'!r}, not 'complete'"
+                         + (f" ({detail})" if detail else "") + "; refusing to plot")
+    manifest = folder / "outputs.sha256"
+    if not manifest.is_file():
+        raise ValueError(f"{folder}: complete campaign without outputs.sha256")
+    listed = set()
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, separator, name = line.partition("  ")
+        if not separator or "/" in name or name in ("", ".", ".."):
+            raise ValueError(f"{manifest}: malformed line {line!r}")
+        path = folder / name
+        if not path.is_file() or fingerprint(path) != digest:
+            raise ValueError(f"{folder}: {name} does not match outputs.sha256; refusing to plot")
+        listed.add(name)
+    for required in ("summary.csv", "summary.txt", "runs.csv", "samples.csv"):
+        if required not in listed:
+            raise ValueError(f"{manifest}: {required} is not covered")
+
+
 def fixed_metadata(folder: Path) -> dict[str, str]:
     report = folder / "summary.txt"
     if not report.exists():
@@ -290,13 +328,23 @@ def fixed_campaign(folder: Path, output: Path) -> list[Path]:
         ("signer", "sign_crypto_per_item", "XMSS crypto sign"),
         ("mldsa_signer", "sign_crypto_per_item", "ML-DSA crypto sign"),
     ])
-    chart("peak_memory.svg", "Peak process RSS", "Kernel ru_maxrss; integer MiB", "MB", [
-        ("signer", "peak_rss_kernel", "XMSS signer"),
-        ("mldsa_signer", "peak_rss_kernel", "ML-DSA signer"),
-        ("prover", "peak_rss_kernel", "XMSS / SNARK prover"),
-        ("verifier", "peak_rss_kernel", "XMSS / SNARK verifier"),
-        ("raw_agg", "peak_rss_kernel", "XMSS raw verifier"),
-        ("mldsa_raw_agg", "peak_rss_kernel", "ML-DSA raw verifier"),
+    # One source for the whole figure: the kernel's reading when every target
+    # that reports a peak has it, otherwise each process's own VmHWM. A missing
+    # kernel reading is a fallback that the figure names, never a zero.
+    peak_targets = [target for target in NAMES if (target, "peak_rss_vmhwm") in indexed
+                    or (target, "peak_rss_kernel") in indexed]
+    if peak_targets and all((target, "peak_rss_kernel") in indexed for target in peak_targets):
+        peak_metric, peak_source = "peak_rss_kernel", "Kernel ru_maxrss"
+    else:
+        peak_metric, peak_source = "peak_rss_vmhwm", "Process VmHWM (no kernel reading), whole MiB"
+    chart("peak_memory.svg", "Peak process RSS",
+          f"{peak_source}; whole process incl. setup and negative controls; not a capacity bound", "MiB", [
+        ("signer", peak_metric, "XMSS signer"),
+        ("mldsa_signer", peak_metric, "ML-DSA signer"),
+        ("prover", peak_metric, "XMSS / SNARK prover"),
+        ("verifier", peak_metric, "XMSS / SNARK verifier"),
+        ("raw_agg", peak_metric, "XMSS raw verifier"),
+        ("mldsa_raw_agg", peak_metric, "ML-DSA raw verifier"),
     ])
     lines = ["# Fixed-committee benchmark", "", f"Source: `{source.name}` (SHA-256 `{fingerprint(source)}`).", "",
              "Each row summarizes per-process run values. For per-update metrics, each run contributes its median.",
@@ -325,7 +373,7 @@ def scaling_campaign(folder: Path, output: Path) -> list[Path]:
     source = folder / "scaling.csv"
     data = rows(source, ("n", "t", "observations", "prove_ms", "snark_decode_verify_ms",
                          "raw_decode_verify_ms", "snark_record_bytes", "raw_record_bytes",
-                         "verify_advantage_confirmed", "break_even_median"))
+                         "verify_advantage_confirmed", "break_even_elapsed_median"))
     seen = set()
     for row in data:
         n = value(row, "n", positive=True)
@@ -377,17 +425,25 @@ def scaling_campaign(folder: Path, output: Path) -> list[Path]:
     chart("prover_scaling.svg", "XMSS / SNARK proving cost", "One aggregator; per-update median, excludes fixture signing", "ms", [
         ("Prove", "prove_ms", COLORS["prover"]),
     ])
-    chart("memory_scaling.svg", "Peak process RSS by role", "Kernel ru_maxrss, integer MiB", "MB", [
+    sources = {row.get("peak_rss_source") or "kernel" for row in data}
+    for source_name in sources:
+        if source_name not in ("kernel", "vmhwm"):
+            raise ValueError(f"{source}: invalid peak_rss_source {source_name!r}")
+    described = {"kernel": "kernel ru_maxrss", "vmhwm": "process VmHWM (no kernel reading)"}
+    peak_subtitle = ("Median process peak; " + " / ".join(described[name] for name in sorted(sources))
+                     + ("; sources differ between points" if len(sources) > 1 else "")
+                     + "; not a capacity bound")
+    chart("memory_scaling.svg", "Peak process RSS by role", peak_subtitle, "MiB", [
         ("Prover", "prover_peak_mb", COLORS["prover"]),
         ("SNARK verifier", "snark_verifier_peak_mb", COLORS["verifier"]),
         ("XMSS raw verifier", "raw_verifier_peak_mb", COLORS["raw_agg"]),
         ("ML-DSA raw verifier", "mldsa_verifier_peak_mb", COLORS["mldsa_raw_agg"]),
     ])
     confirmed = [row for row in data if row["verify_advantage_confirmed"] == "1"
-                 and value(row, "break_even_median", positive=True) is not None]
+                 and value(row, "break_even_elapsed_median", positive=True) is not None]
     destination = output / "break_even.svg"
     line_plot(destination, "Observed XMSS / SNARK break-even", "Independent receiver checks needed to repay one proof; confirmed points only", "count", confirmed, [
-        ("Break-even", "break_even_median", COLORS["prover"]),
+        ("Break-even", "break_even_elapsed_median", COLORS["prover"]),
     ])
     figures.append(destination)
 
@@ -418,7 +474,7 @@ def scaling_campaign(folder: Path, output: Path) -> list[Path]:
                          f'{shown(value(row, "mldsa_decode_verify_ms"), "ms")} | '
                          f'{delta} [{lo}, {hi}] | '
                          f'{"yes" if row["verify_advantage_confirmed"] == "1" else "no"} | '
-                         f'{shown(value(row, "break_even_median"), "count")} |')
+                         f'{shown(value(row, "break_even_elapsed_median"), "count")} |')
         lines.extend(["", "## Receiver phases (ms per update)", "",
                       "| N | t | SNARK decode | SNARK verify-only | XMSS raw decode | XMSS raw verify-only | ML-DSA raw decode | ML-DSA raw verify-only |",
                       "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"])
@@ -433,19 +489,23 @@ def scaling_campaign(folder: Path, output: Path) -> list[Path]:
         for row in data:
             speed = ", ".join(shown(value(row, field)) for field in
                               ("verify_speedup_median", "verify_speedup_q1", "verify_speedup_q3"))
-            bounds = ("break_even_median", "break_even_q1", "break_even_q3")
+            bounds = ("break_even_elapsed_median", "break_even_elapsed_q1", "break_even_elapsed_q3")
             breakeven = ", ".join(shown(value(row, field), "count") for field in bounds)
             lines.append(f'| {row["n"]} | {row["t"]} | {speed} | {breakeven} |')
         lines.extend(["", "## Record size and resources", "",
-                      "| N | t | SNARK B | XMSS raw B | ML-DSA raw B | XMSS wire reduction % | Prove ms | Prover peak MiB | SNARK verifier peak MiB | XMSS raw peak MiB | ML-DSA raw peak MiB |",
-                      "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"])
+                      "| N | t | SNARK B | XMSS raw B | ML-DSA raw B | XMSS wire reduction % | Prove ms | Prover peak MiB | SNARK verifier peak MiB | XMSS raw peak MiB | ML-DSA raw peak MiB | RSS source |",
+                      "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"])
         for row in data:
             fields = ("snark_record_bytes", "raw_record_bytes", "mldsa_record_bytes",
                       "wire_reduction_pct", "prove_ms", "prover_peak_mb", "snark_verifier_peak_mb",
                       "raw_verifier_peak_mb", "mldsa_verifier_peak_mb")
-            units = ("bytes", "bytes", "bytes", "%", "ms", "MB", "MB", "MB", "MB")
+            units = ("bytes", "bytes", "bytes", "%", "ms", "MiB", "MiB", "MiB", "MiB")
             values = [shown(value(row, field), unit) for field, unit in zip(fields, units)]
-            lines.append(f'| {row["n"]} | {row["t"]} | ' + " | ".join(values) + " |")
+            lines.append(f'| {row["n"]} | {row["t"]} | ' + " | ".join(values)
+                         + f' | {row.get("peak_rss_source") or "kernel"} |')
+        lines.extend(["", "Peaks are medians of whole-process peaks (setup, measured updates and, for the",
+                      "verifiers, their negative controls), read from the named source. They describe",
+                      "this host's runs and are not bounds for sizing a machine."])
     else:
         lines.extend(["No complete measured scaling points are present. Figures mark these metrics unavailable.", ""])
 
@@ -483,8 +543,10 @@ def main() -> int:
     fixed = (folder / "summary.csv").is_file()
     if not scaling and not fixed:
         parser.error(f"no scaling.csv or summary.csv in {folder}")
-    output.mkdir(parents=True, exist_ok=True)
     try:
+        if not scaling:
+            require_complete(folder)
+        output.mkdir(parents=True, exist_ok=True)
         figures = scaling_campaign(folder, output) if scaling else fixed_campaign(folder, output)
     except (OSError, ValueError, OverflowError) as exc:
         print(f"plot_benchmarks: {exc}", file=sys.stderr)

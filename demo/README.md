@@ -74,8 +74,11 @@ grow, shrink, or become empty. There is no one-entry transition rule.
    and removals in the same version; `round` and `revoke` merely drive one simple
    operation each. In the XMSS modes the aggregator does **not** propose a slot:
    every member derives it through `Committee::slot_for`. ML-DSA has no slot.
-3. Each member signs the exact canonical statement. XMSS members first burn the
-   derived leaf slot durably and abstain if it is already spent. ML-DSA members
+3. Each member signs the exact canonical statement. An XMSS member first checks
+   that the proposed version immediately follows the published record and
+   abstains otherwise. It then burns the derived leaf slot durably and abstains
+   if it is already spent. ML-DSA members sign the statement's 64-byte SHAKE256
+   digest (`Committee::statement_for`),
    use randomized FIPS 204 signing and need no one-time state. The demo approves
    every requested lifecycle operation; a deployment supplies its own policy.
    ML-DSA itself does not prevent a member from signing two different statements
@@ -186,6 +189,14 @@ verifier APIs with the same external freshness gate.
   and removals, including both in one update; the durable slot counter
   independently prevents two different snapshots from being signed at one XMSS
   slot.
+* **Next-version rule.** Proposals are unauthenticated, and `reserve_at` burns
+  every slot up to the one requested. An XMSS member therefore signs only
+  `published version + 1` (version `0` before anything is published), so one
+  proposal for a far-future version cannot exhaust its key window. The member
+  decodes the published record to read its version but does not verify it: the
+  storage volume stands in for the trusted VDR, and signer-only SNARK members
+  never load the verifier. A production member would take the current version
+  from its own authenticated view of the VDR.
 
 ## Rebuilding
 

@@ -1,0 +1,180 @@
+ML-DSA STATEMENT DIGEST EXPERIMENT
+timestamp   : 2026-10-01T18:21:49+02:00
+host        : <redacted>
+kernel      : Linux 7.0.0-31-generic x86_64 GNU/Linux
+cpu         : AMD Ryzen 7 4800H with Radeon Graphics
+governors   : schedutil
+pinned      : 2
+power       : mains at start
+rustc       : rustc 1.97.0-nightly (7af3402cd 2026-04-16)
+git commit  : ef95c2b0e1e410cdd6d481b24d4efc40cc104204
+git dirty   : yes
+method      : 5 processes per quorum size t; each process measures every list size
+              and both variants, interleaved. A value is the median across processes
+              of the per-process median (15 repetitions); +- and [low, high] are the
+              Student-t 95% CI of the mean of the per-process values (n/a with one
+              process). Ratios and differences are computed inside each process.
+
+1. QUORUM VERIFICATION, ms (build the statement, then verify t signatures)
+     t       L stmt_bytes |   statement   +-ci95 |      digest   +-ci95 |    ratio         ratio ci95
+     4      20        750 |       0.220    0.001 |       0.213    0.003 |    1.04x       [1.02, 1.04]
+     4     100       3310 |       0.237    0.004 |       0.219    0.001 |    1.08x       [1.07, 1.11]
+     4    1000      32110 |       0.476    0.004 |       0.279    0.002 |    1.71x       [1.70, 1.71]
+     4   10000     320110 |       3.124    0.020 |       1.267    0.006 |    2.46x       [2.45, 2.48]
+    67      20        750 |       3.716    0.013 |       3.578    0.008 |    1.04x       [1.04, 1.04]
+    67     100       3310 |       4.004    0.011 |       3.583    0.008 |    1.12x       [1.12, 1.12]
+    67    1000      32110 |       7.924    0.006 |       3.643    0.011 |    2.17x       [2.17, 2.18]
+    67   10000     320110 |      47.380    0.056 |       4.767    0.021 |    9.94x       [9.88, 9.98]
+   334      20        750 |      18.441    0.036 |      17.891    0.035 |    1.03x       [1.03, 1.03]
+   334     100       3310 |      20.098    0.028 |      17.896    0.035 |    1.12x       [1.12, 1.12]
+   334    1000      32110 |      39.617    0.061 |      17.979    0.036 |    2.20x       [2.20, 2.21]
+   334   10000     320110 |     233.953    0.498 |      18.625    0.031 |   12.56x     [12.53, 12.61]
+  1001      20        750 |      55.371    0.046 |      53.738    0.058 |    1.03x       [1.03, 1.03]
+  1001     100       3310 |      60.383    0.057 |      53.696    0.066 |    1.12x       [1.12, 1.12]
+  1001    1000      32110 |     118.834    0.244 |      53.827    0.057 |    2.21x       [2.20, 2.21]
+  1001   10000     320110 |     703.150    2.901 |      54.419    0.063 |   12.92x     [12.86, 12.98]
+
+2. PER SIGNATURE VERIFIED, ms (quorum verification / t)
+     t       L |   statement |      digest
+     4      20 |      0.0551 |      0.0533
+     4     100 |      0.0593 |      0.0548
+     4    1000 |      0.1190 |      0.0696
+     4   10000 |      0.7809 |      0.3168
+    67      20 |      0.0555 |      0.0534
+    67     100 |      0.0598 |      0.0535
+    67    1000 |      0.1183 |      0.0544
+    67   10000 |      0.7072 |      0.0711
+   334      20 |      0.0552 |      0.0536
+   334     100 |      0.0602 |      0.0536
+   334    1000 |      0.1186 |      0.0538
+   334   10000 |      0.7005 |      0.0558
+  1001      20 |      0.0553 |      0.0537
+  1001     100 |      0.0603 |      0.0536
+  1001    1000 |      0.1187 |      0.0538
+  1001   10000 |      0.7024 |      0.0544
+
+3. TIME SAVED PER QUORUM VERIFICATION, ms (statement - digest, same process), against
+   the building blocks: t x (ML-DSA's own hashing of the statement - of the digest)
+   - one application SHAKE256 pass. saved / model near 1 means the difference is
+   ML-DSA's hashing of the statement and nothing else; that step is timed alone, on
+   its own buffer, and need not run at exactly the speed it has inside verification.
+     t       L |       saved   +-ci95 |       model |  saved / model
+     4      20 |       0.008    0.003 |       0.004 |           1.77
+     4     100 |       0.019    0.005 |       0.018 |           1.01
+     4    1000 |       0.197    0.003 |       0.189 |           1.04
+     4   10000 |       1.857    0.019 |       1.927 |           0.96
+    67      20 |       0.140    0.008 |       0.157 |           0.92
+    67     100 |       0.425    0.004 |       0.494 |           0.86
+    67    1000 |       4.278    0.010 |       4.295 |           1.00
+    67   10000 |      42.613    0.070 |      42.959 |           0.99
+   334      20 |       0.560    0.021 |       0.931 |           0.59
+   334     100 |       2.202    0.009 |       2.529 |           0.87
+   334    1000 |      21.613    0.069 |      21.743 |           0.99
+   334   10000 |     215.285    0.512 |     215.708 |           1.00
+  1001      20 |       1.617    0.017 |       2.799 |           0.58
+  1001     100 |       6.643    0.034 |       7.599 |           0.87
+  1001    1000 |      65.007    0.260 |      65.799 |           0.99
+  1001   10000 |     648.622    2.925 |     647.089 |           1.00
+
+4. GROWTH WITH THE LIST, same process: quorum verification at L / at L=20
+     t       L |  statement               ci95 |     digest               ci95
+     4      20 |      1.00x       [1.00, 1.00] |      1.00x       [1.00, 1.00]
+     4     100 |      1.08x       [1.06, 1.10] |      1.03x       [1.02, 1.03]
+     4    1000 |      2.16x       [2.15, 2.17] |      1.31x       [1.29, 1.32]
+     4   10000 |     14.17x     [14.08, 14.33] |      5.94x       [5.87, 5.99]
+    67      20 |      1.00x       [1.00, 1.00] |      1.00x       [1.00, 1.00]
+    67     100 |      1.08x       [1.07, 1.08] |      1.00x       [1.00, 1.00]
+    67    1000 |      2.13x       [2.12, 2.14] |      1.02x       [1.02, 1.02]
+    67   10000 |     12.75x     [12.68, 12.79] |      1.33x       [1.33, 1.34]
+   334      20 |      1.00x       [1.00, 1.00] |      1.00x       [1.00, 1.00]
+   334     100 |      1.09x       [1.09, 1.09] |      1.00x       [1.00, 1.00]
+   334    1000 |      2.15x       [2.14, 2.15] |      1.00x       [1.00, 1.01]
+   334   10000 |     12.68x     [12.65, 12.72] |      1.04x       [1.04, 1.04]
+  1001      20 |      1.00x       [1.00, 1.00] |      1.00x       [1.00, 1.00]
+  1001     100 |      1.09x       [1.09, 1.09] |      1.00x       [1.00, 1.00]
+  1001    1000 |      2.15x       [2.14, 2.15] |      1.00x       [1.00, 1.00]
+  1001   10000 |     12.70x     [12.64, 12.76] |      1.01x       [1.01, 1.01]
+
+5. ONE MEMBER SIGNING ONCE, ms (build the statement, then sign)
+     t       L |   statement   +-ci95 |      digest   +-ci95 |    ratio         ratio ci95
+     4      20 |       0.404    0.059 |       0.315    0.110 |    1.01x       [0.64, 1.71]
+     4     100 |       0.411    0.055 |       0.413    0.080 |    1.11x       [0.77, 1.47]
+     4    1000 |       0.465    0.047 |       0.461    0.049 |    1.01x       [1.00, 1.01]
+     4   10000 |       1.367    0.045 |       1.446    0.051 |    0.91x       [0.88, 0.95]
+    67      20 |       0.402    0.049 |       0.323    0.063 |    0.99x       [0.89, 1.35]
+    67     100 |       0.409    0.053 |       0.403    0.074 |    0.99x       [0.74, 1.22]
+    67    1000 |       0.461    0.053 |       0.462    0.078 |    1.00x       [0.85, 1.04]
+    67   10000 |       1.362    0.058 |       1.538    0.089 |    0.88x       [0.82, 0.93]
+   334      20 |       0.395    0.055 |       0.398    0.045 |    0.99x       [0.73, 1.20]
+   334     100 |       0.399    0.045 |       0.400    0.028 |    1.00x       [0.84, 1.18]
+   334    1000 |       0.459    0.001 |       0.465    0.043 |    0.99x       [0.92, 1.14]
+   334   10000 |       1.072    0.003 |       1.096    0.004 |    0.98x       [0.97, 0.98]
+  1001      20 |       0.396    0.001 |       0.396    0.003 |    1.00x       [0.99, 1.01]
+  1001     100 |       0.399    0.043 |       0.403    0.002 |    0.99x       [0.84, 1.07]
+  1001    1000 |       0.461    0.002 |       0.463    0.044 |    1.00x       [0.92, 1.15]
+  1001   10000 |       1.072    0.004 |       1.090    0.009 |    0.98x       [0.97, 0.99]
+
+6. BUILDING BLOCKS, ms, pooled over every process (they do not depend on t).
+   The two SHAKE256 passes over the statement are different code: the application's
+   digest (sha3 crate) and ML-DSA's own hashing of its message (mu). MiB/s is the
+   statement size over the time of that pass alone.
+      L stmt_bytes |     build |  application pass  MiB/s |    ML-DSA mu pass  MiB/s |  mu / app
+     20        750 |    0.0024 |            0.0034    210 |            0.0025    286 |     0.74x
+    100       3310 |    0.0029 |            0.0089    355 |            0.0076    415 |     0.85x
+   1000      32110 |    0.0100 |            0.0668    458 |            0.0649    471 |     0.97x
+  10000     320110 |    0.2072 |            0.6576    464 |            0.6482    471 |     0.99x
+
+6b. HOW MUCH OF THE RATIO IS STRUCTURAL: the measured statement/digest ratio, and the
+    ratio computed as if each of ML-DSA's passes over the statement cost one application
+    pass: (digest variant + (t - 1) application passes) / digest variant. One pass
+    instead of t, with the difference in SHAKE256 speed removed.
+     t       L |   measured | at equal hashing speed               ci95
+     4      20 |      1.04x |                  1.05x       [1.05, 1.05]
+     4     100 |      1.08x |                  1.12x       [1.12, 1.12]
+     4    1000 |      1.71x |                  1.72x       [1.71, 1.72]
+     4   10000 |      2.46x |                  2.55x       [2.55, 2.56]
+    67      20 |      1.04x |                  1.06x       [1.06, 1.06]
+    67     100 |      1.12x |                  1.17x       [1.16, 1.17]
+    67    1000 |      2.17x |                  2.21x       [2.21, 2.22]
+    67   10000 |      9.94x |                 10.07x     [10.02, 10.13]
+   334      20 |      1.03x |                  1.06x       [1.06, 1.07]
+   334     100 |      1.12x |                  1.17x       [1.17, 1.17]
+   334    1000 |      2.20x |                  2.24x       [2.24, 2.24]
+   334   10000 |     12.56x |                 12.77x     [12.72, 12.80]
+  1001      20 |      1.03x |                  1.06x       [1.06, 1.06]
+  1001     100 |      1.12x |                  1.17x       [1.16, 1.17]
+  1001    1000 |      2.21x |                  2.24x       [2.24, 2.25]
+  1001   10000 |     12.92x |                 13.10x     [13.04, 13.12]
+
+7. CPU CLOCK AND POWER SOURCE right after each process (informative: the comparisons
+   above are in-process ratios and do not depend on them; the absolute ms do)
+  t=4     mean 3629
+  t=67    mean 2571
+  t=334   mean 4293
+  t=1001  mean 3696
+  all processes: 1397 to 4295 MHz
+  power source: 20 on mains of 20 processes
+
+HYPOTHESES (L from 20 to 10000 entries; nothing is filtered or discarded)
+  t=4     H1 statement variant: 0.220 -> 3.124 ms (x14.2 in-process)
+          H2 digest variant   : 0.213 -> 1.267 ms (x5.94 in-process, +1.054 ms)
+          H3 statement/digest : 1.04x at L=20, 2.5x at L=10000
+  t=67    H1 statement variant: 3.716 -> 47.380 ms (x12.8 in-process)
+          H2 digest variant   : 3.578 -> 4.767 ms (x1.33 in-process, +1.189 ms)
+          H3 statement/digest : 1.04x at L=20, 9.9x at L=10000
+  t=334   H1 statement variant: 18.441 -> 233.953 ms (x12.7 in-process)
+          H2 digest variant   : 17.891 -> 18.625 ms (x1.04 in-process, +0.735 ms)
+          H3 statement/digest : 1.03x at L=20, 12.6x at L=10000
+  t=1001  H1 statement variant: 55.371 -> 703.150 ms (x12.7 in-process)
+          H2 digest variant   : 53.738 -> 54.419 ms (x1.01 in-process, +0.682 ms)
+          H3 statement/digest : 1.03x at L=20, 12.9x at L=10000
+
+SHAPE CHECK (what should reproduce on other hardware; the milliseconds should not)
+  S1 the statement/digest ratio does not decrease as the list grows, for every t: REPRODUCED
+  S2 at L=10000 the 95% CI of the ratio is wholly above 1, for every t: REPRODUCED
+  S3 from L=20 to L=10000 the statement variant grows more than the digest variant: REPRODUCED (20 of 20 processes)
+  S4 at L=10000 the ratio is larger for t=1001 than for t=4: REPRODUCED (12.9x against 2.5x)
+  S5 at L=10000 the ratio stays above 1 with the SHAKE256 speed difference removed, for every t: REPRODUCED
+
+Every quorum verified in every repetition and all four negative controls
+failed to verify in every process, or this report would not exist.

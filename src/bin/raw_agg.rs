@@ -31,7 +31,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::state::signer_state_dir;
 use decentralized_root_of_trust::bench::stats::{Series, median_usize};
+use decentralized_root_of_trust::bench::timing::{
+    DecodeVerify, decode_then_verify, process_cpu_time,
+};
+use decentralized_root_of_trust::bench::workload::ListSizes;
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::params::{KEY_SLOTS, N_MEMBERS, N_UPDATES, SLOT, T};
@@ -45,18 +50,37 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn measure_verification(
-    bytes: &[u8],
-    verifier: &VerifierNode,
-) -> (bool, Duration, Duration, Duration) {
-    let total_start = Instant::now();
-    let decoded = StatusList::from_bytes(bytes);
-    let decode_time = total_start.elapsed();
-    let verify_start = Instant::now();
-    let accepted = decoded.is_ok_and(|record| verifier.verify_status_list(&record));
-    let verify_time = verify_start.elapsed();
-    let total_time = total_start.elapsed();
-    (accepted, decode_time, verify_time, total_time)
+/// Decode and verify one record under the boundary every relying-party target
+/// shares (`bench::timing`): the returned value still owns the decoded record,
+/// so its release is outside the timers and the caller reads RSS before
+/// dropping it.
+fn measure_verification(bytes: &[u8], verifier: &VerifierNode) -> DecodeVerify<StatusList, String> {
+    decode_then_verify(
+        || StatusList::from_bytes(bytes),
+        |record| verifier.verify_status_list(record),
+    )
+}
+
+/// The signature-validity control: `wire` with one bit of its last signature
+/// changed. It must decode to the same list, version and signer set, so quorum,
+/// bitmap and message are all in order and only verifying that signature can
+/// reject it. SSZ puts the fixed-size signatures last, so the final byte of the
+/// record is the final byte of the last one, and every XMSS byte string of the
+/// right length decodes.
+fn corrupt_last_signature(wire: &[u8]) -> StatusList {
+    let honest = StatusList::from_bytes(wire).expect("honest control must decode");
+    let mut bytes = wire.to_vec();
+    *bytes.last_mut().expect("record has signature bytes") ^= 1;
+    let corrupted = StatusList::from_bytes(&bytes)
+        .expect("changing a signature bit must preserve the record shape");
+    assert!(
+        corrupted.list() == honest.list()
+            && corrupted.version() == honest.version()
+            && corrupted.signer_indices().eq(honest.signer_indices())
+            && corrupted.to_bytes() != wire,
+        "the signature control must differ from its honest record in a signature only"
+    );
+    corrupted
 }
 
 fn fixture_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
@@ -93,6 +117,12 @@ fn indexed_signatures(record: &StatusList) -> Vec<(usize, XmssSignature)> {
 /// separate committee process. No secret key or slot counter is resident here.
 fn run_fixture_verifier(fixture_dir: &Path) {
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
+    // `ready`: what a relying party pays once per process before it can verify
+    // anything: read and decode the anchor, build the verifier. The three
+    // verifier targets bracket the same steps, so a cold start can be compared
+    // across them; this path has no circuit to set up.
+    let ready_cpu_start = process_cpu_time();
+    let t_ready = Instant::now();
     let anchor_bytes =
         std::fs::read(fixture_dir.join("anchor.bin")).expect("cannot read fixture anchor");
     let committee = Committee::from_bytes(&anchor_bytes).expect("malformed fixture anchor");
@@ -103,6 +133,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
     );
     assert_eq!(committee.threshold(), T, "fixture t/build t drift");
     let verifier = VerifierNode::new(committee);
+    let ready = ms(t_ready.elapsed());
+    let ready_cpu = ms(process_cpu_time().saturating_sub(ready_cpu_start));
 
     let rss_after_anchor = rss_now_mb();
     let updates = fixture_files(fixture_dir, "raw-update-");
@@ -117,14 +149,26 @@ fn run_fixture_verifier(fixture_dir: &Path) {
     let mut record_bytes = Vec::with_capacity(updates.len());
     let mut rss_updates_max = rss_after_anchor;
 
+    let mut total_cpu_ms = Vec::with_capacity(updates.len());
+    let mut list_sizes = ListSizes::default();
+
     for (index, path) in updates.iter().enumerate() {
         let bytes = std::fs::read(path)
             .unwrap_or_else(|e| panic!("cannot read raw fixture {}: {e}", path.display()));
-        let (accepted, decode_time, verify_only_time, verify_time) =
-            measure_verification(&bytes, &verifier);
-        assert!(accepted, "an honest fixture failed raw verification");
+        let measured = measure_verification(&bytes, &verifier);
+        assert!(
+            measured.accepted,
+            "an honest fixture failed raw verification"
+        );
+        if let Ok(record) = &measured.decoded {
+            list_sizes.record(record.list().len());
+        }
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
+        let (decode_time, verify_only_time, verify_time) =
+            (measured.decode, measured.verify, measured.total);
+        let cpu = ms(measured.cpu);
+        drop(measured);
         println!(
             "  update {:2}/{}  t={}  verify={:>8.1?}  {} B  RAM={} MB",
             index + 1,
@@ -136,13 +180,14 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=raw_agg idx={index} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=raw_agg idx={index} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss} cpu_ms={cpu:.3}",
                 ms(decode_time),
                 ms(verify_only_time),
                 ms(verify_time),
                 bytes.len()
             );
         }
+        total_cpu_ms.push(cpu);
         decode_ms.push(ms(decode_time));
         verify_only_ms.push(ms(verify_only_time));
         verify_ms.push(ms(verify_time));
@@ -151,7 +196,9 @@ fn run_fixture_verifier(fixture_dir: &Path) {
 
     // Preserve the raw-path failure gate while keeping every negative control
     // outside the timed update series.
-    let honest = load_raw(&fixture_dir.join("raw-attack-honest.bin"));
+    let honest_bytes = std::fs::read(fixture_dir.join("raw-attack-honest.bin"))
+        .expect("cannot read raw-attack-honest.bin");
+    let honest = StatusList::from_bytes(&honest_bytes).expect("malformed raw-attack-honest.bin");
     let honest_pairs = indexed_signatures(&honest);
     let mut tampered_list = honest.list_cloned();
     tampered_list.push(hash_any(b"FAKE-REVOCATION"));
@@ -186,20 +233,33 @@ fn run_fixture_verifier(fixture_dir: &Path) {
     let short_rejected = !verifier.verify_status_list(&short);
     let outsider = load_raw(&fixture_dir.join("raw-attack-outsider.bin"));
     let outsider_rejected = !verifier.verify_status_list(&outsider);
-    let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
+    // A full quorum over the right statement, signed one slot late. The raw
+    // record has no slot field, so this is rejected at signature verification.
+    let slot_attack = load_raw(&fixture_dir.join("raw-attack-slot.bin"));
+    let slot_rejected = !verifier.verify_status_list(&slot_attack);
+    let signature_rejected = !verifier.verify_status_list(&corrupt_last_signature(&honest_bytes));
+    let all_rejected = tamper_rejected
+        && relabel_rejected
+        && short_rejected
+        && outsider_rejected
+        && slot_rejected
+        && signature_rejected;
 
     let decode = Series::new(decode_ms);
     let verify = Series::new(verify_only_ms);
     let total = Series::new(verify_ms);
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
     let (total_min, total_med, total_max) = total.min_med_max();
+    let total_cpu = Series::new(total_cpu_ms);
+    let (total_cpu_med, total_cpu_total) = (total_cpu.median(), total_cpu.sum());
     let record_med = median_usize(&record_bytes);
     let per_signature_us = vf_med * 1000.0 / T as f64;
 
     println!("\n{} honest updates accepted", verify.len());
     println!(
-        "forgeries rejected (tampered / relabelled / short / outsider): \
-         {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected}"
+        "forgeries rejected (tampered / relabelled / short / outsider / slot / signature): \
+         {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected} / \
+         {slot_rejected} / {signature_rejected}"
     );
     println!("verify-only min/med/max : {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
     println!("decode+verify min/med/max: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
@@ -218,7 +278,9 @@ fn run_fixture_verifier(fixture_dir: &Path) {
          total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
          per_sig_verify_us={per_signature_us:.3} record_med_bytes={record_med:.3} \
          rss_keygen_mb={rss_after_anchor} rss_updates_max_mb={rss_updates_max} \
-         peak_rss_mb={} tamper_rejected={} fixture_input=1",
+         peak_rss_mb={} tamper_rejected={} fixture_input=1 {list_sizes} \
+         total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3} \
+         ready_ms={ready:.3} ready_cpu_ms={ready_cpu:.3}",
         verify.len(),
         verify.mean(),
         verify.stddev(),
@@ -256,7 +318,7 @@ fn main() {
     // are generated fresh every run, so their counters are meaningless the moment
     // the process exits. A real node does the opposite: its counter outlives it,
     // and deleting one while its key survives is how slots get reused.
-    let state_dir = std::env::temp_dir().join(format!("raw-agg-{}", std::process::id()));
+    let state_dir = signer_state_dir().join(format!("raw-agg-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state_dir);
     std::fs::create_dir_all(&state_dir).expect("cannot create slot state dir");
 
@@ -311,6 +373,7 @@ fn main() {
     let mut decode_ms = Vec::new();
     let mut verify_only_ms = Vec::new();
     let mut verify_ms = Vec::new();
+    let mut total_cpu_ms = Vec::new();
     let mut record_bytes = Vec::new();
     let mut accepted = 0usize;
     let mut rss_updates_max = rss_after_keygen;
@@ -345,13 +408,16 @@ fn main() {
         // Verify the way a peer would: decode off the wire, then check against the
         // anchor alone. Decoding is timed with verification because on an
         // untrusted transport it is part of the cost an attacker can force.
-        let (ok, decode_time, verify_only_time, verify_time) =
-            measure_verification(&wire, &verifier);
-        assert!(ok, "a legitimate update failed to verify");
+        let measured = measure_verification(&wire, &verifier);
+        assert!(measured.accepted, "a legitimate update failed to verify");
         accepted += 1;
 
         let rss = rss_now_mb();
         rss_updates_max = rss_updates_max.max(rss);
+        let (decode_time, verify_only_time, verify_time) =
+            (measured.decode, measured.verify, measured.total);
+        let cpu = ms(measured.cpu);
+        drop(measured);
         println!(
             "  update {:2}/{}  v{}  slot {}  verify={:>8.1?}  {} B  RAM={} MB",
             i + 1,
@@ -364,13 +430,14 @@ fn main() {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=raw_agg idx={i} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=raw_agg idx={i} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss} cpu_ms={cpu:.3}",
                 ms(decode_time),
                 ms(verify_only_time),
                 ms(verify_time),
                 wire.len()
             );
         }
+        total_cpu_ms.push(cpu);
         decode_ms.push(ms(decode_time));
         verify_only_ms.push(ms(verify_only_time));
         verify_ms.push(ms(verify_time));
@@ -435,6 +502,15 @@ fn main() {
     // D) an outsider claiming a member's seat. There is no other way in: a record
     //    names signers by index, so a non-member is unnameable rather than merely
     //    rejected.
+    let honest_wire = StatusList::new(
+        Algorithms::WotsXmss,
+        list.clone(),
+        version,
+        N_MEMBERS,
+        honest.clone(),
+    )
+    .expect("well-formed")
+    .to_bytes();
     let (out_sk, out_pk) = key_gen(&mut xmss_rng, SLOT, SLOT + KEY_SLOTS).expect("keygen");
     let out_counter =
         AtomicSlotCounter::create(state_dir.join("outsider"), &out_pk, SLOT, SLOT + KEY_SLOTS)
@@ -453,7 +529,33 @@ fn main() {
         .expect("well-formed"),
     );
 
-    let all_rejected = tamper_rejected && relabel_rejected && short_rejected && outsider_rejected;
+    // E) the same statement signed by a full quorum one slot late. Each member's
+    //    durable counter jumps forward to it, so no key signs twice at one slot.
+    let late_slot = committee.slot_for(version + 1).expect("slot overflow");
+    let late: Vec<(usize, XmssSignature)> = (0..T)
+        .map(|k| {
+            (
+                k,
+                signers[k]
+                    .sign_at(&message, late_slot)
+                    .expect("signing failed"),
+            )
+        })
+        .collect();
+    let slot_rejected = !verifier.verify_status_list(
+        &StatusList::new(Algorithms::WotsXmss, list.clone(), version, N_MEMBERS, late)
+            .expect("well-formed"),
+    );
+
+    // F) the honest record with one bit of one signature changed.
+    let signature_rejected = !verifier.verify_status_list(&corrupt_last_signature(&honest_wire));
+
+    let all_rejected = tamper_rejected
+        && relabel_rejected
+        && short_rejected
+        && outsider_rejected
+        && slot_rejected
+        && signature_rejected;
 
     // ---- Summary ----
     let decode = Series::new(decode_ms);
@@ -461,6 +563,8 @@ fn main() {
     let total = Series::new(verify_ms);
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
     let (total_min, total_med, total_max) = total.min_med_max();
+    let total_cpu = Series::new(total_cpu_ms);
+    let (total_cpu_med, total_cpu_total) = (total_cpu.median(), total_cpu.sum());
     let record_med = median_usize(&record_bytes);
     // Per-signature figure, derived from the median: what checking one signature
     // costs, which is what makes the number projectable to other values of t.
@@ -468,7 +572,9 @@ fn main() {
 
     println!("\n{accepted}/{N_UPDATES} updates accepted by the verifier node");
     println!(
-        "forgeries rejected (tampered / relabelled / short quorum / outsider): {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected}"
+        "forgeries rejected (tampered / relabelled / short quorum / outsider / slot / signature): \
+         {tamper_rejected} / {relabel_rejected} / {short_rejected} / {outsider_rejected} / \
+         {slot_rejected} / {signature_rejected}"
     );
 
     println!("\nkeygen ({N_MEMBERS} keys)   : {keygen_time:.2?}");
@@ -501,7 +607,8 @@ fn main() {
          total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
          per_sig_verify_us={per_sig_verify_us:.3} \
          record_med_bytes={record_med:.3} rss_keygen_mb={rss_after_keygen} \
-         rss_updates_max_mb={rss_updates_max} peak_rss_mb={} tamper_rejected={}",
+         rss_updates_max_mb={rss_updates_max} peak_rss_mb={} tamper_rejected={} \
+         total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3}",
         ms(keygen_time),
         ms(slot_state_time),
         verify.len(),
@@ -520,8 +627,8 @@ fn main() {
         peak_rss_mb(),
         // Must be an integer: benchmark.sh's failure gate tests this field against
         // "1", and a Rust bool would print "true" and score every run as a
-        // security-expectation failure. The name is historical: this is the AND
-        // of all four forgery checks, not just the tampered-list one.
+        // security-expectation failure. Despite the field's name
+        // (`tamper_rejected`), this is the AND of all six forgery checks.
         all_rejected as u8,
     );
 

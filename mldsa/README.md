@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fresh OS randomness and the empty FIPS 204 context; failure to obtain
 randomness is returned as an error. ML-DSA is stateless: repeated signing does
 not consume an XMSS leaf or need a slot journal. A status-list signer uses
-`Committee::statement_for` to construct the canonical protocol statement.
+`Committee::statement_for` to obtain the 64-byte statement digest it signs.
 Signing a precomputed digest with the generic signer is ordinary ML-DSA over
 those digest bytes, not the standardized HashML-DSA mode. The seed is private
 key material; its durable, access-controlled storage is left to the embedding
@@ -68,12 +68,27 @@ SSZ and canonical ML-DSA signature encoding. Records are limited to 64 MiB
 and at most 2,048 member slots. Measurement fixture generation is limited
 to 64 updates per run to bound disk use.
 
-Members sign the complete bytes returned by `Committee::statement_for`:
-an application-domain prefix followed by the SSZ encoding of
-`(alg=2, anchor_id[48], version, status_list)`. This is ordinary, randomized
-FIPS 204 ML-DSA over that byte string, not HashML-DSA or an external pre-hash.
-The bitmap and signatures are assembled after members sign the common
-statement.
+The statement is an application-domain prefix followed by the SSZ encoding of
+`(alg=2, anchor_id[48], version, status_list)`
+(`Committee::statement_preimage`). Members sign its digest,
+`SHAKE256(statement, 64 bytes)`, returned by `Committee::statement_for`, with
+ordinary, randomized FIPS 204 ML-DSA. The bitmap and signatures are assembled
+after members sign the common digest.
+
+Why a digest: the statement contains the whole list, and ML-DSA starts by
+hashing `H(pk) || M`, a prefix that differs for every signer, so signing the
+statement itself made a verifier re-read the entire list once per signature.
+Hashing once and signing 64 bytes keeps the per-signer hash small. This is
+hashing at the application level followed by pure ML-DSA, as FIPS 204 section
+5.4 describes (its example is CMS, RFC 9882); it is not the separate HashML-DSA
+mode. The same section requires an approved hash or XOF with at least lambda
+bits of collision strength, i.e. a digest of at least 2*lambda bits: 384 for
+ML-DSA-65. SHAKE256 with 512 output bits (FIPS 202) provides 256, and is the
+function and output length of ML-DSA's own message representative; a 32-byte
+digest would not be enough. The statement domain is generation `v2`: signatures
+made over the generation-1 statement do not verify.
+[`docs/mldsa-statement-digest.md`](../docs/mldsa-statement-digest.md) has the
+two flows, the measured comparison and the script that reproduces it.
 
 `RawVerifier::verify_status_list` requires exactly `N` bitmap positions, at
 least `t` distinct signer bits, and a valid signature under every public key
@@ -127,10 +142,29 @@ binaries emit raw samples; `benchmark.sh` and
 `committee-scaling-benchmark.sh` organize comparisons with the XMSS raw and
 XMSS/SNARK paths.
 
+Three more things are reported the way the XMSS binaries report them, so the
+paths can be compared on the same footing. `BENCH_LIST_ENTRIES=L` makes the
+fixture and the signer use lists of exactly `L` entries (one replaced per
+version) instead of a list growing by one entry per version; the fixture
+records it in `workload.txt`, quorums are `t` distinct members spread over the
+whole committee, and each summary line ends with the list sizes the process
+actually handled (`list_min`, `list_max`). Every sample has `cpu_ms`, the
+process CPU time (user plus system, all threads) over the interval its elapsed
+figure times. The verifier also reports `ready_ms` and `ready_cpu_ms`: reading
+and decoding the anchor, every member's public key included, and building the
+verifier, which a process pays once before its first verification.
+
 The dependency is pinned to RustCrypto `ml-dsa` 0.1.1 with key zeroization
 enabled. Its maintainers state that this implementation has not been
 independently audited; passing unit tests does not establish production
 readiness.
+
+`libc` is used by the measurement binaries only, for one call: the process CPU
+clock (`clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ..)`) in `bin/support`, which
+is the single `unsafe` line of this crate. The library (signer, committee,
+record, verifier) does not use it. The repository README, under
+"Dependencies", records what the call does, why it is there and the
+alternatives that were measured and rejected.
 
 Run `cargo test --manifest-path mldsa/Cargo.toml` from the repository root
 to check this crate without building the XMSS workspace.

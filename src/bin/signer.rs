@@ -18,7 +18,12 @@
 use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::state::signer_state_dir;
 use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::bench::timing::process_cpu_time;
+use decentralized_root_of_trust::bench::workload::{
+    ListSizes, advance_list, list_entries_from_env,
+};
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::params::{KEY_SLOTS, N_UPDATES, SLOT};
 use decentralized_root_of_trust::protocol::committee::Committee;
@@ -37,7 +42,10 @@ fn main() {
     // The counter outlives the process in a real deployment; here the key is
     // regenerated every run, so the two die together. Deleting the state of a key
     // that still exists is how slots get reused.
-    let state = std::env::temp_dir().join(format!("signer-bench-{}", std::process::id()));
+    //
+    // Its directory is a parameter of the measurement (`bench::state`): the
+    // durable burn timed below costs whatever this filesystem's sync costs.
+    let state = signer_state_dir().join(format!("signer-bench-{}", std::process::id()));
     for ext in ["", "lock", "tmp"] {
         let p = if ext.is_empty() {
             state.clone()
@@ -78,11 +86,17 @@ fn main() {
     let mut sign_ms = Vec::new();
     let mut reserve_ms = Vec::new();
     let mut crypto_ms = Vec::new();
+    let mut sign_cpu_ms = Vec::new();
     let mut failures = 0usize;
     let mut rss_max = rss_after_keygen;
 
+    let list_entries = list_entries_from_env();
+    let mut list_sizes = ListSizes::default();
     for i in 0..N_UPDATES {
-        list.push(hash_any(rng.random::<[u8; 32]>()));
+        advance_list(&mut list, i, list_entries, || {
+            hash_any(rng.random::<[u8; 32]>())
+        });
+        list_sizes.record(list.len());
         let version = i as u32;
         let slot = committee.slot_for(version).expect("slot overflow");
         // Computing the digest is not timed: it is the same work for every member
@@ -91,11 +105,15 @@ fn main() {
         // signature.
         let message = committee.message_for(Algorithms::WotsXmss, &list, version);
 
+        // Elapsed and CPU: the durable burn waits for the device in
+        // `sync_data`, so this phase's CPU is less than its elapsed time.
+        let cpu_start = process_cpu_time();
         let t_sign = Instant::now();
         let (signature, phases) = signer
             .sign_at_timed(&message, slot)
             .expect("signing failed");
         let sign_time = t_sign.elapsed();
+        let sign_cpu = ms(process_cpu_time().saturating_sub(cpu_start));
 
         // Not part of a member's job, and not timed: a cheap guard that the run
         // produced real signatures rather than measuring an error path.
@@ -117,7 +135,7 @@ fn main() {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=signer idx={i} sign_ms={:.3} reserve_ms={:.3} crypto_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=signer idx={i} sign_ms={:.3} reserve_ms={:.3} crypto_ms={:.3} bytes={} rss_mb={rss} cpu_ms={sign_cpu:.3}",
                 ms(sign_time),
                 ms(phases.reserve),
                 ms(phases.crypto),
@@ -127,11 +145,14 @@ fn main() {
         sign_ms.push(ms(sign_time));
         reserve_ms.push(ms(phases.reserve));
         crypto_ms.push(ms(phases.crypto));
+        sign_cpu_ms.push(sign_cpu);
     }
 
     let sign = Series::new(sign_ms);
     let reserve = Series::new(reserve_ms);
     let crypto = Series::new(crypto_ms);
+    let sign_cpu = Series::new(sign_cpu_ms);
+    let (sign_cpu_med, sign_cpu_total) = (sign_cpu.median(), sign_cpu.sum());
     let (sg_min, sg_med, sg_max) = sign.min_med_max();
 
     println!("\nkeygen (1 key)         : {keygen_time:.2?}");
@@ -152,7 +173,8 @@ fn main() {
          reserve_med_ms={:.3} reserve_total_ms={:.3} \
          crypto_med_ms={:.3} crypto_total_ms={:.3} sig_bytes={} \
          rss_keygen_mb={rss_after_keygen} rss_rounds_max_mb={rss_max} peak_rss_mb={} \
-         failures={failures}",
+         failures={failures} {list_sizes} \
+         sign_cpu_med_ms={sign_cpu_med:.3} sign_cpu_total_ms={sign_cpu_total:.3}",
         ms(keygen_time),
         ms(slot_state_time),
         sign.len(),

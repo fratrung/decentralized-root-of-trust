@@ -1,5 +1,9 @@
-# Required by the leanVM prover: proof generation uses a very deep stack
-# (leanVM sets the same value in its own .cargo/config).
+# A precaution against deep recursion in the prover, not a requirement of
+# leanVM v0.10, which neither sets nor mentions it. [env] reaches only processes
+# Cargo starts (cargo run/test): benchmark.sh execs its frozen binaries
+# directly, so measured processes do not receive it. Verified without it up to
+# N=500, t=334. env.txt's runtime probe records what the measured processes
+# actually receive.
 [env]
 RUST_MIN_STACK = "536870912"
 

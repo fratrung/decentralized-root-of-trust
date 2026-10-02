@@ -262,9 +262,14 @@ silently upgraded.
 
 ## Build
 
-The repository pins Rust 1.90.0, with `rustfmt` and `clippy`, in
+The repository pins Rust 1.98.1, with `rustfmt` and `clippy`, in
 [`rust-toolchain.toml`](rust-toolchain.toml). Rustup selects and installs that
-toolchain automatically.
+toolchain automatically. The pin is for reproducible builds and lints; leanVM
+v0.10 does not require a particular compiler. Benchmark figures belong to the
+compiler that built the binaries (recorded in `env.txt`), so results obtained
+under different pins must not be mixed: moving from Rust 1.90.0 to 1.98.1 left
+the XMSS and SNARK timings unchanged within noise and made ML-DSA verification
+faster ([`docs/mldsa-statement-digest.md`](docs/mldsa-statement-digest.md)).
 
 ```sh
 cargo build --release
@@ -275,8 +280,13 @@ compiles the leanVM dependency tree and may take several minutes.
 
 `.cargo/config.toml` configures:
 
-- `RUST_MIN_STACK=512MiB`, required by the prover's deep recursion;
-- `target-cpu=native`, which makes release binaries host-specific.
+- `target-cpu=native`, which makes release binaries host-specific;
+- `RUST_MIN_STACK=512MiB`, a precaution against deep recursion in the prover.
+  It applies only to processes Cargo starts (`cargo run`, `cargo test`); the
+  benchmark scripts run their binaries directly, so measured processes do not
+  receive it. leanVM v0.10 does not require it: a prover at N=500, t=334
+  aggregates and verifies 20 updates without it. `env.txt` records what the
+  measured processes actually receive.
 
 ## Run
 
@@ -303,14 +313,24 @@ construction with FIPS 204 ML-DSA-65. It exposes a stateless signer, an SSZ
 committee anchor, an SSZ `MlDsaStatusList` carrying a signer bitmap and raw
 signatures, and a verifier that keeps decoding separate from authorization.
 The canonical statement binds the algorithm, committee-derived anchor identifier,
-version and ordered fingerprint list, and is passed directly to ML-DSA.Sign with
-the empty FIPS 204 context; it is not application-prehashed. This path is not an
+version and ordered fingerprint list. Members sign its 64-byte SHAKE256 digest
+with ordinary ML-DSA.Sign and the empty FIPS 204 context: hashing at the
+application level as FIPS 204 section 5.4 describes, not the HashML-DSA mode.
+Signing the statement itself made every signature verification re-read the
+whole list; [`docs/mldsa-statement-digest.md`](docs/mldsa-statement-digest.md)
+explains the two flows, the standard's condition on the digest, and the
+measured difference, reproducible with `tools/mldsa_statement_experiment.sh`. This path is not an
 input to leanVM's XMSS aggregate and does not produce a SNARK.
 
 ```sh
 cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_signer
-cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_raw_agg
+FIXTURE_PARENT="$(mktemp -d)"
+cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_fixture -- "$FIXTURE_PARENT/records" 5 3 20
+cargo run --release --manifest-path mldsa/Cargo.toml --bin mldsa_raw_agg -- "$FIXTURE_PARENT/records" 20
 ```
+
+`mldsa_raw_agg` verifies a pre-generated corpus: `mldsa_fixture` must first
+write it to a directory that does not exist yet, with arguments `N t updates`.
 
 Small local walkthrough:
 
@@ -336,10 +356,16 @@ artifacts/
   anchor.bin
   update-NN.bin
   canonical.bin
-  attack-tampered.bin
-  attack-outsider.bin
-  attack-version.bin
+  attack-outsider.bin     check 1: a signer outside the anchor
+  attack-tampered.bin     check 2: the list differs from the signed one
+  attack-version.bin      check 2: the version differs from the signed one
+  attack-slot.bin         check 3: a full quorum at a slot the version does not derive to
+  attack-short.bin        check 4: a genuine proof over t - 1 signatures
+  attack-proofbody.bin    check 5: honest claims, one proof-body bit flipped
 ```
+
+Each forgery passes every check except the one named, so removing any single
+check from the verifier makes exactly that artifact accepted.
 
 `update-*` records form the measured verification corpus, `canonical.bin` is the
 single current-record fixture supplied to the anti-rollback flow, and
@@ -442,10 +468,18 @@ Defaults:
 - `RUNS=24`;
 - `WARMUP=2`;
 - `N_UPDATES=20` rounds inside each process run;
+- status list growing by one entry per round (1 to 20 entries) unless
+  `LIST_ENTRIES=L` fixes its size;
 - `TARGETS="signer mldsa_signer prover verifier raw_agg mldsa_raw_agg"`;
 - `COOLDOWN_SECONDS=2` before every target process;
 - balanced target ordering (`INTERLEAVE=1`);
 - plotting disabled by default (`PLOT=0`).
+
+Every process runs from a frozen copy of its binary in `OUTDIR/bin`, not from
+`target/release`: `tools/freeze_bins.sh` takes each executable's real path from
+Cargo, copies it and records its SHA-256 and build parameters, which
+`env.txt` repeats. The hashes are checked again after the last run. A copy is
+byte-identical, so this only fixes *which* program is measured, not how.
 
 Thus the default harness starts each target 26 times: two warm-ups whose data
 is discarded, followed by 24 measured process runs. Each measured run contains
@@ -463,19 +497,84 @@ each measured raw process is a relying-party verifier and the measured prover is
 one aggregator, not a hidden committee signer. `BENCH_SELF_CONTAINED=1` retains
 the older diagnostic XMSS process shape for back-comparison.
 
+Every figure belongs to a workload `(N, t, L)`: committee size, threshold and
+the number of entries in the status list. A record carries the whole list, 32
+bytes per credential, and every scheme reads it once to authenticate it, so `L`
+enters record size and verification time on all three paths.
+`LIST_ENTRIES=1000 ./benchmark.sh` makes every version carry exactly 1,000
+entries, one of them replaced per version; unset, the list grows by one entry
+per version, which is cheap to run and says nothing about a list of realistic
+size. The fixtures draw each version's quorum as `t` distinct members spread
+over the whole committee, reproducibly from the version number
+(`spread-splitmix64-v1`), so a small quorum is not confined to the start of a
+large anchor. The workload is not a label: both fixtures state theirs in
+`workload.txt`, every measured process reports the smallest and largest list it
+handled, and the harness stops, withholding all numbers, if either differs from
+what was declared. `workload.txt` in the output directory, `env.txt` and
+`summary.txt` carry it. A figure is not to be carried to another list size;
+measure that size. The self-contained shape and the `combined` target build
+their own lists and are refused together with `LIST_ENTRIES`.
+
 The default order is a Williams-style balanced crossover sequence rather than a
 fixed round-robin: across a complete block, target position and immediate
-predecessor are balanced. The cooldown reduces thermal carry-over between
+predecessor are balanced. A complete block is N rows for an even number of
+targets and 2N for an odd one; the harness warns when `RUNS` is not a multiple
+of it, or when per-target run counts differ, since the order is then only
+partly balanced. The cooldown reduces thermal carry-over between
 processes; it does not assert equal package temperature, so `runs.csv` retains
 each start time for drift analysis.
 
 Size rows name the serialized object they measure: `signature_size` for one
 XMSS or ML-DSA signature and `record_size` for the complete `StatusList`,
 `MlDsaStatusList` or `SnarkStatusList`. All three verifier targets report
-separate decode, verify-only and contiguous decode-plus-verify timings. The
+separate decode, verify-only and contiguous decode-plus-verify timings. Decode
+covers everything parsed before the checks run: every signature on the raw
+paths, and the leanVM aggregate as well as the SSZ container on the SNARK path.
+Earlier SNARK runs billed aggregate deserialization to verify-only; their phase
+columns are not comparable with later runs, but the end-to-end total is. The
 end-to-end interval is used for receiver-cost comparisons and XMSS/SNARK
-break-even. XMSS signer timings separate durable slot burn, cryptographic
-signing and complete protocol cost.
+break-even. The three receivers stop their timers at the same point: when the
+predicate returns, before the decoded record is released, and they read RSS
+while it is still alive (`src/bench/timing.rs`).
+
+Every timed phase is reported on two clocks. Elapsed time (`Instant`) is how
+long a caller waits. CPU time is the kernel's account of the user and system
+CPU the process used over all of its threads (`CLOCK_PROCESS_CPUTIME_ID`, read
+inside the binaries around the same interval, outside the elapsed timer). They
+answer different questions and are not interchangeable: the prover and the
+SNARK verifier are multithreaded, so their CPU is a multiple of their elapsed
+time, while the raw XMSS and ML-DSA verifiers are sequential and the XMSS
+signer waits for the storage device. On the development host, at `N=10`, `t=7`,
+`L=1000` and eight pinned CPUs, one proof took 0.48 s of elapsed time and 3.0 s
+of CPU, and one SNARK verification 177 ms and 0.89 s. `summary.csv` has a
+`*_cpu_per_item` and a `*_cpu_total` row next to each elapsed row;
+`samples.csv` carries the per-update CPU readings as `*_cpu` phases, and the
+validator recomputes the run statistics from them like the elapsed ones.
+
+A verifier also has a cost it pays once per process, before its first
+verification, reported as `ready` (elapsed and CPU): reading and decoding the
+anchor, building the verifier and, on the SNARK path, setting up the circuit
+(`setup`, which `ready` contains). All three verifier targets bracket the same
+steps. A resident verifier pays it once; a process started for one request pays
+`ready` plus one decode-plus-verify every time. `setup_cpu` reports the CPU of
+the circuit setup for the prover and the SNARK verifier.
+
+Memory rows are resident set size in MiB. A process peak is read twice, from
+the process's own `VmHWM` and from the kernel through `/usr/bin/time -v`; when
+the latter is unavailable its rows are absent rather than zero, and reports and
+plots use `VmHWM` and say so. A peak covers the whole process, including setup
+and, for the verifiers, the negative controls that follow the measured updates;
+"RSS max during work" is the largest reading sampled after each honest update.
+These describe the runs on this host and are not bounds for sizing a machine.
+
+XMSS signer timings separate durable slot burn, cryptographic signing and
+complete protocol cost. The burn waits for one `sync_data` per signature, so it
+measures the storage under the slot journal as much as the scheme:
+`SIGNER_STATE_DIR` (default `TMPDIR`) selects that directory, `env.txt` and
+`summary.txt` record its class (`ram`, `local`, `network`, `other`), filesystem,
+device and mount, and a strict run refuses RAM-backed storage unless
+`ALLOW_RAM_SIGNER_STATE=1` asks for that scenario by name. On the development
+host the burn took 0.57 ms on ext4 and 0.003 ms on tmpfs.
 The optional `combined` target alone reports
 `proof_size`, because it measures `SnarkStatusList::proof_bytes()` rather than
 the whole record. Even-sized samples use the conventional median, the arithmetic
@@ -493,13 +592,37 @@ also requires a clean Git tree. Exploratory dirty-tree runs preserve
 such pilot runs may not be exactly reconstructible. Publication mode requires a
 clean committed tree.
 
+A campaign directory also keeps what the numbers were taken from: `logs/` with
+the stdout and stderr of every process (including the full `/usr/bin/time -v`
+report), the signed inputs the script generated under `inputs/`, the verifier
+corpus when small and its hashes always (`corpus.sha256`), and
+`prover-outputs.sha256` with the hash and size of every record each prover
+execution wrote; large proofs are not copied. `runs.csv` records, per process,
+elapsed and CPU time, page faults, context switches and the host's swap,
+memory-stall and OOM counters around it; `summary.txt` reports whether any
+measured run paged.
+
+`OUTDIR` must be new or empty: one directory holds one campaign. `status.txt`
+reads `running` during the campaign, `failed` (numbers withheld) after any
+abort, and `complete` only once every check has passed. Until then
+`summary.csv`, `summary.txt` and `drift.csv` do not exist under those names;
+they are staged and moved in at the end, together with `outputs.sha256`, which
+binds metadata, samples, per-run rows, summaries and `inputs.sha256` (the
+signed fixture inputs, verified unchanged after the last run). The CSV validator
+also recomputes every per-run median, mean, sd, minimum, maximum, total and
+record size from `samples.csv`, within the three-decimal rounding of both files,
+so a statistic that does not follow from its own samples is an error rather
+than merely numeric.
+
 `PLOT=1` runs [`tools/plot_benchmarks.py`](tools/plot_benchmarks.py) after the
 measurements and writes standalone SVG figures plus `plots/overview.md` in the
 output directory. It compares receiver decode plus verification, record and
 signature sizes, signing phases and peak process RSS. The table includes every
 `summary.csv` metric with run count and between-run quartiles; a single run
-receives no uncertainty estimate. Existing results can be plotted without
-rerunning the benchmark:
+receives no uncertainty estimate. The plotter refuses a fixed benchmark whose
+`status.txt` is not `complete` or whose files no longer match
+`outputs.sha256`. Existing results can be plotted without rerunning the
+benchmark:
 
 ```sh
 python3 tools/plot_benchmarks.py bench-<timestamp>
@@ -524,6 +647,7 @@ project implements a consensus protocol.
 
 ```sh
 ./committee-scaling-benchmark.sh
+LIST_ENTRIES=1000 ./committee-scaling-benchmark.sh
 PLAN_ONLY=1 ./committee-scaling-benchmark.sh
 STUDY_MODE=publication PIN_CPUS=0-7 ./committee-scaling-benchmark.sh
 RESUME=1 OUTDIR=committee-scaling-<timestamp> ./committee-scaling-benchmark.sh
@@ -535,10 +659,15 @@ resource discovery, not for paper results. `STUDY_MODE=publication` defaults to
 24 measured runs, two warm-ups, ten seconds of cooldown and two complete
 sweeps. The second sweep reverses the committee-size order, so host-time and
 committee size are not perfectly confounded. Publication mode requires
-`STRICT_ENV=1`, a clean committed tree, an explicit CPU mask, at least ten runs
-and at least two sweeps. Its run count must be a multiple of four, completing
+`STRICT_ENV=1`, a clean committed tree, an explicit CPU mask, at least ten runs,
+`INTERLEAVE=1` and an even number of sweeps (at least two), so that ascending and
+descending sweeps occur equally often. Its run count must be a multiple of four, completing
 the balanced design for the four per-point targets (`prover`, `verifier`,
-`raw_agg`, `mldsa_raw_agg`). Any session whose early/late
+`raw_agg`, `mldsa_raw_agg`). These checks run before anything is built. The
+report states the sweep and role design that actually ran; `plan.csv` records
+the planned sweep order and `schedule.csv` every stage as it starts and ends,
+while each `benchmark.sh` directory keeps its own `schedule.csv` of processes,
+warm-ups and cooldowns. Any session whose early/late
 medians differ by more than 15% is marked unstable and withheld; no outlier is
 discarded.
 
@@ -567,7 +696,18 @@ campaign fingerprint to match source patch, Cargo lockfile, scripts, host,
 measurement parameters and CPU policy. It also reuses the original N set and
 recalculates the hard cap from current availability. It refuses to resume only
 when the current usable cap has fallen below the admission threshold of the
-largest recorded N.
+largest recorded N. A session completed earlier keeps its `complete` status even
+if the resumed invocation stops before reaching it; the final validation still
+rechecks its data and marks only a session whose data is damaged. Every status
+change is also appended to that directory's `status-history.txt`.
+
+A campaign has one status-list size for all its points (`LIST_ENTRIES`, as in
+`benchmark.sh`; unset is the growing list), so a sweep varies the committee and
+not the list. It is part of the campaign fingerprint, every table of the report
+states `(N, t, L)`, and `scaling.csv` has a `list_entries` column. To compare
+list sizes, for example 100, 1,000 and 10,000 credentials, run one campaign per
+size. `N` and `t` move together under the two-thirds policy, so a sweep does not
+separate the effect of one from the other.
 
 Before the sweep, `benchmark.sh` measures `signer` and `mldsa_signer` once
 as separate single-member campaigns, using the same run and warm-up counts.
@@ -579,44 +719,101 @@ At every point, unmeasured XMSS and ML-DSA fixture processes generate their
 respective signed corpora. The measured `prover` is therefore one XMSS
 aggregator holding public keys and ready-made signatures—never `N` aggregators
 or one process retaining all committee secret keys. Both raw measurements are
-verifier-only processes. The report keeps ML-DSA raw results separate from the
-XMSS/SNARK crossover because ML-DSA is a different signature construction, not
-an alternative encoding of the same XMSS quorum.
+verifier-only processes. The three published forms (raw XMSS, aggregated XMSS
+and raw ML-DSA) are measured the same way: the same workload, the same timer
+boundaries, both clocks, the same once-per-process `ready` cost, and paired
+comparisons two at a time. ML-DSA is a different signature construction, not
+another encoding of the same XMSS quorum, so what the comparison shows is cost;
+it says nothing about the equivalence of their security models, key management
+or state.
 
 The top-level output contains:
 
-- `memory-decision.txt` — the announced admission and runtime limits;
+- `memory-decision.txt` — the announced admission and runtime limits; each
+  resume appends its own block below the original decision;
 - `signer.csv` and `signer/benchmark/` — the XMSS and ML-DSA single-member
   campaigns, measured once for the complete sweep;
 - `manifest.csv` — completed, stopped and RAM-excluded points;
 - `scaling.csv` — run-level medians combined across sweeps, XMSS/SNARK wire
   size, RSS, paired verification deltas and derived ratios, plus ML-DSA decode,
-  verification, combined time, record size and verifier RSS;
-- `report.txt` — the first observed wire-size, verification-time and joint
-  crossover;
+  verification, combined time, record size and verifier RSS. Memory columns are
+  MiB: per role the typical (median) and largest observed process peak, the
+  largest RSS sampled during honest updates, and `peak_rss_source` (`kernel`
+  for `ru_maxrss`, `vmhwm` when a kernel reading is missing; never 0);
+- `costs.csv` — what each role costs for every completed point, one row per
+  role (prover and the three verifiers), quantity (`per_update`, `setup`,
+  `ready`), clock (`elapsed`, `cpu`) and per-run statistic: `median` (each run
+  contributes the median of its updates, the typical update) or `mean` (what a
+  total or a budget is made of; a median hides the tail). Each row has the
+  quartiles, the mean and its 95% CI across runs;
+- `comparisons.csv` — the three verifiers compared two at a time on both
+  clocks: the paired difference of decode-plus-verify with its 95% CI, which
+  one is slower when the interval excludes zero, the ratio, and the descriptive
+  break-even against the SNARK verifier;
+- `all-runs.csv` — every measured run of every session with its committee, list
+  size, sweep, the sweep's direction, the point's position in it and the
+  process start time, for analyses by block, by time or across sweeps;
+- `report.txt` — the tables above in readable form and the first observed
+  points;
+- `pressure.csv` — paging, memory-stall time and OOM kills during every guarded
+  stage; the disk reserve is checked on every filesystem the campaign uses;
 - `Nxxxx-tyyyy/session-XX/benchmark/` — the complete `benchmark.sh` output for
   every sweep session at each point, including raw observations and confidence
-  intervals.
+  intervals;
+- `Nxxxx-tyyyy/session-XX/bin/` — the frozen binaries, `SHA256SUMS` and
+  `PROVENANCE` that the session's fixtures and measurements all ran from.
 
-The report calls SNARK verification faster only when the paired 95% confidence
-interval for `raw_decode_verify - snark_decode_verify` is wholly above zero. Only then does it
-report the number of independent relying-party verifications needed to amortize
-one proof:
+The paired interval below is Student's t for the mean of the per-run
+differences, with the exact quantile for every df (`tools/stats.awk`, shared
+with `benchmark.sh`); with fewer than two paired runs it does not exist, and
+nothing is confirmed. `summary.csv` names the same kind of interval
+`mean_ci95_halfwidth` and leaves sd, CV and the interval empty, never 0, when a
+metric has a single run.
+
+The report calls one verifier slower than another only when the paired 95%
+confidence interval of their difference excludes zero. For a raw verifier
+against the SNARK verifier it then also reports a descriptive break-even, per
+paired run and on one clock:
 
 ```text
-ceil(prove_ms / (raw_decode_verify_ms - snark_decode_verify_ms))
+ceil(prove / (raw_decode_verify - snark_decode_verify))
 ```
 
-This deliberately excludes one-time setup, signing, network transfer and
-fixture generation; those costs have different owners and must not be folded
-into one latency figure. Break-even is withheld if any paired run has no
-positive verification-time saving; that run is not silently discarded.
-Speedup and break-even Q1/Q3 remain in `scaling.csv`. Sessions are checked for
-complete runs and samples; inherited per-target run overrides are rejected.
-The paired interval assumes independent repetitions on this host and session,
-not a crossover established across days or machines.
-The first favorable N is only the first observed grid point: a final study must
-refine the interval around it rather than call it the exact crossover.
+`scaling.csv` carries the elapsed one for raw XMSS as `break_even_elapsed_*`;
+`comparisons.csv` carries all four (XMSS and ML-DSA, elapsed and CPU). It reads:
+with typical per-update costs on that clock, this many verifications of one
+record cost as much as the proof saved. It is withheld if any paired run has no
+positive saving; that run is not discarded. It is a restricted indicator, and
+the report says what it is not:
+
+- not a cost: elapsed milliseconds of processes with different parallelism do
+  not add up to CPU, energy or money, which is why both clocks are reported;
+- not a budget: it is built from medians, and totals are made of means
+  (`costs.csv` has both);
+- not an interval: its Q1/Q3 are the spread of the ratio across runs;
+- not end-to-end: it leaves out setup and `ready` costs, signing, network and
+  storage, and more verifiers do not make any single request faster, because
+  the proof must exist before anyone verifies it.
+
+`costs.csv` holds the inputs of a fuller model on both clocks: `P` (prover
+`per_update`), `R` and `S` (raw and SNARK verifier `per_update`), `Sp` (prover
+`setup`) and `Sv` (SNARK verifier `ready`). With `U` updates per prover process,
+`K` verifications per verifier process and `M` verifications per update, the
+aggregated form costs less when `P + Sp/U + M·(S + Sv/K) < M·R`, all in one
+unit. The harness reports the measured quantities and chooses none of `U`, `K`,
+`M`, the unit or a threshold: those belong to the deployment being decided.
+
+A "first observed point" in the report is the smallest `N` of the completed
+grid at which a condition held, for that list size, host and session. It is not
+the exact `N` at which the regime changes, not a statement about every larger
+`N`, and not about points the campaign did not complete. The report reads
+several comparisons off one grid, each with its own 95% interval; the intervals
+are not simultaneous, so a candidate should be confirmed by an independent
+campaign around it. Sessions are checked for complete runs and samples;
+inherited per-target run overrides are rejected. The paired intervals assume
+independent repetitions on this host and session, not an effect established
+across days or machines; `all-runs.csv` keeps each run's sweep, position and
+start time so that the blocks can be analysed as blocks.
 
 After a scaling campaign, generate its figures and tables with:
 
@@ -641,7 +838,42 @@ The main direct dependencies are:
 - `primitives` from the same leanVM revision: BLAKE2s-256;
 - `ethereum_ssz` and `ethereum_ssz_derive`: canonical wire containers;
 - `sha3`: credential and anchor fingerprints;
-- `rand`: application-level randomness.
+- `rand`: application-level randomness;
+- `libc`: one function, the process CPU clock used by the benchmark binaries.
+
+### The one `unsafe` call
+
+The benchmark reports CPU time next to elapsed time, per operation. Rust's
+standard library has no process CPU clock, so
+`bench::timing::process_cpu_time` calls the operating system's
+`clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ..)` through `libc`, and calling a C
+function requires `unsafe`. It is the only `unsafe` in this repository's own
+code: one line in `src/bench/timing.rs` and its twin in
+`mldsa/src/bin/support/mod.rs`.
+
+- **What it does.** It passes the kernel a 16-byte `timespec` that lives on the
+  function's stack; the kernel writes seconds and nanoseconds into it. No
+  memory is allocated and no pointer is kept. A failing call stops the process
+  instead of reporting zero CPU.
+- **Who calls it.** The six measurement binaries and `tests/cpu_clock.rs`. The
+  protocol modules (`node`, `protocol`, `state`) and the container demo do
+  not: signing, verification, slot state and anti-rollback are unaffected.
+- **Dependency.** `libc` was already in the tree through `rand` and
+  `getrandom`; only the direct edge was added.
+- **Limits it brings.** The crates cannot declare `#![forbid(unsafe_code)]`
+  while the benchmark module is part of the library, and they do not compile
+  on Windows, which has no such function (the benchmarks already require
+  Linux's `/proc`).
+- **Alternatives considered.** A crate with a safe wrapper (`rustix`) would
+  give the same numbers with no `unsafe` here, at the price of a new
+  dependency. Reading `/proc/self/task/*/schedstat` needs neither, but costs
+  10 to 20 microseconds per thread per reading, which distorts the smallest
+  verifications. Deriving per-operation CPU from whole-process CPU (already
+  recorded from `time -v`) was tested on a pilot campaign against the measured
+  values: within 4% for the prover, but 24 to 25% off for a SNARK verification
+  (setup and negative controls are inside the process total) and up to 67% off
+  for a raw XMSS verification (twenty of them cost less than the 10 ms
+  resolution). It was therefore not adopted.
 
 `demo/` is a separate Cargo workspace.
 
@@ -673,6 +905,6 @@ preserved in the `poseidon2` branch.
 ## Development provenance
 
 This project was developed with assistance from AI coding systems, including
-GPT-5.6 Sol/Terra, GPT-5.5 and Fable 5. AI-assisted changes are reviewed and
+Claude Opus 5.5, GPT-5.6 Sol/Terra, GPT-5.5 and Fable 5. AI-assisted changes are reviewed and
 tested before being accepted. Responsibility for the design, implementation and
 published commits remains with the repository maintainer.

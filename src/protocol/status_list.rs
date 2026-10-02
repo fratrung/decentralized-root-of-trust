@@ -24,7 +24,7 @@ const _: () = assert!(MAX_COMMITTEE_SIZE == <MaxCommittee as typenum::Unsigned>:
 /// out-of-range signer indices and padding variants are unrepresentable.
 type SignerBits = BitList<MaxCommittee>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Algorithms {
     WotsXmss,
 }
@@ -205,6 +205,21 @@ impl SnarkStatusList {
         Ok(value)
     }
 
+    /// Completes decoding: deserializes and canonicalizes the aggregate, and
+    /// keeps it together with the record it came from.
+    ///
+    /// [`Self::from_bytes`] decodes only the SSZ container. This is the step
+    /// that makes a record's decode cost comparable with the raw form, whose
+    /// decoder already parses every signature. Same setup requirement as
+    /// [`Self::proof`].
+    pub fn decode(self) -> Result<DecodedSnarkStatusList, String> {
+        let aggregate = self.proof()?;
+        Ok(DecodedSnarkStatusList {
+            record: self,
+            aggregate,
+        })
+    }
+
     /// Canonical SSZ wire encoding of the published object.
     pub fn to_bytes(&self) -> Vec<u8> {
         SnarkStatusListWire {
@@ -227,6 +242,26 @@ impl SnarkStatusList {
             version: value.version,
             zk_proof: value.zk_proof,
         })
+    }
+}
+
+/// A [`SnarkStatusList`] whose aggregate is already deserialized and canonical.
+///
+/// Only [`SnarkStatusList::decode`] builds one, and neither half is exposed
+/// mutably, so the aggregate is always the one the record carries: a verifier
+/// cannot be handed a record paired with some other proof.
+pub struct DecodedSnarkStatusList {
+    record: SnarkStatusList,
+    aggregate: AggregateSignature,
+}
+
+impl DecodedSnarkStatusList {
+    pub fn record(&self) -> &SnarkStatusList {
+        &self.record
+    }
+
+    pub fn aggregate(&self) -> &AggregateSignature {
+        &self.aggregate
     }
 }
 

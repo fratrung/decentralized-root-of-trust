@@ -15,6 +15,10 @@
 //!
 //! Usage: `probe --member <index> --entry <label> [--version <n>]`
 //!
+//! Members sign only the version that follows the published record, so a
+//! `--version` other than that one is refused by policy (exit 3) before the
+//! member's slot counter is consulted.
+//!
 //! Exit status: 0 signed, 3 abstained, 1 could not ask.
 
 use std::time::Duration;

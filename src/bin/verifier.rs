@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 
 use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
 use decentralized_root_of_trust::bench::stats::Series;
+use decentralized_root_of_trust::bench::timing::{decode_then_verify, process_cpu_time};
+use decentralized_root_of_trust::bench::workload::ListSizes;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
 use decentralized_root_of_trust::protocol::committee::Committee;
 use decentralized_root_of_trust::protocol::status_list::SnarkStatusList;
@@ -81,6 +83,13 @@ fn main() -> ExitCode {
 
     let rss_baseline = rss_now_mb();
 
+    // `ready`: what a relying party pays once per process before it can verify
+    // anything: read and decode the anchor, open its durable mark, set up the
+    // circuit. The three verifier targets bracket the same steps, so a cold
+    // start can be compared across them; `setup` below is the circuit alone.
+    let ready_cpu_start = process_cpu_time();
+    let t_ready = Instant::now();
+
     // Read before setup because `PQSNARKVerifierModule::new` owns both the anchor
     // and the `setup_verifier()` call. A production verifier embeds the anchor at
     // compile time; either way all that matters is that it is authentic.
@@ -111,12 +120,16 @@ fn main() -> ExitCode {
         .unwrap_or_else(|e| panic!("cannot open high-water mark {}: {e}", state_path.display()));
 
     println!("verifier: setup...");
+    let setup_cpu_start = process_cpu_time();
     let t_setup = Instant::now();
     // The second argument feeds `is_newer`, a stateless convenience this binary
     // does not use: freshness here is the durable `HighWaterMark` below, which
     // survives restarts. `unwrap_or(0)` is therefore not load-bearing.
     let verifier = PQSNARKVerifierModule::new(committee, hwm.current().unwrap_or(0));
     let setup_time = t_setup.elapsed();
+    let setup_cpu = ms(process_cpu_time().saturating_sub(setup_cpu_start));
+    let ready = ms(t_ready.elapsed());
+    let ready_cpu = ms(process_cpu_time().saturating_sub(ready_cpu_start));
     let rss_after_setup = rss_now_mb();
 
     let committee = verifier.committee_as_ref();
@@ -132,31 +145,41 @@ fn main() -> ExitCode {
     let mut verify_ts = Vec::new();
     let mut failures = 0usize;
     let mut rss_max = rss_after_setup;
+    let mut total_cpu_ms = Vec::new();
+    let mut list_sizes = ListSizes::default();
 
     // Legitimate updates: every one must be accepted.
     for (idx, path) in artifacts(dir, "update-").into_iter().enumerate() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let bytes = std::fs::read(&path).expect("cannot read update");
         // Decoding is timed with verification: on an untrusted transport it is
-        // part of the cost an attacker can force, and it is not free: leanVM
-        // recomputes the bytecode claim while deserializing.
-        let total_start = Instant::now();
-        let decoded = SnarkStatusList::from_bytes(&bytes);
-        let decode_time = total_start.elapsed();
-        let record = match decoded {
-            Ok(record) => record,
-            Err(e) => {
-                println!("  {name:<22} DECODE FAILED: {e}");
-                failures += 1;
-                continue;
-            }
-        };
-        let verify_start = Instant::now();
-        let ok = verifier.verify(&record);
-        let verify_only_time = verify_start.elapsed();
-        let elapsed = total_start.elapsed();
+        // part of the cost an attacker can force. It covers the SSZ container
+        // *and* the leanVM aggregate, which is not free: leanVM recomputes the
+        // bytecode claim while deserializing. That keeps the phase split
+        // comparable with the raw path, whose decoder parses every signature.
+        //
+        // The timers start and stop where every relying-party target's do
+        // (`bench::timing`); the decoded record stays alive in `measured`
+        // until RSS has been read.
+        let measured = decode_then_verify(
+            || SnarkStatusList::from_bytes(&bytes).and_then(SnarkStatusList::decode),
+            |record| verifier.verify_decoded(record),
+        );
+        if let Err(e) = &measured.decoded {
+            println!("  {name:<22} DECODE FAILED: {e}");
+            failures += 1;
+            continue;
+        }
+        if let Ok(decoded) = &measured.decoded {
+            list_sizes.record(decoded.record().list().len());
+        }
+        let ok = measured.accepted;
+        let (decode_time, verify_only_time, elapsed) =
+            (measured.decode, measured.verify, measured.total);
+        let cpu = ms(measured.cpu);
         let rss = rss_now_mb();
         rss_max = rss_max.max(rss);
+        drop(measured);
         if !ok {
             failures += 1;
         }
@@ -168,13 +191,14 @@ fn main() -> ExitCode {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=verifier idx={idx} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss}",
+                "SAMPLE target=verifier idx={idx} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss} cpu_ms={cpu:.3}",
                 ms(decode_time),
                 ms(verify_only_time),
                 ms(elapsed),
                 bytes.len()
             );
         }
+        total_cpu_ms.push(cpu);
         decode_ts.push(decode_time);
         verify_only_ts.push(verify_only_time);
         verify_ts.push(elapsed);
@@ -183,11 +207,17 @@ fn main() -> ExitCode {
     // Forgeries: every one must be rejected. A decode failure counts as a
     // rejection: refusing to parse is a valid way to refuse.
     println!("\nForgeries (expected: all REJECTED)");
+    // One control per check, each built so that only its own check can reject it:
+    // outsider (1), tampered and version (2), slot (3), short (4), proofbody (5).
+    // The last three are what make this gate fail when check 3, 4 or 5 is removed.
     let attacks = artifacts(dir, "attack-");
     for required in [
         "attack-outsider.bin",
         "attack-tampered.bin",
         "attack-version.bin",
+        "attack-slot.bin",
+        "attack-short.bin",
+        "attack-proofbody.bin",
     ] {
         if !dir.join(required).is_file() {
             println!("  {required:<22} MISSING <- SECURITY TEST NOT RUN");
@@ -302,6 +332,8 @@ fn main() -> ExitCode {
     let total = Series::new(verify_ts.iter().map(|d| ms(*d)));
     let (vf_min, vf_med, vf_max) = verify.min_med_max();
     let (total_min, total_med, total_max) = total.min_med_max();
+    let total_cpu = Series::new(total_cpu_ms);
+    let (total_cpu_med, total_cpu_total) = (total_cpu.median(), total_cpu.sum());
 
     println!("\nsetup_verifier         : {setup_time:.2?}");
     println!(
@@ -327,7 +359,9 @@ fn main() -> ExitCode {
          total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
          total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} anchor_bytes={} \
          rss_setup_mb={rss_after_setup} rss_verify_max_mb={rss_max} peak_rss_mb={} \
-         failures={failures}",
+         failures={failures} {list_sizes} setup_cpu_ms={setup_cpu:.3} \
+         total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3} \
+         ready_ms={ready:.3} ready_cpu_ms={ready_cpu:.3}",
         ms(setup_time),
         verify.len(),
         verify.mean(),

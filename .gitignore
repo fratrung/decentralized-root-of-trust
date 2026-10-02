@@ -17,6 +17,27 @@ examples/my_test_3.rs
 signers/
 next
 next_lock
+next_slot
+next_slot.*
 
 # The demo crate builds into its own target directory.
 demo/target
+/mldsa-statement-experiment-*/
+
+# Working documents of the benchmark review: the audit notes and the guide
+# written from them. They record how the harness was corrected and are kept
+# locally; the resulting rules live in README.md and AGENTS.md.
+/docs/benchmark-review-*.md
+/docs/benchmark-guida-alla-review-*.md
+/docs/benchmark-guida-alla-review-*.pdf
+
+# Python bytecode left by the tools (plot_benchmarks.py, mutate.py and tests).
+__pycache__/
+*.pyc
+
+# Editor and operating-system leftovers.
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

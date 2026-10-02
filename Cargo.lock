@@ -780,6 +780,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "leanvm",
+ "libc",
  "primitives",
  "rand 0.10.2",
  "serde_jcs",

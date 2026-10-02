@@ -24,9 +24,10 @@
 //! ## Slot discipline
 //!
 //! Seeds are tagged `[FILE, ns, member, 0, ..]` with `FILE = 8`, disjoint from
-//! `committee.rs` (1), `raw_path_round.rs` (2), `snark_path.rs` (3),
-//! `lock_two_processes.rs` (4), `hostile_bytes.rs` (5), `signer_node.rs` (6) and
-//! `verifier_node.rs` (7). Exactly one `(member, slot)` pair is spent per member:
+//! `src/protocol/committee.rs` (1), `raw_path_round.rs` (2), `snark_path.rs` (3),
+//! `lock_two_processes.rs` (4), `hostile_bytes.rs` (5), `src/node/signer.rs` (6),
+//! `src/node/raw_verifier.rs` (7), `src/node/raw_node.rs` (9) and
+//! `snark_node.rs` (10). Exactly one `(member, slot)` pair is spent per member:
 //! members 0, 1 and 2 sign round 0 at slot 100, once.
 
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
@@ -141,6 +142,32 @@ fn the_modules_derive_the_slot_and_enforce_every_binding() {
             honest.proof_bytes().to_vec(),
         )),
         "a relabelled version was accepted"
+    );
+
+    // The pre-decoded entry point, which the `verifier` binary uses so that its
+    // decode timer covers the aggregate, must run the same predicate: it accepts
+    // the honest record off the wire and refuses the same tampered list.
+    let decoded = SnarkStatusList::from_bytes(&honest.to_bytes())
+        .expect("the record decodes")
+        .decode()
+        .expect("the aggregate decodes");
+    assert!(
+        verifier.verify_decoded(&decoded),
+        "verify_decoded disagrees with verify on an honest record"
+    );
+    let mut tampered = list.clone();
+    tampered.push(hash_any(b"FAKE-REVOCATION"));
+    let tampered = SnarkStatusList::new(
+        Algorithms::WotsXmss,
+        tampered,
+        version,
+        honest.proof_bytes().to_vec(),
+    )
+    .decode()
+    .expect("the untouched aggregate still decodes");
+    assert!(
+        !verifier.verify_decoded(&tampered),
+        "verify_decoded accepted a row nobody signed"
     );
 
     // (3) `is_newer` is strict. Accepting an equal version would let a peer replay

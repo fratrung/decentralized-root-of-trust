@@ -30,6 +30,11 @@ ssz_derive = { package = "ethereum_ssz_derive", version = "0.10.1" }
 # adds no crate, only the ability to write the bound down.
 typenum = "1"
 
+# Only for `bench::timing::process_cpu_time`: the standard library has no
+# process CPU clock. Already in the tree through `rand`; the protocol modules
+# do not use it.
+libc = "0.2"
+
 # Not used by the library: the local scratch binaries (`src/bin/my_test*.rs`,
 # gitignored) build JCS-canonical JSON credentials with them.
 serde_json = "1.0"

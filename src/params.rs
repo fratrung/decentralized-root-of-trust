@@ -63,25 +63,26 @@ pub const T: usize = benchmark_usize(option_env!("DROT_BENCH_T"), DEFAULT_T);
 /// Number of sequential updates the demo performs.
 ///
 /// Bounded by the key window: updates take slots `SLOT..SLOT + N_UPDATES` and the
-/// two security-test forgeries take `SLOT + N_UPDATES` and `SLOT + KEY_SLOTS`.
-/// Hence `N_UPDATES < KEY_SLOTS`, strictly; see the assertion below.
+/// security-test forgeries take `SLOT + N_UPDATES`, `SLOT + N_UPDATES + 1` (the
+/// wrong-slot control) and `SLOT + KEY_SLOTS`. Hence `N_UPDATES + 1 < KEY_SLOTS`,
+/// strictly; see the assertion below.
 pub const N_UPDATES: usize = 20;
 
 /// Width of the XMSS slot window each committee key is generated for: the last
 /// usable slot is `SLOT + KEY_SLOTS`, **inclusive**.
 pub const KEY_SLOTS: u32 = 64;
 
-// `N_UPDATES == KEY_SLOTS` destroys the committee keys *silently*: both forgeries
-// then derive slot `SLOT + KEY_SLOTS`, still inside the key window, so `t` members
-// sign two different messages at one XMSS slot while the demo prints
-// `security OK: true`. `main.rs` and `prover.rs` sign by plain arithmetic on these
+// A forgery slot landing on `SLOT + KEY_SLOTS` destroys the committee keys
+// *silently*: two forgeries then sign different messages at one XMSS slot, still
+// inside the key window, while the demo prints `security OK: true`. `main.rs`,
+// `prover.rs` and `committee_fixture.rs` sign by plain arithmetic on these
 // constants rather than through `AtomicSlotCounter`, so nothing at runtime would
 // catch it. Signing randomness does not help: any reuse of an XMSS slot is unsafe.
 const _: () = assert!(
-    N_UPDATES < KEY_SLOTS as usize,
-    "N_UPDATES must be < KEY_SLOTS: the two security-test forgeries consume the \
-     slots above the update range, and at N_UPDATES == KEY_SLOTS they collide, \
-     making the committee sign twice at one XMSS slot"
+    N_UPDATES + 1 < KEY_SLOTS as usize,
+    "N_UPDATES + 1 must be < KEY_SLOTS: the security-test forgeries consume \
+     SLOT + N_UPDATES, SLOT + N_UPDATES + 1 and SLOT + KEY_SLOTS, and any two of \
+     them colliding makes the committee sign twice at one XMSS slot"
 );
 
 // `Committee::new` already refuses `t` outside `1..=N`, but it refuses at

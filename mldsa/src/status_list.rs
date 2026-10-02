@@ -3,6 +3,8 @@
 //! Structural validity is not authorization. The committee and quorum checks
 //! are performed by RawVerifier after decoding.
 
+use sha3::Shake256;
+use sha3::digest::{ExtendableOutput, Update, XofReader};
 use ssz::{BitList, Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
@@ -18,7 +20,11 @@ pub const SIGNATURE_BYTES: usize = 3309;
 /// Distinct from the existing XMSS wire tag 1. A future wire break needs a new tag.
 const ALGORITHM_TAG: u8 = 2;
 /// Binds the signed statement to this application and construction generation.
-const STATEMENT_DOMAIN: &[u8] = b"decentralized-root-of-trust/ml-dsa-65/status-list/v1\0";
+/// Generation 2 signs the 64-byte digest of the statement; generation 1 signed
+/// the statement itself, so their signatures are not interchangeable.
+const STATEMENT_DOMAIN: &[u8] = b"decentralized-root-of-trust/ml-dsa-65/status-list/v2\0";
+/// Length of the statement digest every member signs.
+pub const STATEMENT_DIGEST_BYTES: usize = 64;
 /// Derived from the canonical committee anchor by Committee.
 pub const ANCHOR_ID_BYTES: usize = 48;
 
@@ -36,7 +42,7 @@ struct StatusListWire {
     signatures: Vec<[u8; SIGNATURE_BYTES]>,
 }
 
-/// The statement signed directly with FIPS 204 ML-DSA.Sign (not HashML-DSA).
+/// The statement whose SHAKE256 digest is signed with FIPS 204 ML-DSA.Sign.
 /// The bitmap and signatures cannot be part of it: they are assembled only
 /// after independent members have signed the common statement.
 #[derive(SszEncode)]
@@ -48,13 +54,12 @@ struct StatementWire {
     status_list: Vec<[u8; 32]>,
 }
 
-/// Canonical, domain-separated bytes all members sign for one update.
+/// Canonical, domain-separated statement for one update: what the committee
+/// attests. Members do not sign these bytes; they sign [`statement_digest`].
 ///
 /// Only the trusted [`crate::Committee`] exposes this construction publicly,
-/// ensuring callers cannot substitute an arbitrary anchor identifier. It
-/// performs no application-level pre-hash: pass the complete result to
-/// `MlDsa65Signer::sign`.
-pub(crate) fn statement_bytes(
+/// ensuring callers cannot substitute an arbitrary anchor identifier.
+pub(crate) fn statement_preimage(
     anchor_id: &[u8; ANCHOR_ID_BYTES],
     list: &[[u8; 32]],
     version: u32,
@@ -70,6 +75,37 @@ pub(crate) fn statement_bytes(
     bytes.extend_from_slice(STATEMENT_DOMAIN);
     bytes.extend_from_slice(&statement);
     bytes
+}
+
+/// The 64 bytes every member signs: `SHAKE256(statement_preimage, 64)`.
+///
+/// The statement contains the whole list, 32 bytes per credential. ML-DSA
+/// starts by hashing `H(pk) || M`, a prefix that differs for every signer, so
+/// signing the statement itself would make a verifier re-hash the entire list
+/// once per signature: `t` passes over `32 * L` bytes. Hashing the statement once
+/// and signing the digest leaves ML-DSA's own per-signer hash over 64 bytes.
+///
+/// This is hashing at the application level followed by pure ML-DSA, the case
+/// FIPS 204 section 5.4 describes (its example is CMS, RFC 9882); it is not
+/// the separate HashML-DSA mode. The same section sets the condition for
+/// keeping the security strength: an approved hash or XOF with at least
+/// lambda bits of collision and second-preimage strength, hence a digest of at
+/// least 2*lambda bits. ML-DSA-65 has lambda = 192, so 384 bits; SHAKE256
+/// (FIPS 202) with 512 output bits gives 256-bit collision strength, and is
+/// the function and output length of ML-DSA's own message representative.
+/// A 32-byte digest would fall below ML-DSA-65's level. Everything the
+/// statement binds (domain, algorithm, anchor, version, ordered list) is
+/// inside the digest.
+pub(crate) fn statement_digest(
+    anchor_id: &[u8; ANCHOR_ID_BYTES],
+    list: &[[u8; 32]],
+    version: u32,
+) -> [u8; STATEMENT_DIGEST_BYTES] {
+    let mut hasher = Shake256::default();
+    hasher.update(&statement_preimage(anchor_id, list, version));
+    let mut digest = [0u8; STATEMENT_DIGEST_BYTES];
+    hasher.finalize_xof().read(&mut digest);
+    digest
 }
 
 fn record_len(n_members: usize, list_len: usize, signature_count: usize) -> Option<usize> {
@@ -252,7 +288,7 @@ mod tests {
         let second = MlDsa65Signer::generate().unwrap();
         let list = vec![[7; 32], [8; 32]];
         let anchor = [3; ANCHOR_ID_BYTES];
-        let message = statement_bytes(&anchor, &list, 9);
+        let message = statement_digest(&anchor, &list, 9);
         let record = MlDsaStatusList::new(
             list.clone(),
             9,
@@ -287,7 +323,7 @@ mod tests {
     fn empty_snapshot_round_trips() {
         let signer = MlDsa65Signer::generate().unwrap();
         let anchor = [3; ANCHOR_ID_BYTES];
-        let message = statement_bytes(&anchor, &[], 0);
+        let message = statement_digest(&anchor, &[], 0);
         let record =
             MlDsaStatusList::new(vec![], 0, 1, vec![(0, signer.sign(&message).unwrap())]).unwrap();
         let decoded = MlDsaStatusList::from_bytes(&record.to_bytes()).unwrap();
@@ -304,9 +340,22 @@ mod tests {
     fn statement_binds_anchor_algorithm_version_order_and_list() {
         let anchor = [3; ANCHOR_ID_BYTES];
         let list = [[7; 32], [8; 32]];
-        let message = statement_bytes(&anchor, &list, 9);
+        let digest_of = |preimage: &[u8]| {
+            let mut hasher = Shake256::default();
+            hasher.update(preimage);
+            let mut digest = [0u8; STATEMENT_DIGEST_BYTES];
+            hasher.finalize_xof().read(&mut digest);
+            digest
+        };
+        let preimage = statement_preimage(&anchor, &list, 9);
+        let message = statement_digest(&anchor, &list, 9);
+        assert_eq!(message, digest_of(&preimage));
         let signer = MlDsa65Signer::generate().unwrap();
         let signature = signer.sign(&message).unwrap();
+        assert!(verify(&signer.public_key(), &message, &signature));
+        // A signature over the digest is not a signature over the statement
+        // itself: generation 1 and generation 2 cannot be confused.
+        assert!(!verify(&signer.public_key(), &preimage, &signature));
         let mut wrong_algorithm = STATEMENT_DOMAIN.to_vec();
         wrong_algorithm.extend_from_slice(
             &StatementWire {
@@ -318,16 +367,41 @@ mod tests {
             .as_ssz_bytes(),
         );
         for other in [
-            wrong_algorithm,
-            statement_bytes(&[4; ANCHOR_ID_BYTES], &list, 9),
-            statement_bytes(&anchor, &list, 10),
-            statement_bytes(&anchor, &list[..1], 9),
-            statement_bytes(&anchor, &[list[1], list[0]], 9),
+            digest_of(&wrong_algorithm),
+            statement_digest(&[4; ANCHOR_ID_BYTES], &list, 9),
+            statement_digest(&anchor, &list, 10),
+            statement_digest(&anchor, &list[..1], 9),
+            statement_digest(&anchor, &[list[1], list[0]], 9),
         ] {
             assert_ne!(message, other);
             assert!(!verify(&signer.public_key(), &other, &signature));
         }
-        assert!(message.starts_with(STATEMENT_DOMAIN));
+        assert!(preimage.starts_with(STATEMENT_DOMAIN));
+    }
+
+    /// The digest is pinned against a value computed outside this crate
+    /// (Python `hashlib.shake_256(preimage).hexdigest(64)` over the bytes
+    /// written out below), so neither the statement layout nor the hash can
+    /// change unnoticed.
+    #[test]
+    fn statement_digest_matches_an_independent_shake256() {
+        let anchor = [3; ANCHOR_ID_BYTES];
+        let list = [[7; 32], [8; 32]];
+        let mut expected_preimage = STATEMENT_DOMAIN.to_vec();
+        expected_preimage.push(2); // alg
+        expected_preimage.extend_from_slice(&anchor);
+        expected_preimage.extend_from_slice(&9u32.to_le_bytes()); // version
+        expected_preimage.extend_from_slice(&57u32.to_le_bytes()); // SSZ offset of the list
+        expected_preimage.extend_from_slice(&[7; 32]);
+        expected_preimage.extend_from_slice(&[8; 32]);
+        assert_eq!(statement_preimage(&anchor, &list, 9), expected_preimage);
+        let digest = statement_digest(&anchor, &list, 9);
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            hex,
+            "1adc6cd0ac150f8cfa9a63b65de64025a8178596a0960e419d655bc4792a3013\
+             36907fb1e7a51f92ca94c4da5dce66e79afe13d09bef17946397d2d1c2189e86"
+        );
     }
 
     #[test]

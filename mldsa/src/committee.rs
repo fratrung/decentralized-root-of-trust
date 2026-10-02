@@ -11,7 +11,10 @@ use ssz::{Decode as _, Encode as _};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
 use crate::PublicKey;
-use crate::status_list::{ANCHOR_ID_BYTES, MAX_COMMITTEE_SIZE, statement_bytes};
+use crate::status_list::{
+    ANCHOR_ID_BYTES, MAX_COMMITTEE_SIZE, STATEMENT_DIGEST_BYTES, statement_digest,
+    statement_preimage,
+};
 
 /// FIPS 204 ML-DSA-65 public-key encoding size.
 pub const PUBLIC_KEY_BYTES: usize = 1952;
@@ -196,13 +199,28 @@ impl Committee {
         &self.anchor_id
     }
 
-    /// The sole public constructor for the bytes a committee member signs.
+    /// The sole public constructor for the bytes a committee member signs:
+    /// the 64-byte SHAKE256 digest of [`Self::statement_preimage`].
     ///
-    /// It is a normal FIPS 204 ML-DSA message. It contains a protocol domain,
-    /// algorithm tag, this anchor identifier, version, and ordered list; it is
-    /// not an application-level pre-hash.
-    pub fn statement_for(&self, status_list: &[[u8; 32]], version: u32) -> Vec<u8> {
-        statement_bytes(&self.anchor_id, status_list, version)
+    /// It is a normal FIPS 204 ML-DSA message, hashed at the application level
+    /// as FIPS 204 section 5.4 describes, not the HashML-DSA mode. The digest
+    /// covers the protocol domain, algorithm tag, this anchor identifier,
+    /// version and ordered list, so ML-DSA's per-signer hash runs over 64 bytes
+    /// instead of the whole list. See `status_list::statement_digest`.
+    pub fn statement_for(
+        &self,
+        status_list: &[[u8; 32]],
+        version: u32,
+    ) -> [u8; STATEMENT_DIGEST_BYTES] {
+        statement_digest(&self.anchor_id, status_list, version)
+    }
+
+    /// The complete statement the digest is taken over: protocol domain, then
+    /// the SSZ encoding of `(alg, anchor_id, version, status_list)`. Exposed
+    /// for auditing and for the statement-digest experiment; members sign
+    /// [`Self::statement_for`], never these bytes.
+    pub fn statement_preimage(&self, status_list: &[[u8; 32]], version: u32) -> Vec<u8> {
+        statement_preimage(&self.anchor_id, status_list, version)
     }
 }
 

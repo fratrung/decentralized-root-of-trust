@@ -4,8 +4,8 @@
 //! `tests/snark_path.rs` proves the five checks are load-bearing and
 //! `src/state/freshness.rs` proves the gate is strict. What neither covers is the
 //! seam: that a record which fails the predicate never reaches the gate. That is
-//! the property a relying party is built out of, and the one every binary used to
-//! re-implement by hand.
+//! the property a relying party is built out of, and `SnarkNode` is its single
+//! implementation.
 //!
 //! Everything lives in one `#[test]` for the reason spelled out in
 //! `tests/snark_path.rs`: leanVM's arena is one shared region per process, and

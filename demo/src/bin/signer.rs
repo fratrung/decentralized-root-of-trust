@@ -237,6 +237,48 @@ impl Node {
             }
         };
 
+        // Policy, checked before any slot is touched: sign only the version that
+        // immediately follows the published one. `reserve_at` burns every slot
+        // up to the one requested, so without this a single unauthenticated
+        // proposal for a far-future version would exhaust this member's whole
+        // key window. The record is decoded but not verified: signer-only SNARK
+        // members never load the verifier, and the storage volume stands in for
+        // the trusted VDR. A repeated version still passes here and is refused
+        // by the durable counter, which is what the crash scenario asserts.
+        let expected = match storage::current_record() {
+            None => 0,
+            Some(bytes) => match self.decode_list(&bytes) {
+                Ok((published, _)) => match published.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return (
+                            wire::MSG_SIGNATURE,
+                            abstain("the status-list version is exhausted"),
+                        );
+                    }
+                },
+                Err(e) => {
+                    return (
+                        wire::MSG_SIGNATURE,
+                        abstain(format!("published record is unreadable: {e}")),
+                    );
+                }
+            },
+        };
+        if proposal.version != expected {
+            println!(
+                "member {}: abstains on v{}, only v{expected} follows the published record",
+                self.index, proposal.version
+            );
+            return (
+                wire::MSG_SIGNATURE,
+                abstain(format!(
+                    "version {} is not the next version {expected}",
+                    proposal.version
+                )),
+            );
+        }
+
         // Derived, never taken from the proposal. An aggregator that could pick
         // the slot could have one version signed at the slot of another.
         let Some(slot) = self.committee.slot_for(proposal.version) else {

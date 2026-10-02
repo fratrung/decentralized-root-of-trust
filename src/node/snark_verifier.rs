@@ -3,10 +3,10 @@
 //! Constructing the module initializes leanVM verification. Freshness stays
 //! outside this pure predicate in [`crate::state::freshness`].
 
-use leanvm::setup_verifier;
+use leanvm::{AggregateSignature, setup_verifier};
 
 use crate::protocol::committee::Committee;
-use crate::protocol::status_list::{SnarkStatusList, status_list_message};
+use crate::protocol::status_list::{DecodedSnarkStatusList, SnarkStatusList, status_list_message};
 
 pub struct PQSNARKVerifierModule {
     committee: Committee,
@@ -33,7 +33,19 @@ impl PQSNARKVerifierModule {
             Ok(a) => a,
             Err(_) => return false,
         };
+        self.check(status_list, &agg)
+    }
 
+    /// [`Self::verify`] for a record whose aggregate was deserialized ahead of
+    /// time by [`SnarkStatusList::decode`], so decoding and verification can be
+    /// timed apart. The same single predicate runs underneath.
+    pub fn verify_decoded(&self, decoded: &DecodedSnarkStatusList) -> bool {
+        self.check(decoded.record(), decoded.aggregate())
+    }
+
+    /// The one copy of the predicate. Private, so the only way to reach it is
+    /// with an aggregate decoded from the record itself.
+    fn check(&self, status_list: &SnarkStatusList, agg: &AggregateSignature) -> bool {
         // v0.10 aggregates a general collection of XMSS epoch/message groups
         // and SPHINCS claims. This protocol accepts exactly one XMSS group and
         // no other signature family; accepting a broader statement here would
