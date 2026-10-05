@@ -75,6 +75,9 @@ jobs:
       - name: Test benchmark plotting
         run: python3 tools/test_plot_benchmarks.py
 
+      - name: Test scaling analysis
+        run: python3 tools/test_analyze_scaling.py
+
       - name: Lint
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 

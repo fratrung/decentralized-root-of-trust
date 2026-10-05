@@ -36,7 +36,7 @@
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::rss_now_mb;
+use decentralized_root_of_trust::bench::mem::rss_now_mib;
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::node::raw_node::RawNode;
 use decentralized_root_of_trust::node::snark_node::SnarkNode;
@@ -136,14 +136,14 @@ impl Node {
             println!("node A: resuming, nothing below v{version} will be accepted again");
         }
 
-        let before = rss_now_mb();
+        let before = rss_now_mib();
         let started = Instant::now();
         let built = match mode {
             Mode::Raw => Node::Raw(RawNode::new(committee, mark)),
             Mode::Snark => Node::Snark(SnarkNode::new(committee, mark)),
         };
         let setup = started.elapsed();
-        let after = rss_now_mb();
+        let after = rss_now_mib();
 
         match mode {
             Mode::Raw => {

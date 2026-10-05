@@ -815,6 +815,36 @@ independent repetitions on this host and session, not an effect established
 across days or machines; `all-runs.csv` keeps each run's sweep, position and
 start time so that the blocks can be analysed as blocks.
 
+That analysis is a separate step, run on a finished campaign:
+
+```sh
+python3 tools/analyze_scaling.py committee-scaling-<timestamp>
+```
+
+It writes `analysis/report.txt` and three CSV files and changes nothing else.
+A session is one sweep's visit to a committee size: its own build, fixture and
+stretch of time. The tool reports, for every role and both clocks:
+
+- the **session effect**: the spread of the session means, an F test of it and
+  the share of the variance that lies between sessions (intraclass
+  correlation). Where that share is well above zero, runs of one session are
+  not independent and the report's interval is too narrow;
+- the **drift inside each session**: the slope of the per-run values against
+  run order with its 95% interval, and the lag-1 autocorrelation of the
+  residuals;
+- each paired comparison under **three intervals**: every pair independent (the
+  report's own), sessions as fixed blocks (a statement about these sessions),
+  and sessions as the unit of replication (a statement about another session
+  on this host, with one degree of freedom fewer than there are sweeps);
+- the **whole family at once**: Holm-adjusted p-values and Bonferroni
+  simultaneous intervals over every committee size, verifier pair and clock,
+  and the first observed points under each reading.
+
+More sweeps, not more runs per session, narrow the session-level interval: two
+sweeps leave it one degree of freedom, so it confirms a difference only when
+the two sessions agree closely. The tool needs no third-party package, uses the
+95% level the harness already uses, and chooses no threshold.
+
 After a scaling campaign, generate its figures and tables with:
 
 ```sh

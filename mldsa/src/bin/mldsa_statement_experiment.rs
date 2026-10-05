@@ -265,7 +265,7 @@ fn main() {
     let outsider = MlDsa65Signer::generate()
         .expect("outsider key generation failed")
         .public_key();
-    let peak_rss_mb = support::rss_mb("VmHWM:");
+    let peak_rss_mib = support::rss_mib("VmHWM:");
     for (case, entries) in cases.iter().zip(&list_sizes) {
         let preimage = committee.statement_preimage(&case.list, version);
         let digest = committee.statement_for(&case.list, version);
@@ -282,7 +282,7 @@ fn main() {
              sign_statement_med_ms={:.4} sign_digest_med_ms={:.4} \
              verify_statement_med_ms={:.4} verify_digest_med_ms={:.4} \
              preimage_med_ms={:.4} digest_med_ms={:.4} app_pass_med_ms={:.4} mu_statement_med_ms={:.4} \
-             mu_digest_med_ms={:.4} peak_rss_mb={peak_rss_mb} controls_ok=1",
+             mu_digest_med_ms={:.4} peak_rss_mib={peak_rss_mib} controls_ok=1",
             preimage.len(),
             median(&case.sign_statement_ms),
             median(&case.sign_digest_ms),

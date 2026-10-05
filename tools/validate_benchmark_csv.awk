@@ -109,7 +109,7 @@ FILENAME == ARGV[1] {
         fail("wrong n_items for " target "/" run)
     if ($(run_col["failures"]) != "0")
         fail("failed or missing security gate for " target "/" run)
-    required("peak_rss_mb", 0)
+    required("peak_rss_mib", 0)
     if (target == "signer") {
         required("keygen_ms", 0)
         required("slot_state_ms", 0)
@@ -175,7 +175,7 @@ FILENAME == ARGV[2] {
     sample_ms[target, run, phase, n] = $(sample_col["ms"])
     sample_bytes[target, run, phase, n] = $(sample_col["bytes"])
     if (!decimal($(sample_col["ms"])) || !decimal($(sample_col["bytes"])) ||
-        $(sample_col["bytes"]) + 0 <= 0 || !decimal($(sample_col["rss_mb"])))
+        $(sample_col["bytes"]) + 0 <= 0 || !decimal($(sample_col["rss_mib"])))
         fail("invalid numeric sample at line " FNR)
     next
 }

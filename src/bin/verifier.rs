@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::mem::{peak_rss_mib, rss_now_mib};
 use decentralized_root_of_trust::bench::stats::Series;
 use decentralized_root_of_trust::bench::timing::{decode_then_verify, process_cpu_time};
 use decentralized_root_of_trust::bench::workload::ListSizes;
@@ -81,7 +81,7 @@ fn main() -> ExitCode {
     let dir = Path::new(&dir);
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
 
-    let rss_baseline = rss_now_mb();
+    let rss_baseline = rss_now_mib();
 
     // `ready`: what a relying party pays once per process before it can verify
     // anything: read and decode the anchor, open its durable mark, set up the
@@ -130,7 +130,7 @@ fn main() -> ExitCode {
     let setup_cpu = ms(process_cpu_time().saturating_sub(setup_cpu_start));
     let ready = ms(t_ready.elapsed());
     let ready_cpu = ms(process_cpu_time().saturating_sub(ready_cpu_start));
-    let rss_after_setup = rss_now_mb();
+    let rss_after_setup = rss_now_mib();
 
     let committee = verifier.committee_as_ref();
     println!(
@@ -177,7 +177,7 @@ fn main() -> ExitCode {
         let (decode_time, verify_only_time, elapsed) =
             (measured.decode, measured.verify, measured.total);
         let cpu = ms(measured.cpu);
-        let rss = rss_now_mb();
+        let rss = rss_now_mib();
         rss_max = rss_max.max(rss);
         drop(measured);
         if !ok {
@@ -191,7 +191,7 @@ fn main() -> ExitCode {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=verifier idx={idx} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss} cpu_ms={cpu:.3}",
+                "SAMPLE target=verifier idx={idx} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mib={rss} cpu_ms={cpu:.3}",
                 ms(decode_time),
                 ms(verify_only_time),
                 ms(elapsed),
@@ -344,10 +344,10 @@ fn main() -> ExitCode {
     println!("verify-only min/med/max: {vf_min:.1} / {vf_med:.1} / {vf_max:.1} ms");
     println!("decode+verify min/med/max: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
     println!("\nRAM (verify-only process)");
-    println!("baseline (pre-setup)   : {rss_baseline} MB");
-    println!("after setup (resident) : {rss_after_setup} MB");
-    println!("max during verifies    : {rss_max} MB");
-    println!("peak (VmHWM)           : {} MB", peak_rss_mb());
+    println!("baseline (pre-setup)   : {rss_baseline} MiB");
+    println!("after setup (resident) : {rss_after_setup} MiB");
+    println!("max during verifies    : {rss_max} MiB");
+    println!("peak (VmHWM)           : {} MiB", peak_rss_mib());
 
     // One-line machine-readable record, parsed by benchmark.sh.
     println!(
@@ -358,7 +358,7 @@ fn main() -> ExitCode {
          decode_min_ms={:.3} decode_max_ms={:.3} decode_total_ms={:.3} \
          total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
          total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} anchor_bytes={} \
-         rss_setup_mb={rss_after_setup} rss_verify_max_mb={rss_max} peak_rss_mb={} \
+         rss_setup_mib={rss_after_setup} rss_verify_max_mib={rss_max} peak_rss_mib={} \
          failures={failures} {list_sizes} setup_cpu_ms={setup_cpu:.3} \
          total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3} \
          ready_ms={ready:.3} ready_cpu_ms={ready_cpu:.3}",
@@ -377,7 +377,7 @@ fn main() -> ExitCode {
         total.stddev(),
         total.sum(),
         anchor.len(),
-        peak_rss_mb()
+        peak_rss_mib()
     );
 
     if failures == 0 {

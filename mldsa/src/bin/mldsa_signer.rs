@@ -17,13 +17,13 @@ fn main() {
         support::parse_count(value, "updates", support::MAX_UPDATES)
     });
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
-    let rss_baseline = support::rss_mb("VmRSS:");
+    let rss_baseline = support::rss_mib("VmRSS:");
 
     let keygen_start = Instant::now();
     let signer = MlDsa65Signer::generate().expect("ML-DSA key generation failed");
     let keygen_time = keygen_start.elapsed();
     let committee = Committee::new(vec![signer.public_key()], 1).expect("single-member anchor");
-    let rss_after_keygen = support::rss_mb("VmRSS:");
+    let rss_after_keygen = support::rss_mib("VmRSS:");
     let mut rss_rounds_max = rss_after_keygen;
     let list_entries = support::list_entries_from_env();
     let mut next_entry = 0;
@@ -45,11 +45,11 @@ fn main() {
             verify(&committee.members()[0], &message, &signature),
             "self-verification failed"
         );
-        let rss = support::rss_mb("VmRSS:");
+        let rss = support::rss_mib("VmRSS:");
         rss_rounds_max = rss_rounds_max.max(rss);
         if emit_samples {
             println!(
-                "SAMPLE target=mldsa_signer idx={index} sign_ms={:.3} sig_bytes={SIGNATURE_BYTES} rss_mb={rss} cpu_ms={sign_cpu:.3}",
+                "SAMPLE target=mldsa_signer idx={index} sign_ms={:.3} sig_bytes={SIGNATURE_BYTES} rss_mib={rss} cpu_ms={sign_cpu:.3}",
                 support::milliseconds(sign_time)
             );
         }
@@ -64,8 +64,8 @@ fn main() {
         "MLDSA_SIGNER keygen_ms={:.3} n_rounds={} sign_med_ms={:.3} \
          sign_mean_ms={:.3} sign_sd_ms={:.3} sign_min_ms={:.3} \
          sign_max_ms={:.3} sign_total_ms={:.3} sig_bytes={SIGNATURE_BYTES} \
-         rss_baseline_mb={rss_baseline} rss_keygen_mb={rss_after_keygen} \
-         rss_rounds_max_mb={rss_rounds_max} peak_rss_mb={} failures=0 {list_sizes} \
+         rss_baseline_mib={rss_baseline} rss_keygen_mib={rss_after_keygen} \
+         rss_rounds_max_mib={rss_rounds_max} peak_rss_mib={} failures=0 {list_sizes} \
          sign_cpu_med_ms={sign_cpu_med:.3} sign_cpu_total_ms={sign_cpu_total:.3}",
         support::milliseconds(keygen_time),
         sign.count,
@@ -75,6 +75,6 @@ fn main() {
         sign.min,
         sign.max,
         sign.total,
-        support::rss_mb("VmHWM:")
+        support::rss_mib("VmHWM:")
     );
 }

@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::mem::{peak_rss_mib, rss_now_mib};
 use decentralized_root_of_trust::bench::stats::median_usize;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
 use decentralized_root_of_trust::node::snark_verifier::PQSNARKVerifierModule;
@@ -139,7 +139,7 @@ fn make_signed_proof(
 }
 
 fn main() {
-    let rss_baseline = rss_now_mb();
+    let rss_baseline = rss_now_mib();
 
     // Setup is called directly rather than through the modules, because timing the
     // two phases *apart* is why this binary exists: `setup_verifier` is the bytecode
@@ -155,7 +155,7 @@ fn main() {
     setup_prover();
     let setup_prover_extra = t_p.elapsed();
     let setup_prover_total = setup_verifier_time + setup_prover_extra;
-    let rss_after_setup = rss_now_mb();
+    let rss_after_setup = rss_now_mib();
 
     let mut rng = rand::rng();
     let mut xmss_rng = leanvm::rand::rng();
@@ -221,14 +221,14 @@ fn main() {
             list.clone(),
             version,
         );
-        let rss = rss_now_mb();
+        let rss = rss_now_mib();
         rss_updates_max = rss_updates_max.max(rss);
         // The signer window as a range rather than one character per member: at
         // N=200 the old `b'A' + index` mapping ran off the printable range into
         // Latin-1 and C1 control codes, and past N_UPDATES = 64 it would have
         // overflowed the u8 outright: a panic in debug, a silent wrap in release.
         println!(
-            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  prove={:>8.1?}  verify={:>8.1?}  RAM={} MB  OK",
+            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  prove={:>8.1?}  verify={:>8.1?}  RAM={} MiB  OK",
             i + 1,
             N_UPDATES,
             signers[0],
@@ -313,7 +313,7 @@ fn main() {
     let sec_ok = tamper_rejected && outsider_rejected && version_rejected;
 
     // summary
-    let rss_peak = peak_rss_mb();
+    let rss_peak = peak_rss_mib();
     let (pv_min, pv_med, pv_max) = dur_stats(&prove_ts);
     let (vf_min, vf_med, vf_max) = dur_stats(&verify_ts);
     let proof_med = median_usize(&proof_sizes);
@@ -337,13 +337,13 @@ fn main() {
     println!("total {N_UPDATES} updates : {updates_total:.2?}");
 
     println!(" RAM ");
-    println!("baseline (pre-setup)   : {rss_baseline} MB");
-    println!("after setup (resident) : {rss_after_setup} MB");
-    println!("max during updates     : {rss_updates_max} MB");
-    println!("peak (VmHWM)           : {rss_peak} MB");
+    println!("baseline (pre-setup)   : {rss_baseline} MiB");
+    println!("after setup (resident) : {rss_after_setup} MiB");
+    println!("max during updates     : {rss_updates_max} MiB");
+    println!("peak (VmHWM)           : {rss_peak} MiB");
 
     // BENCH: ONE line, space-separated key=value fields, read by benchmark.sh.
-    // Units: *_ms in ms, *_bytes in bytes, *_mb in MB, sec_ok in {0,1}.
+    // Units: *_ms in ms, *_bytes in bytes, *_mib in MiB, sec_ok in {0,1}.
     //
     // `updates_total_ms` is the wall clock of the whole loop: sign, prove, verify,
     // the RSS reads and the printing. It is NOT comparable with the prover's
@@ -365,9 +365,9 @@ fn main() {
         format!("upd_verify_total_ms={:.3}", sum_ms(&verify_ts)),
         format!("updates_total_ms={:.3}", ms(updates_total)),
         format!("proof_med_bytes={proof_med:.3}"),
-        format!("rss_setup_mb={rss_after_setup}"),
-        format!("rss_updates_max_mb={rss_updates_max}"),
-        format!("peak_rss_mb={rss_peak}"),
+        format!("rss_setup_mib={rss_after_setup}"),
+        format!("rss_updates_max_mib={rss_updates_max}"),
+        format!("peak_rss_mib={rss_peak}"),
         format!("sec_ok={}", sec_ok as u8),
     ]
     .join(" ");

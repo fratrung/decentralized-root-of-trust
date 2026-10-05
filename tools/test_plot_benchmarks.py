@@ -128,8 +128,8 @@ class PlotBenchmarksTest(unittest.TestCase):
                       "snark_decode_verify_ms", "raw_decode_verify_ms",
                       "mldsa_decode_verify_ms", "snark_record_bytes",
                       "raw_record_bytes", "mldsa_record_bytes",
-                      "prover_peak_mb", "snark_verifier_peak_mb",
-                      "raw_verifier_peak_mb", "mldsa_verifier_peak_mb",
+                      "prover_peak_mib", "snark_verifier_peak_mib",
+                      "raw_verifier_peak_mib", "mldsa_verifier_peak_mib",
                       "verify_advantage_confirmed", "break_even_elapsed_median",
                       "verify_delta_mean_ms", "verify_delta_ci95_low",
                       "verify_delta_ci95_high", "wire_reduction_pct")
@@ -138,8 +138,8 @@ class PlotBenchmarksTest(unittest.TestCase):
                         snark_decode_verify_ms="2", raw_decode_verify_ms="1",
                         mldsa_decode_verify_ms="1.5", snark_record_bytes="4000",
                         raw_record_bytes="5000", mldsa_record_bytes="9000",
-                        prover_peak_mb="700", snark_verifier_peak_mb="100",
-                        raw_verifier_peak_mb="3", mldsa_verifier_peak_mb="4",
+                        prover_peak_mib="700", snark_verifier_peak_mib="100",
+                        raw_verifier_peak_mib="3", mldsa_verifier_peak_mib="4",
                         verify_advantage_confirmed="0", verify_delta_mean_ms="-1",
                         verify_delta_ci95_low="-1.2", verify_delta_ci95_high="-0.8",
                         wire_reduction_pct="20")
@@ -179,8 +179,8 @@ class PlotBenchmarksTest(unittest.TestCase):
                   "snark_decode_verify_ms", "raw_decode_verify_ms",
                   "mldsa_decode_verify_ms", "snark_record_bytes",
                   "raw_record_bytes", "mldsa_record_bytes",
-                  "prover_peak_mb", "snark_verifier_peak_mb",
-                  "raw_verifier_peak_mb", "mldsa_verifier_peak_mb",
+                  "prover_peak_mib", "snark_verifier_peak_mib",
+                  "raw_verifier_peak_mib", "mldsa_verifier_peak_mib",
                   "verify_advantage_confirmed", "break_even_elapsed_median",
                   "verify_delta_mean_ms", "verify_delta_ci95_low",
                   "verify_delta_ci95_high", "wire_reduction_pct", "peak_rss_source")
@@ -189,8 +189,8 @@ class PlotBenchmarksTest(unittest.TestCase):
                    snark_decode_verify_ms="2", raw_decode_verify_ms="1",
                    mldsa_decode_verify_ms="1.5", snark_record_bytes="4000",
                    raw_record_bytes="5000", mldsa_record_bytes="9000",
-                   prover_peak_mb="700", snark_verifier_peak_mb="100",
-                   raw_verifier_peak_mb="3", mldsa_verifier_peak_mb="4",
+                   prover_peak_mib="700", snark_verifier_peak_mib="100",
+                   raw_verifier_peak_mib="3", mldsa_verifier_peak_mib="4",
                    verify_advantage_confirmed="0", verify_delta_mean_ms="-1",
                    wire_reduction_pct="20", peak_rss_source="vmhwm")
         with tempfile.TemporaryDirectory() as temporary:
@@ -201,7 +201,7 @@ class PlotBenchmarksTest(unittest.TestCase):
             self.assertIn("| vmhwm |", (folder / "plots/overview.md").read_text(encoding="utf-8"))
             self.assertIn("process VmHWM",
                           (folder / "plots/memory_scaling.svg").read_text(encoding="utf-8"))
-        for change in ({"raw_verifier_peak_mb": "0"}, {"peak_rss_source": "guess"}):
+        for change in ({"raw_verifier_peak_mib": "0"}, {"peak_rss_source": "guess"}):
             with tempfile.TemporaryDirectory() as temporary:
                 folder = Path(temporary)
                 write_csv(folder / "scaling.csv", fields, [dict(row, **change)])

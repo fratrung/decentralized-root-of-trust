@@ -386,8 +386,8 @@ def scaling_campaign(folder: Path, output: Path) -> list[Path]:
         seen.add((n, t))
         required_positive = ("prove_ms", "snark_decode_verify_ms", "raw_decode_verify_ms",
                              "mldsa_decode_verify_ms", "snark_record_bytes", "raw_record_bytes",
-                             "mldsa_record_bytes", "prover_peak_mb", "snark_verifier_peak_mb",
-                             "raw_verifier_peak_mb", "mldsa_verifier_peak_mb")
+                             "mldsa_record_bytes", "prover_peak_mib", "snark_verifier_peak_mib",
+                             "raw_verifier_peak_mib", "mldsa_verifier_peak_mib")
         for field in required_positive:
             if value(row, field, positive=True) is None:
                 raise ValueError(f"{source}: missing {field} at N={int(n)}, t={int(t)}")
@@ -434,10 +434,10 @@ def scaling_campaign(folder: Path, output: Path) -> list[Path]:
                      + ("; sources differ between points" if len(sources) > 1 else "")
                      + "; not a capacity bound")
     chart("memory_scaling.svg", "Peak process RSS by role", peak_subtitle, "MiB", [
-        ("Prover", "prover_peak_mb", COLORS["prover"]),
-        ("SNARK verifier", "snark_verifier_peak_mb", COLORS["verifier"]),
-        ("XMSS raw verifier", "raw_verifier_peak_mb", COLORS["raw_agg"]),
-        ("ML-DSA raw verifier", "mldsa_verifier_peak_mb", COLORS["mldsa_raw_agg"]),
+        ("Prover", "prover_peak_mib", COLORS["prover"]),
+        ("SNARK verifier", "snark_verifier_peak_mib", COLORS["verifier"]),
+        ("XMSS raw verifier", "raw_verifier_peak_mib", COLORS["raw_agg"]),
+        ("ML-DSA raw verifier", "mldsa_verifier_peak_mib", COLORS["mldsa_raw_agg"]),
     ])
     confirmed = [row for row in data if row["verify_advantage_confirmed"] == "1"
                  and value(row, "break_even_elapsed_median", positive=True) is not None]
@@ -497,8 +497,8 @@ def scaling_campaign(folder: Path, output: Path) -> list[Path]:
                       "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"])
         for row in data:
             fields = ("snark_record_bytes", "raw_record_bytes", "mldsa_record_bytes",
-                      "wire_reduction_pct", "prove_ms", "prover_peak_mb", "snark_verifier_peak_mb",
-                      "raw_verifier_peak_mb", "mldsa_verifier_peak_mb")
+                      "wire_reduction_pct", "prove_ms", "prover_peak_mib", "snark_verifier_peak_mib",
+                      "raw_verifier_peak_mib", "mldsa_verifier_peak_mib")
             units = ("bytes", "bytes", "bytes", "%", "ms", "MiB", "MiB", "MiB", "MiB")
             values = [shown(value(row, field), unit) for field, unit in zip(fields, units)]
             lines.append(f'| {row["n"]} | {row["t"]} | ' + " | ".join(values)

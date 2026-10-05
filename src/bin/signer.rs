@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::mem::{peak_rss_mib, rss_now_mib};
 use decentralized_root_of_trust::bench::state::signer_state_dir;
 use decentralized_root_of_trust::bench::stats::Series;
 use decentralized_root_of_trust::bench::timing::process_cpu_time;
@@ -55,7 +55,7 @@ fn main() {
         let _ = std::fs::remove_file(p);
     }
 
-    let rss_baseline = rss_now_mb();
+    let rss_baseline = rss_now_mib();
     let mut rng = rand::rng();
     let mut xmss_rng = leanvm::rand::rng();
 
@@ -71,7 +71,7 @@ fn main() {
     let counter =
         AtomicSlotCounter::create(&state, &pk, SLOT, SLOT + KEY_SLOTS).expect("slot state");
     let slot_state_time = t_state.elapsed();
-    let rss_after_keygen = rss_now_mb();
+    let rss_after_keygen = rss_now_mib();
 
     // The anchor is what turns a version into a slot. A member needs nothing else
     // from it to sign, so a one-member committee is enough here: `slot_for` reads
@@ -121,10 +121,10 @@ fn main() {
             failures += 1;
         }
 
-        let rss = rss_now_mb();
+        let rss = rss_now_mib();
         rss_max = rss_max.max(rss);
         println!(
-            "  round {:2}/{}  v{}  slot {}  sign={:>8.1?}  {} B  RAM={} MB",
+            "  round {:2}/{}  v{}  slot {}  sign={:>8.1?}  {} B  RAM={} MiB",
             i + 1,
             N_UPDATES,
             version,
@@ -135,7 +135,7 @@ fn main() {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=signer idx={i} sign_ms={:.3} reserve_ms={:.3} crypto_ms={:.3} bytes={} rss_mb={rss} cpu_ms={sign_cpu:.3}",
+                "SAMPLE target=signer idx={i} sign_ms={:.3} reserve_ms={:.3} crypto_ms={:.3} bytes={} rss_mib={rss} cpu_ms={sign_cpu:.3}",
                 ms(sign_time),
                 ms(phases.reserve),
                 ms(phases.crypto),
@@ -161,10 +161,10 @@ fn main() {
     println!("sign     : {sg_min:.2} / {sg_med:.2} / {sg_max:.2} ms   (incl. durable slot burn)");
     println!("signature size         : {} B", SIGNATURE_SSZ_LEN);
     println!("\nRAM (signer process)");
-    println!("baseline (pre-keygen)  : {rss_baseline} MB");
-    println!("after keygen (resident): {rss_after_keygen} MB");
-    println!("max during rounds      : {rss_max} MB");
-    println!("peak (VmHWM)           : {} MB", peak_rss_mb());
+    println!("baseline (pre-keygen)  : {rss_baseline} MiB");
+    println!("after keygen (resident): {rss_after_keygen} MiB");
+    println!("max during rounds      : {rss_max} MiB");
+    println!("peak (VmHWM)           : {} MiB", peak_rss_mib());
 
     println!(
         "\nSIGNER keygen_ms={:.3} slot_state_ms={:.3} n_rounds={} \
@@ -172,7 +172,7 @@ fn main() {
          sign_max_ms={sg_max:.3} sign_total_ms={:.3} \
          reserve_med_ms={:.3} reserve_total_ms={:.3} \
          crypto_med_ms={:.3} crypto_total_ms={:.3} sig_bytes={} \
-         rss_keygen_mb={rss_after_keygen} rss_rounds_max_mb={rss_max} peak_rss_mb={} \
+         rss_keygen_mib={rss_after_keygen} rss_rounds_max_mib={rss_max} peak_rss_mib={} \
          failures={failures} {list_sizes} \
          sign_cpu_med_ms={sign_cpu_med:.3} sign_cpu_total_ms={sign_cpu_total:.3}",
         ms(keygen_time),
@@ -186,7 +186,7 @@ fn main() {
         crypto.median(),
         crypto.sum(),
         SIGNATURE_SSZ_LEN,
-        peak_rss_mb(),
+        peak_rss_mib(),
     );
 
     // The counter dies with the key it belongs to; see the note at the top.

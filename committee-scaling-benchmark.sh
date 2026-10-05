@@ -179,7 +179,7 @@ positive_integer RESERVE_MB "$RESERVE_MB"
 CAP_FROM_TOTAL_MB=$((TOTAL_MB * 70 / 100))
 CAP_FROM_AVAILABLE_MB=$((AVAILABLE_MB - RESERVE_MB))
 if [ "$CAP_FROM_AVAILABLE_MB" -le 0 ]; then
-  echo "insufficient available RAM: ${AVAILABLE_MB} MB available, ${RESERVE_MB} MB reserved" >&2
+  echo "insufficient available RAM: ${AVAILABLE_MB} MiB available, ${RESERVE_MB} MiB reserved" >&2
   exit 1
 fi
 SAFE_MEMORY_LIMIT_MB="$CAP_FROM_TOTAL_MB"
@@ -191,7 +191,7 @@ if [ -n "${MAX_RSS_MB:-}" ]; then
   positive_integer MAX_RSS_MB "$MAX_RSS_MB"
   MEMORY_LIMIT_MB="$MAX_RSS_MB"
   if [ "$MEMORY_LIMIT_MB" -gt "$SAFE_MEMORY_LIMIT_MB" ]; then
-    echo "NOTE: requested MAX_RSS_MB=$MEMORY_LIMIT_MB exceeds the safe host budget; clamping to $SAFE_MEMORY_LIMIT_MB MB"
+    echo "NOTE: requested MAX_RSS_MB=$MEMORY_LIMIT_MB exceeds the safe host budget; clamping to $SAFE_MEMORY_LIMIT_MB MiB"
     MEMORY_LIMIT_MB="$SAFE_MEMORY_LIMIT_MB"
   fi
 else
@@ -201,8 +201,8 @@ fi
 REQUESTED_SIZES=(5 10 100 500 1000 1500)
 SELECTED_SIZES=(5 10 100)
 MAX_SELECTED_N=100
-N500_REASON="usable budget ${MEMORY_LIMIT_MB} MB is below ${RAM_FOR_N500_MB} MB"
-N1000_REASON="usable budget ${MEMORY_LIMIT_MB} MB is below ${RAM_FOR_N1000_MB} MB"
+N500_REASON="usable budget ${MEMORY_LIMIT_MB} MiB is below ${RAM_FOR_N500_MB} MiB"
+N1000_REASON="usable budget ${MEMORY_LIMIT_MB} MiB is below ${RAM_FOR_N1000_MB} MiB"
 N1500_REASON="N=1000 was not admitted"
 if [ "$MEMORY_LIMIT_MB" -ge "$RAM_FOR_N500_MB" ]; then
   SELECTED_SIZES+=(500)
@@ -212,7 +212,7 @@ if [ "$MEMORY_LIMIT_MB" -ge "$RAM_FOR_N500_MB" ]; then
     SELECTED_SIZES+=(1000)
     MAX_SELECTED_N=1000
     N1000_REASON="admitted"
-    N1500_REASON="usable budget ${MEMORY_LIMIT_MB} MB is below ${RAM_FOR_N1500_MB} MB"
+    N1500_REASON="usable budget ${MEMORY_LIMIT_MB} MiB is below ${RAM_FOR_N1500_MB} MiB"
     if [ "$MEMORY_LIMIT_MB" -ge "$RAM_FOR_N1500_MB" ]; then
       SELECTED_SIZES+=(1500)
       MAX_SELECTED_N=1500
@@ -276,7 +276,7 @@ if [ "$RESUME" = 1 ] && [ -f "$CONFIG_FILE" ]; then
   [ "$MAX_SELECTED_N" -ge 1000 ] && required_resume_mb="$RAM_FOR_N1000_MB"
   [ "$MAX_SELECTED_N" -ge 1500 ] && required_resume_mb="$RAM_FOR_N1500_MB"
   if [ "$MEMORY_LIMIT_MB" -lt "$required_resume_mb" ]; then
-    echo "resume refused: current usable RAM cap ${MEMORY_LIMIT_MB} MB is below the ${required_resume_mb} MB admission threshold for N=$MAX_SELECTED_N" >&2
+    echo "resume refused: current usable RAM cap ${MEMORY_LIMIT_MB} MiB is below the ${required_resume_mb} MiB admission threshold for N=$MAX_SELECTED_N" >&2
     exit 1
   fi
   N500_REASON="not admitted in the recorded campaign"
@@ -290,7 +290,7 @@ if [ "$RESUME" = 1 ] && [ -f "$CONFIG_FILE" ]; then
 fi
 
 current_config() {
-  echo "schema=9"
+  echo "schema=10"
   echo "study_mode=$STUDY_MODE"
   echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo n/a)"
   echo "git_dirty=$(test -n "$(git status --porcelain 2>/dev/null)" && echo yes || echo no)"
@@ -362,26 +362,26 @@ decision_tee=(tee "$DECISION_FILE")
   echo "COMMITTEE SCALING — MEMORY ADMISSION DECISION"
   echo "timestamp                 : $(date -Is)"
   echo "host                      : $(hostname)"
-  echo "physical RAM              : $TOTAL_MB MB"
-  echo "available RAM at start    : $AVAILABLE_MB MB"
-  echo "RAM reserved for host     : $RESERVE_MB MB"
-  echo "70% physical-RAM ceiling : $CAP_FROM_TOTAL_MB MB"
-  echo "enforced process-group cap: $MEMORY_LIMIT_MB MB"
-  echo "allowed swap growth       : $MAX_SWAP_GROWTH_MB MB"
+  echo "physical RAM              : $TOTAL_MB MiB"
+  echo "available RAM at start    : $AVAILABLE_MB MiB"
+  echo "RAM reserved for host     : $RESERVE_MB MiB"
+  echo "70% physical-RAM ceiling : $CAP_FROM_TOTAL_MB MiB"
+  echo "enforced process-group cap: $MEMORY_LIMIT_MB MiB"
+  echo "allowed swap growth       : $MAX_SWAP_GROWTH_MB MiB"
   echo "timeout per stage         : $POINT_TIMEOUT_MINUTES minutes"
   echo "cooldown per target       : $COOLDOWN_SECONDS seconds"
   echo "study mode                : $STUDY_MODE"
   echo "status list               : $WORKLOAD_DESC"
   echo "complete sweep repeats    : $SWEEP_REPEATS"
   echo "hard memory backend        : $HARD_LIMIT_BACKEND ($HARD_MEMORY_LIMIT policy)"
-  echo "minimum free disk          : $MIN_FREE_DISK_MB MB on every filesystem used:"
+  echo "minimum free disk          : $MIN_FREE_DISK_MB MiB on every filesystem used:"
   for guarded in "$OUTDIR" "${TMPDIR:-/tmp}" "$SIGNER_STATE_DIR" "${CARGO_TARGET_DIR:-$REPO/target}"; do
     [ -e "$guarded" ] || continue
-    echo "    $(df -Pk "$guarded" | awk 'NR == 2 { printf "%s (%d MB free)", $6, $4 / 1024 }') <- $guarded"
+    echo "    $(df -Pk "$guarded" | awk 'NR == 2 { printf "%s (%d MiB free)", $6, $4 / 1024 }') <- $guarded"
   done
-  echo "N=500 admission threshold : $RAM_FOR_N500_MB MB -> $N500_REASON"
-  echo "N=1000 admission threshold: $RAM_FOR_N1000_MB MB -> $N1000_REASON"
-  echo "N=1500 admission threshold: $RAM_FOR_N1500_MB MB -> $N1500_REASON"
+  echo "N=500 admission threshold : $RAM_FOR_N500_MB MiB -> $N500_REASON"
+  echo "N=1000 admission threshold: $RAM_FOR_N1000_MB MiB -> $N1000_REASON"
+  echo "N=1500 admission threshold: $RAM_FOR_N1500_MB MiB -> $N1500_REASON"
   echo "selected committee sizes  : ${SELECTED_SIZES[*]}"
   echo "selected maximum          : N=$MAX_SELECTED_N"
   echo
@@ -433,7 +433,7 @@ if [ "$PLAN_ONLY" = 1 ]; then
   exit 0
 fi
 
-group_rss_mb() {
+group_rss_mib() {
   ps -eo pgid=,rss= | awk -v group="$1" '$1 + 0 == group { sum += $2 } END { print int((sum + 1023) / 1024) }'
 }
 
@@ -469,7 +469,7 @@ memory_events_now() {
 # Preflight: a filesystem already below the reserve stops the campaign here,
 # before anything is built, and is named.
 if [ "$(disk_available_mb)" -lt "$MIN_FREE_DISK_MB" ]; then
-  echo "preflight: free disk $(disk_available_mb) MB on $(disk_tightest_mount) is below the ${MIN_FREE_DISK_MB} MB reserve; nothing was built" >&2
+  echo "preflight: free disk $(disk_available_mb) MiB on $(disk_tightest_mount) is below the ${MIN_FREE_DISK_MB} MiB reserve; nothing was built" >&2
   exit 1
 fi
 PRESSURE_CSV="$OUTDIR/pressure.csv"
@@ -477,7 +477,7 @@ PRESSURE_CSV="$OUTDIR/pressure.csv"
 # while it ran. A stage can finish under pressure; its timings then include
 # paging, and this is where that shows.
 record_pressure() { # label events_before events_after outcome
-  [ -f "$PRESSURE_CSV" ] || echo 'time,stage,swap_in_pages,swap_out_pages,mem_pressure_us,oom_kills,peak_group_rss_mb,outcome' > "$PRESSURE_CSV"
+  [ -f "$PRESSURE_CSV" ] || echo 'time,stage,swap_in_pages,swap_out_pages,mem_pressure_us,oom_kills,peak_group_rss_mib,outcome' > "$PRESSURE_CSV"
   awk -v now="$(date -Is)" -v label="$1" -v a="$2" -v b="$3" -v peak="$GUARD_PEAK_MB" -v outcome="$4" 'BEGIN {
     split(a, s, " "); split(b, e, " "); gsub(/,/, ";", label)
     printf "%s,%s", now, label
@@ -511,12 +511,12 @@ run_guarded() {
   local -a guarded_cmd
   available_before="$(meminfo_mb MemAvailable)"
   if [ "$available_before" -lt "$RESERVE_MB" ]; then
-    GUARD_REASON="available RAM ${available_before} MB is already below reserve ${RESERVE_MB} MB"
+    GUARD_REASON="available RAM ${available_before} MiB is already below reserve ${RESERVE_MB} MiB"
     return 70
   fi
   disk_before="$(disk_available_mb)"
   if [ "$disk_before" -lt "$MIN_FREE_DISK_MB" ]; then
-    GUARD_REASON="free disk ${disk_before} MB on $(disk_tightest_mount) is below reserve ${MIN_FREE_DISK_MB} MB"
+    GUARD_REASON="free disk ${disk_before} MiB on $(disk_tightest_mount) is below reserve ${MIN_FREE_DISK_MB} MiB"
     return 70
   fi
   events_before="$(memory_events_now)"
@@ -540,7 +540,7 @@ run_guarded() {
   last_report="$start"
 
   while kill -0 "$pid" 2>/dev/null; do
-    rss="$(group_rss_mb "$pgid")"
+    rss="$(group_rss_mib "$pgid")"
     available="$(meminfo_mb MemAvailable)"
     disk_free="$(disk_available_mb)"
     swap_free="$(meminfo_mb SwapFree)"
@@ -550,13 +550,13 @@ run_guarded() {
     now="$(date +%s)"
 
     if [ "$rss" -gt "$MEMORY_LIMIT_MB" ]; then
-      GUARD_REASON="process-group RSS ${rss} MB exceeded cap ${MEMORY_LIMIT_MB} MB"
+      GUARD_REASON="process-group RSS ${rss} MiB exceeded cap ${MEMORY_LIMIT_MB} MiB"
     elif [ "$available" -lt "$RESERVE_MB" ]; then
-      GUARD_REASON="available RAM ${available} MB fell below reserve ${RESERVE_MB} MB"
+      GUARD_REASON="available RAM ${available} MiB fell below reserve ${RESERVE_MB} MiB"
     elif [ "$disk_free" -lt "$MIN_FREE_DISK_MB" ]; then
-      GUARD_REASON="free disk ${disk_free} MB on $(disk_tightest_mount) fell below reserve ${MIN_FREE_DISK_MB} MB"
+      GUARD_REASON="free disk ${disk_free} MiB on $(disk_tightest_mount) fell below reserve ${MIN_FREE_DISK_MB} MiB"
     elif [ "$swap_growth" -gt "$MAX_SWAP_GROWTH_MB" ]; then
-      GUARD_REASON="swap use grew by ${swap_growth} MB (limit ${MAX_SWAP_GROWTH_MB} MB)"
+      GUARD_REASON="swap use grew by ${swap_growth} MiB (limit ${MAX_SWAP_GROWTH_MB} MiB)"
     elif [ $((now - start)) -ge $((POINT_TIMEOUT_MINUTES * 60)) ]; then
       GUARD_REASON="stage exceeded ${POINT_TIMEOUT_MINUTES}-minute timeout"
     fi
@@ -569,7 +569,7 @@ run_guarded() {
       return 70
     fi
     if [ $((now - last_report)) -ge "$PROGRESS_INTERVAL_SECONDS" ]; then
-      printf '[%s] GUARD %-24s RSS=%d/%d MB available=%d MB disk=%d MB swap_delta=%d MB\n' \
+      printf '[%s] GUARD %-24s RSS=%d/%d MiB available=%d MiB disk=%d MiB swap_delta=%d MiB\n' \
         "$(date +%H:%M:%S)" "$label" "$rss" "$MEMORY_LIMIT_MB" "$available" "$disk_free" "$swap_growth"
       last_report="$now"
     fi
@@ -588,7 +588,7 @@ run_guarded() {
     tail -20 "$log" >&2 || true
     return "$rc"
   fi
-  echo "[$(date +%H:%M:%S)] DONE  $label (observed group peak ${GUARD_PEAK_MB} MB)"
+  echo "[$(date +%H:%M:%S)] DONE  $label (observed group peak ${GUARD_PEAK_MB} MiB)"
 }
 
 # status.txt holds the current outcome; status-history.txt keeps every outcome
@@ -749,7 +749,7 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
     echo "POINT $point_name, sweep $sweep/$SWEEP_REPEATS"
     echo "one aggregator, one SNARK verifier, one raw XMSS verifier, one raw ML-DSA verifier"
     echo "quorum policy: t=floor(2N/3)+1 -> t=$t"
-    echo "guard: cgroup/poll RSS <= $MEMORY_LIMIT_MB MB, available >= $RESERVE_MB MB, disk >= $MIN_FREE_DISK_MB MB"
+    echo "guard: cgroup/poll RSS <= $MEMORY_LIMIT_MB MiB, available >= $RESERVE_MB MiB, disk >= $MIN_FREE_DISK_MB MiB"
     echo "======================================================================"
 
     # One frozen, hashed set of binaries per session: the fixtures and every
@@ -949,7 +949,7 @@ paired_values() { # point_dir delta|speedup|break_even|nonpositive
   done
 }
 
-echo 'n,t,observations,prover_setup_ms,prove_ms,snark_decode_verify_ms,raw_decode_verify_ms,verify_delta_mean_ms,verify_delta_ci95_low,verify_delta_ci95_high,verify_advantage_confirmed,verify_speedup_median,verify_speedup_q1,verify_speedup_q3,snark_record_bytes,raw_record_bytes,wire_reduction_pct,break_even_elapsed_median,break_even_elapsed_q1,break_even_elapsed_q3,prover_peak_mb,snark_verifier_peak_mb,raw_verifier_peak_mb,point_dir,mldsa_decode_ms,mldsa_verify_ms,mldsa_decode_verify_ms,mldsa_record_bytes,mldsa_verifier_peak_mb,snark_decode_ms,snark_verify_only_ms,raw_decode_ms,raw_verify_only_ms,peak_rss_source,prover_peak_max_mb,snark_verifier_peak_max_mb,raw_verifier_peak_max_mb,mldsa_verifier_peak_max_mb,prover_work_rss_mb,snark_verifier_work_rss_mb,raw_verifier_work_rss_mb,mldsa_verifier_work_rss_mb,list_entries' > "$SCALING_CSV"
+echo 'n,t,observations,prover_setup_ms,prove_ms,snark_decode_verify_ms,raw_decode_verify_ms,verify_delta_mean_ms,verify_delta_ci95_low,verify_delta_ci95_high,verify_advantage_confirmed,verify_speedup_median,verify_speedup_q1,verify_speedup_q3,snark_record_bytes,raw_record_bytes,wire_reduction_pct,break_even_elapsed_median,break_even_elapsed_q1,break_even_elapsed_q3,prover_peak_mib,snark_verifier_peak_mib,raw_verifier_peak_mib,point_dir,mldsa_decode_ms,mldsa_verify_ms,mldsa_decode_verify_ms,mldsa_record_bytes,mldsa_verifier_peak_mib,snark_decode_ms,snark_verify_only_ms,raw_decode_ms,raw_verify_only_ms,peak_rss_source,prover_peak_max_mib,snark_verifier_peak_max_mib,raw_verifier_peak_max_mib,mldsa_verifier_peak_max_mib,prover_work_rss_mib,snark_verifier_work_rss_mib,raw_verifier_work_rss_mib,mldsa_verifier_work_rss_mib,list_entries' > "$SCALING_CSV"
 for n in "${SELECTED_SIZES[@]}"; do
   t="$(threshold_for "$n")"
   point_name="N$(printf '%04d' "$n")-t$(printf '%04d' "$t")"
@@ -1285,7 +1285,7 @@ fi
   echo "order     : $ROLE_ORDER (plan.csv, schedule.csv and each session's schedule.csv record it)"
   echo "cooldown  : $COOLDOWN_SECONDS seconds before every measured process"
   echo "roles     : two single-member signers; per point, one aggregator and three relying-party verifiers"
-  echo "RAM plan  : ${AVAILABLE_MB} MB initially available; ${MEMORY_LIMIT_MB} MB process cap; selected N<=${MAX_SELECTED_N}"
+  echo "RAM plan  : ${AVAILABLE_MB} MiB initially available; ${MEMORY_LIMIT_MB} MiB process cap; selected N<=${MAX_SELECTED_N}"
   echo "hard cap  : $HARD_LIMIT_BACKEND"
   [ "$STUDY_MODE" = pilot ] && echo "status    : EXPLORATORY PILOT — do not publish as a final measurement campaign"
   echo
@@ -1447,9 +1447,11 @@ fi
   echo "  P + Sp/U + M x (S + Sv/K) < M x R,"
   echo "all in one unit. This report does not choose U, K, M or the unit."
   echo "The paired CIs treat repeated runs as independent within this host and"
-  echo "session; they do not establish an effect across days or machines. all-runs.csv"
-  echo "has every run with its sweep, position and start time for an analysis by"
-  echo "blocks. No timing samples are discarded."
+  echo "session, one comparison at a time; they do not establish an effect across"
+  echo "days or machines. tools/analyze_scaling.py reads all-runs.csv (every run with"
+  echo "its sweep, position and start time) and reports the session effect, the drift"
+  echo "inside sessions, intervals with sessions as blocks and as the unit, and"
+  echo "simultaneous intervals for the whole family. No timing samples are discarded."
   echo
   echo "MEMORY PRESSURE DURING THE CAMPAIGN (pressure.csv; runs.csv has it per run)"
   if [ -s "$PRESSURE_CSV" ]; then

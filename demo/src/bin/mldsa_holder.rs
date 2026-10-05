@@ -3,7 +3,7 @@
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::rss_now_mb;
+use decentralized_root_of_trust::bench::mem::rss_now_mib;
 use decentralized_root_of_trust::node::Outcome;
 use decentralized_root_of_trust::state::freshness::{Decision, HighWaterMark};
 use drot_demo::config::{self, ALL_MEMBER_INDICES, MEMBER_IPS};
@@ -77,14 +77,14 @@ impl Node {
         if let Some(version) = mark.current() {
             println!("node A: resuming; versions through v{version} are stale");
         }
-        let before = rss_now_mb();
+        let before = rss_now_mib();
         let node = Self {
             verifier: RawVerifier::new(committee),
             mark,
         };
         report::rule("verifier startup, ML-DSA raw path");
         println!("  setup                 : none, there is no circuit to load");
-        report::memory("anchor load", before, rss_now_mb());
+        report::memory("anchor load", before, rss_now_mib());
         node
     }
 

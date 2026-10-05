@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::mem::{peak_rss_mib, rss_now_mib};
 use decentralized_root_of_trust::bench::stats::{Series, median_usize};
 use decentralized_root_of_trust::bench::timing::process_cpu_time;
 use decentralized_root_of_trust::bench::workload::ListSizes;
@@ -131,7 +131,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
     if !honest_only {
         require_corpus_quorum();
     }
-    let rss_baseline = rss_now_mb();
+    let rss_baseline = rss_now_mib();
 
     println!("prover: setup (pre-signed fixture input)...");
     let setup_cpu_start = process_cpu_time();
@@ -139,7 +139,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
     let prover = PQSNARKProverModule::init_prover();
     let setup_time = t_setup.elapsed();
     let setup_cpu = ms(process_cpu_time().saturating_sub(setup_cpu_start));
-    let rss_after_setup = rss_now_mb();
+    let rss_after_setup = rss_now_mib();
 
     let committee = load_committee(&fixture_dir.join("anchor.bin"));
     assert_eq!(
@@ -192,10 +192,10 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
             write(outdir, "canonical.bin", &bytes);
         }
 
-        let rss = rss_now_mb();
+        let rss = rss_now_mib();
         rss_updates_max = rss_updates_max.max(rss);
         println!(
-            "  update {:2}/{}  t={}  prove={:>8.1?}  {} B  RAM={} MB",
+            "  update {:2}/{}  t={}  prove={:>8.1?}  {} B  RAM={} MiB",
             index + 1,
             updates.len(),
             T,
@@ -205,7 +205,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=prover idx={index} prove_ms={:.3} bytes={} rss_mb={rss} cpu_ms={prove_cpu:.3}",
+                "SAMPLE target=prover idx={index} prove_ms={:.3} bytes={} rss_mib={rss} cpu_ms={prove_cpu:.3}",
                 ms(prove_time),
                 bytes.len()
             );
@@ -371,15 +371,15 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
     println!("published record size (median): {record_med:.1} bytes");
     println!("\nRAM (aggregator process; no secret keys)");
-    println!("baseline (pre-setup)   : {rss_baseline} MB");
-    println!("after setup (resident) : {rss_after_setup} MB");
-    println!("max during updates     : {rss_updates_max} MB");
-    println!("peak (VmHWM)           : {} MB", peak_rss_mb());
+    println!("baseline (pre-setup)   : {rss_baseline} MiB");
+    println!("after setup (resident) : {rss_after_setup} MiB");
+    println!("max during updates     : {rss_updates_max} MiB");
+    println!("peak (VmHWM)           : {} MiB", peak_rss_mib());
     println!(
         "\nPROVER setup_ms={:.3} n_members={N_MEMBERS} t={T} n_updates={} \
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
          prove_max_ms={pv_max:.3} prove_total_ms={:.3} record_med_bytes={record_med:.3} \
-         rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
+         rss_setup_mib={rss_after_setup} rss_updates_max_mib={rss_updates_max} peak_rss_mib={} \
          fixture_input=1 {list_sizes} setup_cpu_ms={setup_cpu:.3} \
          prove_cpu_med_ms={prove_cpu_med:.3} prove_cpu_total_ms={prove_cpu_total:.3}",
         ms(setup_time),
@@ -387,7 +387,7 @@ fn run_fixture_prover(outdir: &Path, fixture_dir: &Path) {
         prove.mean(),
         prove.stddev(),
         prove.sum(),
-        peak_rss_mb()
+        peak_rss_mib()
     );
 }
 
@@ -470,14 +470,14 @@ fn main() {
     // interactive runs stay readable.
     let emit_samples = std::env::var_os("EMIT_SAMPLES").is_some();
 
-    let rss_baseline = rss_now_mb();
+    let rss_baseline = rss_now_mib();
     println!("prover: setup...");
     let t_setup = Instant::now();
     // `init_prover()` *is* the `setup_prover()` call: the module owns the pairing
     // of setup with proving, which is why the bare call is not made here as well.
     let prover = PQSNARKProverModule::init_prover();
     let setup_time = t_setup.elapsed();
-    let rss_after_setup = rss_now_mb();
+    let rss_after_setup = rss_now_mib();
 
     let mut rng = rand::rng();
     let mut xmss_rng = leanvm::rand::rng();
@@ -569,10 +569,10 @@ fn main() {
             write(outdir, "canonical.bin", &bytes);
         }
 
-        let rss = rss_now_mb();
+        let rss = rss_now_mib();
         rss_updates_max = rss_updates_max.max(rss);
         println!(
-            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  prove={:>8.1?}  {} B  RAM={} MB",
+            "  update {:2}/{}  signers {}..{} ({})  v{}  slot {}  prove={:>8.1?}  {} B  RAM={} MiB",
             i + 1,
             N_UPDATES,
             signers[0],
@@ -587,7 +587,7 @@ fn main() {
         if emit_samples {
             // Tidy per-sample record: one row per update, consumed by benchmark.sh.
             println!(
-                "SAMPLE target=prover idx={i} prove_ms={:.3} bytes={} rss_mb={rss} cpu_ms={prove_cpu:.3}",
+                "SAMPLE target=prover idx={i} prove_ms={:.3} bytes={} rss_mib={rss} cpu_ms={prove_cpu:.3}",
                 ms(prove_time),
                 bytes.len()
             );
@@ -759,17 +759,17 @@ fn main() {
     println!("prove min/med/max      : {pv_min:.1} / {pv_med:.1} / {pv_max:.1} ms");
     println!("published record size (median): {record_med:.1} bytes");
     println!("\nRAM (prover process)");
-    println!("baseline (pre-setup)   : {rss_baseline} MB");
-    println!("after setup (resident) : {rss_after_setup} MB");
-    println!("max during updates     : {rss_updates_max} MB");
-    println!("peak (VmHWM)           : {} MB", peak_rss_mb());
+    println!("baseline (pre-setup)   : {rss_baseline} MiB");
+    println!("after setup (resident) : {rss_after_setup} MiB");
+    println!("max during updates     : {rss_updates_max} MiB");
+    println!("peak (VmHWM)           : {} MiB", peak_rss_mib());
 
     // One-line machine-readable record, parsed by benchmark.sh.
     println!(
         "\nPROVER setup_ms={:.3} keygen_ms={:.3} n_updates={} \
          prove_med_ms={pv_med:.3} prove_mean_ms={:.3} prove_sd_ms={:.3} prove_min_ms={pv_min:.3} \
          prove_max_ms={pv_max:.3} prove_total_ms={:.3} record_med_bytes={record_med:.3} \
-         rss_setup_mb={rss_after_setup} rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
+         rss_setup_mib={rss_after_setup} rss_updates_max_mib={rss_updates_max} peak_rss_mib={} \
          prove_cpu_med_ms={prove_cpu_med:.3} prove_cpu_total_ms={prove_cpu_total:.3}",
         ms(setup_time),
         ms(keygen_time),
@@ -777,6 +777,6 @@ fn main() {
         prove.mean(),
         prove.stddev(),
         prove.sum(),
-        peak_rss_mb()
+        peak_rss_mib()
     );
 }

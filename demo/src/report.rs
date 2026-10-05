@@ -5,7 +5,7 @@
 //! The raw and SNARK demos publish the same list under the same committee, so
 //! putting those two figures side by side is the whole comparison.
 
-use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::mem::{peak_rss_mib, rss_now_mib};
 
 pub fn rule(title: &str) {
     println!("\n=== {title} ===");
@@ -58,10 +58,10 @@ pub fn snark_sizes(record_bytes: usize, entries: usize, proof_bytes: usize, quor
 /// in both demos is what makes that visible rather than asserted.
 pub fn memory(stage: &str, before: u64, after: u64) {
     rule("verifier memory");
-    println!("  RSS before {stage:<11}: {before:>5} MB");
-    println!("  RSS after  {stage:<11}: {after:>5} MB");
-    println!("  RSS now               : {:>5} MB", rss_now_mb());
-    println!("  peak (VmHWM)          : {:>5} MB", peak_rss_mb());
+    println!("  RSS before {stage:<11}: {before:>5} MiB");
+    println!("  RSS after  {stage:<11}: {after:>5} MiB");
+    println!("  RSS now               : {:>5} MiB", rss_now_mib());
+    println!("  peak (VmHWM)          : {:>5} MiB", peak_rss_mib());
 }
 
 /// Where memory stands now, for a verifier whose setup is already behind it.
@@ -71,8 +71,8 @@ pub fn memory(stage: &str, before: u64, after: u64) {
 /// that a resident verifier is cheap and a cold one is not.
 pub fn memory_now() {
     rule("verifier memory");
-    println!("  RSS now               : {:>5} MB", rss_now_mb());
-    println!("  peak (VmHWM)          : {:>5} MB", peak_rss_mb());
+    println!("  RSS now               : {:>5} MiB", rss_now_mib());
+    println!("  peak (VmHWM)          : {:>5} MiB", peak_rss_mib());
 }
 
 fn percent(part: usize, whole: usize) -> f64 {

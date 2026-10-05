@@ -6,8 +6,8 @@
 //! never returns freed memory to the OS and its RSS is monotonically
 //! non-decreasing. A verify-only process keeps the normal malloc policy.
 //!
-//! The values are KiB divided by 1024 and truncated: whole **MiB**, whatever a
-//! field name ending in `_mb` suggests.
+//! The values are KiB divided by 1024 and truncated: whole **MiB**, which is
+//! what the `_mib` suffix of every function and field built on them means.
 //!
 //! A reading that cannot be taken is never reported as 0. On Linux, where the
 //! benchmarks run, an unreadable or malformed `/proc/self/status` stops the
@@ -22,7 +22,7 @@ fn status_kib(status: &str, field: &str) -> Option<u64> {
     value.trim().strip_suffix("kB")?.trim().parse().ok()
 }
 
-fn status_mb(field: &str) -> u64 {
+fn status_mib(field: &str) -> u64 {
     let reading = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| status_kib(&status, field));
@@ -36,13 +36,13 @@ fn status_mb(field: &str) -> u64 {
 }
 
 /// Currently resident memory, in whole MiB.
-pub fn rss_now_mb() -> u64 {
-    status_mb("VmRSS:")
+pub fn rss_now_mib() -> u64 {
+    status_mib("VmRSS:")
 }
 
 /// Peak resident memory since process start, in whole MiB.
-pub fn peak_rss_mb() -> u64 {
-    status_mb("VmHWM:")
+pub fn peak_rss_mib() -> u64 {
+    status_mib("VmHWM:")
 }
 
 #[cfg(test)]
@@ -69,8 +69,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn this_process_has_a_positive_peak_not_below_its_current_rss() {
-        let now = rss_now_mb();
-        let peak = peak_rss_mb();
+        let now = rss_now_mib();
+        let peak = peak_rss_mib();
         assert!(peak >= now, "peak {peak} MiB below current {now} MiB");
         assert!(peak > 0);
     }

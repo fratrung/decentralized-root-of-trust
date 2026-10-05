@@ -148,7 +148,7 @@ pub fn parse_count(text: &str, name: &str, max: usize) -> usize {
     value
 }
 
-pub fn rss_mb(field: &str) -> usize {
+pub fn rss_mib(field: &str) -> usize {
     let status = std::fs::read_to_string("/proc/self/status")
         .expect("benchmark requires Linux /proc/self/status");
     let line = status

@@ -144,7 +144,7 @@ fn main() {
     let ready = support::milliseconds(ready_start.elapsed());
     let ready_cpu =
         support::milliseconds(support::process_cpu_time().saturating_sub(ready_cpu_start));
-    let rss_anchor = support::rss_mb("VmRSS:");
+    let rss_anchor = support::rss_mib("VmRSS:");
     let mut rss_updates_max = rss_anchor;
     let mut decode_samples = Vec::with_capacity(updates);
     let mut verify_samples = Vec::with_capacity(updates);
@@ -173,7 +173,7 @@ fn main() {
         assert!(accepted, "honest fixture failed ML-DSA verification");
         list_sizes.record(record.list().len());
 
-        let rss = support::rss_mb("VmRSS:");
+        let rss = support::rss_mib("VmRSS:");
         rss_updates_max = rss_updates_max.max(rss);
         let decode_ms = support::milliseconds(decode_time);
         let verify_ms = support::milliseconds(verify_time);
@@ -182,7 +182,7 @@ fn main() {
             println!(
                 "SAMPLE target=mldsa_raw_agg idx={index} decode_ms={decode_ms:.3} \
                  verify_ms={verify_ms:.3} total_ms={total_ms:.3} bytes={} \
-                 sig_bytes={SIGNATURE_BYTES} signatures_bytes={} rss_mb={rss} cpu_ms={cpu_ms:.3}",
+                 sig_bytes={SIGNATURE_BYTES} signatures_bytes={} rss_mib={rss} cpu_ms={cpu_ms:.3}",
                 bytes.len(),
                 threshold * SIGNATURE_BYTES
             );
@@ -215,8 +215,8 @@ fn main() {
          total_med_ms={:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
          total_min_ms={:.3} total_max_ms={:.3} total_total_ms={:.3} \
          record_med_bytes={:.3} sig_bytes={SIGNATURE_BYTES} \
-         signatures_bytes={} rss_anchor_mb={rss_anchor} \
-         rss_updates_max_mb={rss_updates_max} peak_rss_mb={} \
+         signatures_bytes={} rss_anchor_mib={rss_anchor} \
+         rss_updates_max_mib={rss_updates_max} peak_rss_mib={} \
          tamper_rejected=1 fixture_input=1 {list_sizes} \
          total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3} \
          ready_ms={ready:.3} ready_cpu_ms={ready_cpu:.3}",
@@ -241,6 +241,6 @@ fn main() {
         total.total,
         size.median,
         threshold * SIGNATURE_BYTES,
-        support::rss_mb("VmHWM:")
+        support::rss_mib("VmHWM:")
     );
 }

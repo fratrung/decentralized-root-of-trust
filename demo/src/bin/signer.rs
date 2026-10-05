@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::rss_now_mb;
+use decentralized_root_of_trust::bench::mem::rss_now_mib;
 use decentralized_root_of_trust::node::raw_verifier::VerifierNode;
 use decentralized_root_of_trust::node::signer::SignerNode;
 use decentralized_root_of_trust::node::snark_prover::PQSNARKProverModule;
@@ -139,7 +139,7 @@ fn main() {
     let prover = OnceLock::new();
     match (mode, can_aggregate) {
         (Mode::Snark, true) => {
-            let before = rss_now_mb();
+            let before = rss_now_mib();
             let started = Instant::now();
             println!(
                 "member {index}: SNARK aggregator role enabled; running setup_prover() before listening"
@@ -147,9 +147,9 @@ fn main() {
             let module = PQSNARKProverModule::init_prover();
             assert!(prover.set(module).is_ok(), "fresh prover slot");
             println!(
-                "member {index}: setup_prover() ready in {:.2?}, RSS {before} MB -> {} MB",
+                "member {index}: setup_prover() ready in {:.2?}, RSS {before} MiB -> {} MiB",
                 started.elapsed(),
-                rss_now_mb()
+                rss_now_mib()
             );
         }
         (Mode::Snark, false) => println!(
@@ -174,10 +174,10 @@ fn main() {
 
     let listener = TcpListener::bind(("0.0.0.0", MEMBER_PORT)).expect("cannot bind");
     println!(
-        "member {index}: ready on {MEMBER_PORT} as {role}, {}-of-{} committee, RSS {} MB\n",
+        "member {index}: ready on {MEMBER_PORT} as {role}, {}-of-{} committee, RSS {} MiB\n",
         THRESHOLD,
         N_MEMBERS,
-        rss_now_mb()
+        rss_now_mib()
     );
 
     for stream in listener.incoming() {
@@ -626,7 +626,7 @@ impl Node {
                 let prover = self.prover.get().ok_or_else(|| {
                     format!("member {} is not a configured SNARK aggregator", self.index)
                 })?;
-                let before = rss_now_mb();
+                let before = rss_now_mib();
 
                 let proving = Instant::now();
                 let proof = prover.make_proof(
@@ -642,10 +642,10 @@ impl Node {
                     proof.len()
                 );
                 println!(
-                    "    prove {:.2?}, RSS {} MB -> {} MB (setup_prover() paid at startup)",
+                    "    prove {:.2?}, RSS {} MiB -> {} MiB (setup_prover() paid at startup)",
                     proving.elapsed(),
                     before,
-                    rss_now_mb()
+                    rss_now_mib()
                 );
                 Ok(
                     SnarkStatusList::new(Algorithms::WotsXmss, list.to_vec(), version, proof)

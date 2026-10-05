@@ -737,13 +737,13 @@ if grep -qw verifier <<<"$TARGETS"; then
       -exec cp -- {} "$OUTDIR/inputs/verifier-corpus/" \;
     echo "  corpus kept in $OUTDIR/inputs/verifier-corpus"
   else
-    echo "  corpus is ${corpus_mb} MB (> KEEP_CORPUS_MAX_MB=$KEEP_CORPUS_MAX_MB): hashes kept in corpus.sha256, records not copied"
+    echo "  corpus is ${corpus_mb} MiB (> KEEP_CORPUS_MAX_MB=$KEEP_CORPUS_MAX_MB): hashes kept in corpus.sha256, records not copied"
   fi
   echo
 fi
 
 # ------------------------------------------------------------ collect ----
-echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
+echo 'target,run,idx,phase,ms,bytes,rss_mib' > "$SAMPLES"
 # `t_start` is epoch seconds at the moment the run was launched. Without it a
 # thermal ramp or a background job is invisible after the fact: you can see that
 # early runs differ from late ones only if run index happens to track time, which
@@ -764,7 +764,7 @@ echo 'target,run,idx,phase,ms,bytes,rss_mb' > "$SAMPLES"
 # the fixed-cost columns comparable across targets: `raw_agg` leaves `setup_ms`
 # empty because it has no circuit, which is the result, rather than borrowing the
 # column for its keygen and making the SNARK look like the cheaper setup.
-echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mb,rss_max_mb,peak_rss_mb,kernel_maxrss_mb,failures,load1_start,load1_end,freq_start_mhz,freq_end_mhz,temp_start_c,temp_end_c,decode_med_ms,decode_mean_ms,decode_sd_ms,decode_min_ms,decode_max_ms,decode_total_ms,decode_verify_med_ms,decode_verify_mean_ms,decode_verify_sd_ms,decode_verify_min_ms,decode_verify_max_ms,decode_verify_total_ms,slot_burn_med_ms,slot_burn_total_ms,sign_crypto_med_ms,sign_crypto_total_ms,wall_s,cpu_user_s,cpu_sys_s,cpu_total_s,major_faults,minor_faults,vol_ctx_switches,invol_ctx_switches,swap_in_pages,swap_out_pages,mem_pressure_us,oom_kills,sign_cpu_med_ms,sign_cpu_total_ms,prove_cpu_med_ms,prove_cpu_total_ms,decode_verify_cpu_med_ms,decode_verify_cpu_total_ms,setup_cpu_ms,ready_ms,ready_cpu_ms' > "$RUNS_CSV"
+echo 'target,run,t_start,setup_ms,keygen_ms,slot_state_ms,n_items,sign_med_ms,sign_mean_ms,sign_sd_ms,sign_min_ms,sign_max_ms,sign_total_ms,prove_med_ms,prove_mean_ms,prove_sd_ms,prove_min_ms,prove_max_ms,prove_total_ms,verify_med_ms,verify_mean_ms,verify_sd_ms,verify_min_ms,verify_max_ms,verify_total_ms,artifact_med_bytes,rss_setup_mib,rss_max_mib,peak_rss_mib,kernel_maxrss_mib,failures,load1_start,load1_end,freq_start_mhz,freq_end_mhz,temp_start_c,temp_end_c,decode_med_ms,decode_mean_ms,decode_sd_ms,decode_min_ms,decode_max_ms,decode_total_ms,decode_verify_med_ms,decode_verify_mean_ms,decode_verify_sd_ms,decode_verify_min_ms,decode_verify_max_ms,decode_verify_total_ms,slot_burn_med_ms,slot_burn_total_ms,sign_crypto_med_ms,sign_crypto_total_ms,wall_s,cpu_user_s,cpu_sys_s,cpu_total_s,major_faults,minor_faults,vol_ctx_switches,invol_ctx_switches,swap_in_pages,swap_out_pages,mem_pressure_us,oom_kills,sign_cpu_med_ms,sign_cpu_total_ms,prove_cpu_med_ms,prove_cpu_total_ms,decode_verify_cpu_med_ms,decode_verify_cpu_total_ms,setup_cpu_ms,ready_ms,ready_cpu_ms' > "$RUNS_CSV"
 
 # Column indices into runs.csv, named once. Every awk gate and every summary row
 # below addresses columns through these, so inserting a column is one edit here
@@ -878,7 +878,7 @@ process_accounting() {
   }'
 }
 
-kernel_maxrss_mb() {
+kernel_maxrss_mib() {
   [ -n "$TIME_BIN" ] || { echo ""; return; }
   # KiB to MiB with one decimal: a raw verifier uses a few MiB, so whole MiB
   # would be too coarse.
@@ -937,7 +937,7 @@ accept_prover_run() { # $1 1-based index within the prover schedule
 
 # Normalise the one-line record each binary emits into a runs.csv row.
 emit_run_row() { # $1 target  $2 run index
-  local target="$1" run="$2" kmax; kmax="$(kernel_maxrss_mb)"
+  local target="$1" run="$2" kmax; kmax="$(kernel_maxrss_mib)"
   local tag
   case "$target" in
     mldsa_signer) tag='^MLDSA_SIGNER ' ;;
@@ -979,7 +979,7 @@ emit_run_row() { # $1 target  $2 run index
       sg_lo=v["sign_min_ms"]; sg_hi=v["sign_max_ms"]; sg_tot=v["sign_total_ms"]
       rb_med=v["reserve_med_ms"]; rb_tot=v["reserve_total_ms"]
       cr_med=v["crypto_med_ms"]; cr_tot=v["crypto_total_ms"]
-      pb=v["sig_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_rounds_max_mb"]; pk=v["peak_rss_mb"]
+      pb=v["sig_bytes"]; rs=v["rss_keygen_mib"]; rm=v["rss_rounds_max_mib"]; pk=v["peak_rss_mib"]
       # Every round self-verifies; a missing key means the run told us nothing.
       f=(v["failures"]=="")?1:v["failures"]
     } else if (t=="mldsa_signer") {
@@ -988,7 +988,7 @@ emit_run_row() { # $1 target  $2 run index
       sg_med=v["sign_med_ms"]; sg_mean=v["sign_mean_ms"]; sg_sd=v["sign_sd_ms"]
       sg_lo=v["sign_min_ms"]; sg_hi=v["sign_max_ms"]; sg_tot=v["sign_total_ms"]
       cr_med=sg_med; cr_tot=sg_tot
-      pb=v["sig_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_rounds_max_mb"]; pk=v["peak_rss_mb"]
+      pb=v["sig_bytes"]; rs=v["rss_keygen_mib"]; rm=v["rss_rounds_max_mib"]; pk=v["peak_rss_mib"]
       f=(v["failures"]=="")?1:v["failures"]
     } else if (t=="prover") {
       # Aggregator. It signs to have something to aggregate, but does not time it:
@@ -996,7 +996,7 @@ emit_run_row() { # $1 target  $2 run index
       setup=v["setup_ms"]; keygen=v["keygen_ms"]; n=v["n_updates"]
       pv_med=v["prove_med_ms"]; pv_mean=v["prove_mean_ms"]; pv_sd=v["prove_sd_ms"]
       pv_lo=v["prove_min_ms"]; pv_hi=v["prove_max_ms"]; pv_tot=v["prove_total_ms"]
-      pb=v["record_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+      pb=v["record_med_bytes"]; rs=v["rss_setup_mib"]; rm=v["rss_updates_max_mib"]; pk=v["peak_rss_mib"]
       # The prover never verifies, so its verdict comes from accept_prover_run.
       # Empty means that check never reported, which is a failure, not a zero.
       f=(pc=="")?1:pc
@@ -1012,7 +1012,7 @@ emit_run_row() { # $1 target  $2 run index
       # An absent `failures=` key yields "", which awk would later coerce to 0 —
       # a silent pass for the one target that reports real accept/reject verdicts.
       # Missing means "this run told us nothing", which is a failure, not a zero.
-      pb=""; rs=v["rss_setup_mb"]; rm=v["rss_verify_max_mb"]; pk=v["peak_rss_mb"]
+      pb=""; rs=v["rss_setup_mib"]; rm=v["rss_verify_max_mib"]; pk=v["peak_rss_mib"]
       f=(v["failures"]=="")?1:v["failures"]
     } else if (t=="raw_agg") {
       # Baseline. `setup` stays EMPTY on purpose: this path builds no circuit, and
@@ -1027,7 +1027,7 @@ emit_run_row() { # $1 target  $2 run index
       dc_lo=v["decode_min_ms"]; dc_hi=v["decode_max_ms"]; dc_tot=v["decode_total_ms"]
       dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
       dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
-      pb=v["record_med_bytes"]; rs=v["rss_keygen_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+      pb=v["record_med_bytes"]; rs=v["rss_keygen_mib"]; rm=v["rss_updates_max_mib"]; pk=v["peak_rss_mib"]
       f=(v["tamper_rejected"]=="1")?0:1
     } else if (t=="mldsa_raw_agg") {
       # Fixture I/O is outside all timed regions. Decode, cryptographic verify,
@@ -1039,7 +1039,7 @@ emit_run_row() { # $1 target  $2 run index
       vf_lo=v["verify_min_ms"]; vf_hi=v["verify_max_ms"]; vf_tot=v["verify_total_ms"]
       dv_med=v["total_med_ms"]; dv_mean=v["total_mean_ms"]; dv_sd=v["total_sd_ms"]
       dv_lo=v["total_min_ms"]; dv_hi=v["total_max_ms"]; dv_tot=v["total_total_ms"]
-      pb=v["record_med_bytes"]; rs=v["rss_anchor_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+      pb=v["record_med_bytes"]; rs=v["rss_anchor_mib"]; rm=v["rss_updates_max_mib"]; pk=v["peak_rss_mib"]
       f=(v["tamper_rejected"]=="1")?0:1
     } else {
       # `updates_total_ms` is the whole loop (sign + prove + verify + printing);
@@ -1050,7 +1050,7 @@ emit_run_row() { # $1 target  $2 run index
       pv_med=v["upd_prove_med_ms"]
       pv_lo=v["upd_prove_min_ms"]; pv_hi=v["upd_prove_max_ms"]; pv_tot=v["upd_prove_total_ms"]
       vf_med=v["upd_verify_med_ms"]; vf_tot=v["upd_verify_total_ms"]
-      pb=v["proof_med_bytes"]; rs=v["rss_setup_mb"]; rm=v["rss_updates_max_mb"]; pk=v["peak_rss_mb"]
+      pb=v["proof_med_bytes"]; rs=v["rss_setup_mib"]; rm=v["rss_updates_max_mib"]; pk=v["peak_rss_mib"]
       f=(v["sec_ok"]=="1")?0:1
     }
     printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
@@ -1070,31 +1070,31 @@ emit_run_row() { # $1 target  $2 run index
     /^SAMPLE / {
       delete v; for (i=2;i<=NF;i++){ split($i,kv,"="); v[kv[1]]=kv[2] }
       if (v["target"]=="signer") {
-        printf "%s,%d,%s,sign_protocol,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,slot_burn,%s,%s,%s\n", t,r,v["idx"],v["reserve_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["crypto_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,sign_protocol_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,sign_protocol,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,slot_burn,%s,%s,%s\n", t,r,v["idx"],v["reserve_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["crypto_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,sign_protocol_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mib"]
       } else if (v["target"]=="mldsa_signer") {
-        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["sig_bytes"],v["rss_mb"]
-        printf "%s,%d,%s,sign_crypto_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["sig_bytes"],v["rss_mb"]
+        printf "%s,%d,%s,sign_crypto,%s,%s,%s\n", t,r,v["idx"],v["sign_ms"],v["sig_bytes"],v["rss_mib"]
+        printf "%s,%d,%s,sign_crypto_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["sig_bytes"],v["rss_mib"]
       } else if (v["target"]=="prover") {
-        printf "%s,%d,%s,prove,%s,%s,%s\n",  t,r,v["idx"],v["prove_ms"], v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,prove_cpu,%s,%s,%s\n",  t,r,v["idx"],v["cpu_ms"], v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,prove,%s,%s,%s\n",  t,r,v["idx"],v["prove_ms"], v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,prove_cpu,%s,%s,%s\n",  t,r,v["idx"],v["cpu_ms"], v["bytes"],v["rss_mib"]
       } else if (v["target"]=="verifier") {
-        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,decode_verify_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,decode_verify_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mib"]
       } else if (v["target"]=="raw_agg") {
-        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,decode_verify_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,decode_verify_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mib"]
       } else if (v["target"]=="mldsa_raw_agg") {
-        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mb"]
-        printf "%s,%d,%s,decode_verify_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mb"]
+        printf "%s,%d,%s,decode,%s,%s,%s\n", t,r,v["idx"],v["decode_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,verify,%s,%s,%s\n", t,r,v["idx"],v["verify_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,decode_verify,%s,%s,%s\n", t,r,v["idx"],v["total_ms"],v["bytes"],v["rss_mib"]
+        printf "%s,%d,%s,decode_verify_cpu,%s,%s,%s\n", t,r,v["idx"],v["cpu_ms"],v["bytes"],v["rss_mib"]
       }
     }' "$SCRATCH/out.txt" >> "$SAMPLES"
 }
@@ -1423,7 +1423,7 @@ for target in "${TARGET_LIST[@]}"; do
     raw_agg|mldsa_raw_agg) emit "$target" record_size bytes "$C_ARTIFACT" ;;
     combined) emit "$target" proof_size     bytes "$C_ARTIFACT" ;;
   esac
-  # KiB / 1024: the unit is MiB, though the runs.csv columns end in `_mb`.
+  # KiB / 1024: MiB, as the `_mib` column names say.
   emit "$target" rss_after_setup  MiB   "$C_RSS_SETUP"
   emit "$target" rss_max          MiB   "$C_RSS_MAX"
   emit "$target" peak_rss_vmhwm   MiB   "$C_PEAK"

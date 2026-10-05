@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use decentralized_root_of_trust::bench::mem::{peak_rss_mb, rss_now_mb};
+use decentralized_root_of_trust::bench::mem::{peak_rss_mib, rss_now_mib};
 use decentralized_root_of_trust::bench::state::signer_state_dir;
 use decentralized_root_of_trust::bench::stats::{Series, median_usize};
 use decentralized_root_of_trust::bench::timing::{
@@ -136,7 +136,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
     let ready = ms(t_ready.elapsed());
     let ready_cpu = ms(process_cpu_time().saturating_sub(ready_cpu_start));
 
-    let rss_after_anchor = rss_now_mb();
+    let rss_after_anchor = rss_now_mib();
     let updates = fixture_files(fixture_dir, "raw-update-");
     assert_eq!(
         updates.len(),
@@ -163,14 +163,14 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         if let Ok(record) = &measured.decoded {
             list_sizes.record(record.list().len());
         }
-        let rss = rss_now_mb();
+        let rss = rss_now_mib();
         rss_updates_max = rss_updates_max.max(rss);
         let (decode_time, verify_only_time, verify_time) =
             (measured.decode, measured.verify, measured.total);
         let cpu = ms(measured.cpu);
         drop(measured);
         println!(
-            "  update {:2}/{}  t={}  verify={:>8.1?}  {} B  RAM={} MB",
+            "  update {:2}/{}  t={}  verify={:>8.1?}  {} B  RAM={} MiB",
             index + 1,
             updates.len(),
             T,
@@ -180,7 +180,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=raw_agg idx={index} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss} cpu_ms={cpu:.3}",
+                "SAMPLE target=raw_agg idx={index} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mib={rss} cpu_ms={cpu:.3}",
                 ms(decode_time),
                 ms(verify_only_time),
                 ms(verify_time),
@@ -265,9 +265,9 @@ fn run_fixture_verifier(fixture_dir: &Path) {
     println!("decode+verify min/med/max: {total_min:.1} / {total_med:.1} / {total_max:.1} ms");
     println!("published record size (median): {record_med:.1} bytes");
     println!("\nRAM (raw verifier process; no secret keys)");
-    println!("after anchor            : {rss_after_anchor} MB");
-    println!("max during updates      : {rss_updates_max} MB");
-    println!("peak (VmHWM)            : {} MB", peak_rss_mb());
+    println!("after anchor            : {rss_after_anchor} MiB");
+    println!("max during updates      : {rss_updates_max} MiB");
+    println!("peak (VmHWM)            : {} MiB", peak_rss_mib());
     println!(
         "\nRAW_AGG n_members={N_MEMBERS} t={T} n_updates={} \
          verify_med_ms={vf_med:.3} verify_mean_ms={:.3} verify_sd_ms={:.3} \
@@ -277,8 +277,8 @@ fn run_fixture_verifier(fixture_dir: &Path) {
          total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
          total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
          per_sig_verify_us={per_signature_us:.3} record_med_bytes={record_med:.3} \
-         rss_keygen_mb={rss_after_anchor} rss_updates_max_mb={rss_updates_max} \
-         peak_rss_mb={} tamper_rejected={} fixture_input=1 {list_sizes} \
+         rss_keygen_mib={rss_after_anchor} rss_updates_max_mib={rss_updates_max} \
+         peak_rss_mib={} tamper_rejected={} fixture_input=1 {list_sizes} \
          total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3} \
          ready_ms={ready:.3} ready_cpu_ms={ready_cpu:.3}",
         verify.len(),
@@ -294,7 +294,7 @@ fn run_fixture_verifier(fixture_dir: &Path) {
         total.mean(),
         total.stddev(),
         total.sum(),
-        peak_rss_mb(),
+        peak_rss_mib(),
         all_rejected as u8,
     );
 
@@ -322,7 +322,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&state_dir);
     std::fs::create_dir_all(&state_dir).expect("cannot create slot state dir");
 
-    let rss_baseline = rss_now_mb();
+    let rss_baseline = rss_now_mib();
 
     // ---- One-time costs: the committee's N keys, and their durable slot state. ----
     //
@@ -352,7 +352,7 @@ fn main() {
         members.push(pk.clone());
         signers.push(SignerNode::new(pk, sk, counter));
     }
-    let rss_after_keygen = rss_now_mb();
+    let rss_after_keygen = rss_now_mib();
 
     // The fixed trust anchor. `SLOT` is the genesis: every round derives its slot
     // from it, so no signer ever chooses one.
@@ -412,14 +412,14 @@ fn main() {
         assert!(measured.accepted, "a legitimate update failed to verify");
         accepted += 1;
 
-        let rss = rss_now_mb();
+        let rss = rss_now_mib();
         rss_updates_max = rss_updates_max.max(rss);
         let (decode_time, verify_only_time, verify_time) =
             (measured.decode, measured.verify, measured.total);
         let cpu = ms(measured.cpu);
         drop(measured);
         println!(
-            "  update {:2}/{}  v{}  slot {}  verify={:>8.1?}  {} B  RAM={} MB",
+            "  update {:2}/{}  v{}  slot {}  verify={:>8.1?}  {} B  RAM={} MiB",
             i + 1,
             N_UPDATES,
             version,
@@ -430,7 +430,7 @@ fn main() {
         );
         if emit_samples {
             println!(
-                "SAMPLE target=raw_agg idx={i} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mb={rss} cpu_ms={cpu:.3}",
+                "SAMPLE target=raw_agg idx={i} decode_ms={:.3} verify_ms={:.3} total_ms={:.3} bytes={} rss_mib={rss} cpu_ms={cpu:.3}",
                 ms(decode_time),
                 ms(verify_only_time),
                 ms(verify_time),
@@ -586,10 +586,10 @@ fn main() {
     println!("published record size (median): {record_med:.1} bytes  ({T} signatures + bitmap)");
 
     println!("\nRAM (raw-multisig process, no SNARK)");
-    println!("baseline (pre-keygen)  : {rss_baseline} MB");
-    println!("after keygen (resident): {rss_after_keygen} MB");
-    println!("max during updates     : {rss_updates_max} MB");
-    println!("peak (VmHWM)           : {} MB", peak_rss_mb());
+    println!("baseline (pre-keygen)  : {rss_baseline} MiB");
+    println!("after keygen (resident): {rss_after_keygen} MiB");
+    println!("max during updates     : {rss_updates_max} MiB");
+    println!("peak (VmHWM)           : {} MiB", peak_rss_mib());
 
     // One-line machine-readable record, same convention as prover.rs / verifier.rs.
     // Phases are carried into runs.csv under their own names (`verify_*`), never
@@ -606,8 +606,8 @@ fn main() {
          total_med_ms={total_med:.3} total_mean_ms={:.3} total_sd_ms={:.3} \
          total_min_ms={total_min:.3} total_max_ms={total_max:.3} total_total_ms={:.3} \
          per_sig_verify_us={per_sig_verify_us:.3} \
-         record_med_bytes={record_med:.3} rss_keygen_mb={rss_after_keygen} \
-         rss_updates_max_mb={rss_updates_max} peak_rss_mb={} tamper_rejected={} \
+         record_med_bytes={record_med:.3} rss_keygen_mib={rss_after_keygen} \
+         rss_updates_max_mib={rss_updates_max} peak_rss_mib={} tamper_rejected={} \
          total_cpu_med_ms={total_cpu_med:.3} total_cpu_total_ms={total_cpu_total:.3}",
         ms(keygen_time),
         ms(slot_state_time),
@@ -624,7 +624,7 @@ fn main() {
         total.mean(),
         total.stddev(),
         total.sum(),
-        peak_rss_mb(),
+        peak_rss_mib(),
         // Must be an integer: benchmark.sh's failure gate tests this field against
         // "1", and a Rust bool would print "true" and score every run as a
         // security-expectation failure. Despite the field's name
