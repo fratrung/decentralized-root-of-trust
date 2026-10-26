@@ -535,7 +535,9 @@ campaign keeps, the scaling orchestrator and the analysis tool) is in
 `docs/agents/benchmarking.md`. **Read it before changing** `benchmark.sh`,
 `committee-scaling-benchmark.sh`, anything under `tools/` or `src/bench/`, or a
 measured binary (`src/bin/`, `mldsa/src/bin/`), and before interpreting their
-output. These rules hold even when that file has not been read:
+output. How to prepare a host and launch a publication campaign without
+exhausting it is in `docs/running-benchmarks.md`. These rules hold even when
+that file has not been read:
 
 - Never run a measured process from `target/release`: every process runs from
   the frozen, hashed copies made by `tools/freeze_bins.sh`.

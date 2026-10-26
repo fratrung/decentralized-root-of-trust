@@ -41,3 +41,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Working note on binding the agreement round into the records: under
+# discussion, kept locally until the design is decided.
+/docs/agreement-round.md

@@ -194,22 +194,23 @@ each key against the committee anchor before accepting the proof.
 
 ## Verification
 
-The SNARK verifier applies these checks in order:
+The SNARK verifier first requires the aggregate to contain exactly one XMSS
+group and no other signature family, then applies five checks in order:
 
-1. the aggregate contains exactly one XMSS group and no other signature family;
-2. every declared signer belongs to the committee;
-3. the aggregate message equals the message recomputed from the record;
-4. the aggregate slot equals `committee.slot_for(version)`;
-5. the signer count reaches the threshold;
-6. the leanVM aggregate proof verifies.
+1. every declared signer belongs to the committee;
+2. the aggregate message equals the message recomputed from the record;
+3. the aggregate slot equals `committee.slot_for(version)`;
+4. the signer count reaches the threshold;
+5. the leanVM aggregate proof verifies.
 
-The raw verifier enforces the equivalent policy:
+The raw verifier enforces the equivalent policy, after refusing a degenerate
+anchor with `t = 0`:
 
 1. the signer bitmap has exactly the committee width;
-2. its population equals the signature count;
-3. the signature count reaches the threshold;
-4. the version maps to a valid slot;
-5. every named committee key verifies its signature over the recomputed message.
+2. the signer count reaches the threshold and equals the signature count;
+3. the version maps to a valid slot;
+4. the message is recomputed from the record;
+5. every named committee key verifies its signature over that message.
 
 Verification authenticates a record but does not establish freshness.
 
@@ -455,6 +456,8 @@ The benchmark harness runs six isolated targets: an XMSS protocol signer, an
 ML-DSA cryptographic signer, the XMSS prover and verifier, and two raw
 relying-party verifiers. ML-DSA signing has no persistent one-statement-per-version
 state yet, so its cost is not a protocol-level equivalent of the XMSS signer.
+[`docs/running-benchmarks.md`](docs/running-benchmarks.md) is the operational
+checklist for running both harnesses for publication on a dedicated host.
 
 ```sh
 ./benchmark.sh
