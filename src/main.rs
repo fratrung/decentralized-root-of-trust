@@ -26,7 +26,6 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-/// (min, median, max) in ms of a series of durations.
 /// `(min, median, max)` in ms. Panics on an empty slice, deliberately and with a
 /// message: an empty series here means the update loop never ran, and reporting
 /// `0.0` for that (as `Series` does) makes a run that measured nothing

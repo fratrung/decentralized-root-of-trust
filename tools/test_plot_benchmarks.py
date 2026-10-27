@@ -40,6 +40,16 @@ def fixed_campaign(folder, status="complete", extra=()):
         (folder / "outputs.sha256").write_text("".join(lines), encoding="utf-8")
 
 
+def seal_aggregates(folder):
+    """Bind the scaling aggregates present, as committee-scaling-benchmark.sh does."""
+    lines = []
+    for name in ("signer.csv", "manifest.csv", "scaling.csv"):
+        if (folder / name).exists():
+            digest = hashlib.sha256((folder / name).read_bytes()).hexdigest()
+            lines.append(f"{digest}  {name}\n")
+    (folder / "aggregates.sha256").write_text("".join(lines), encoding="utf-8")
+
+
 class PlotBenchmarksTest(unittest.TestCase):
     def run_plot(self, folder):
         return subprocess.run(
@@ -155,6 +165,7 @@ class PlotBenchmarksTest(unittest.TestCase):
                 {"n": "100", "t": "67", "status": "not_selected_ram",
                  "reason": "insufficient RAM"},
             ])
+            seal_aggregates(folder)
             result = self.run_plot(folder)
             self.assertEqual(result.returncode, 0, result.stderr)
             text = (folder / "plots/overview.md").read_text(encoding="utf-8")
@@ -170,6 +181,7 @@ class PlotBenchmarksTest(unittest.TestCase):
                 {"n": "5", "t": "4", "status": "complete", "reason": ""},
                 {"n": "10", "t": "7", "status": "unstable", "reason": "drift"},
             ])
+            seal_aggregates(folder)
             rejected = self.run_plot(folder)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("not complete", rejected.stderr)
@@ -196,6 +208,7 @@ class PlotBenchmarksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             write_csv(folder / "scaling.csv", fields, [row])
+            seal_aggregates(folder)
             result = self.run_plot(folder)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("| vmhwm |", (folder / "plots/overview.md").read_text(encoding="utf-8"))
@@ -205,7 +218,84 @@ class PlotBenchmarksTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 folder = Path(temporary)
                 write_csv(folder / "scaling.csv", fields, [dict(row, **change)])
+                seal_aggregates(folder)
                 self.assertNotEqual(self.run_plot(folder).returncode, 0, change)
+
+    def test_scaling_campaign_requires_published_aggregates(self):
+        fields = ("n", "t", "observations", "prove_ms",
+                  "snark_decode_verify_ms", "raw_decode_verify_ms",
+                  "mldsa_decode_verify_ms", "snark_record_bytes",
+                  "raw_record_bytes", "mldsa_record_bytes",
+                  "prover_peak_mib", "snark_verifier_peak_mib",
+                  "raw_verifier_peak_mib", "mldsa_verifier_peak_mib",
+                  "verify_advantage_confirmed", "break_even_elapsed_median")
+        row = dict.fromkeys(fields, "")
+        row.update(n="5", t="4", observations="3", prove_ms="500",
+                   snark_decode_verify_ms="2", raw_decode_verify_ms="1",
+                   mldsa_decode_verify_ms="1.5", snark_record_bytes="4000",
+                   raw_record_bytes="5000", mldsa_record_bytes="9000",
+                   prover_peak_mib="700", snark_verifier_peak_mib="100",
+                   raw_verifier_peak_mib="3", mldsa_verifier_peak_mib="4",
+                   verify_advantage_confirmed="0")
+        manifest = [{"n": "5", "t": "4", "status": "complete", "reason": ""}]
+
+        def published(folder):
+            write_csv(folder / "scaling.csv", fields, [row])
+            write_csv(folder / "manifest.csv", ("n", "t", "status", "reason"), manifest)
+            seal_aggregates(folder)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            published(folder)
+            result = self.run_plot(folder)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        # Interrupted while publishing: no aggregates.sha256 yet.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            published(folder)
+            (folder / "aggregates.sha256").unlink()
+            self.assert_refused(folder, "no aggregates.sha256")
+        # A file truncated or changed after publication.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            published(folder)
+            text = (folder / "scaling.csv").read_text(encoding="utf-8")
+            (folder / "scaling.csv").write_text(text[:-10], encoding="utf-8")
+            self.assert_refused(folder, "a truncated scaling.csv")
+        # An aggregate present on disk but not bound by the manifest.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            published(folder)
+            (folder / "signer.csv").write_text("target,metric,unit,n,median\n", encoding="utf-8")
+            self.assert_refused(folder, "an unbound signer.csv")
+
+    def test_a_zero_is_drawn_at_the_axis_edge_and_a_negative_is_refused(self):
+        def row(target, metric, q1, median, q3):
+            return {"target": target, "metric": metric, "unit": "ms", "n": "24",
+                    "q1": q1, "median": median, "q3": q3}
+        # Q1 = 0 (below the 0.001 ms resolution) and a series that is all zero.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            fixed_campaign(folder, extra=[row("raw_agg", "decode_per_item", "0", "0.002", "0.003"),
+                                          row("verifier", "decode_per_item", "0", "0", "0")])
+            result = self.run_plot(folder)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            figure = (folder / "plots/verification_phases.svg").read_text(encoding="utf-8")
+            ET.fromstring(figure)
+            self.assertIn("XMSS raw decode", figure)
+            self.assertIn("SNARK decode", figure)
+            self.assertIn('stroke-dasharray="4 5"', figure)
+            self.assertIn('fill="#ffffff"', figure)
+            self.assertIn("no logarithmic position", figure)
+            self.assertIn("| `decode_per_item` | 24 | 0.000 | 0.000–0.000 | ms |",
+                          (folder / "plots/overview.md").read_text(encoding="utf-8"))
+            # Figures without a zero carry no note about one.
+            self.assertNotIn("no logarithmic position",
+                             (folder / "plots/verification.svg").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            fixed_campaign(folder, extra=[row("raw_agg", "decode_per_item", "-0.001", "0.002", "0.003")])
+            self.assert_refused(folder, "a negative duration")
 
 
 if __name__ == "__main__":

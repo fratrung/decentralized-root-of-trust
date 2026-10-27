@@ -233,7 +233,15 @@ cat OUTDIR/status.txt                                   # complete + campaign id
 (cd OUTDIR && sha256sum --quiet -c outputs.sha256 && echo verified)
 ```
 
-For a scaling campaign also read `report.txt`, `manifest.csv` (every point
+For a scaling campaign also check the campaign-level files, which the last
+invocation published together (without `aggregates.sha256` it stopped while
+publishing: rerun it with `RESUME=1`, which measures nothing again):
+
+```sh
+(cd committee-scaling-L1000 && sha256sum --quiet -c aggregates.sha256 && echo verified)
+```
+
+Then read `report.txt`, `manifest.csv` (every point
 and why it stopped, if it did) and the per-session `drift.csv`; a session
 with an early/late shift above 15% is withheld, never trimmed. Then run the
 analysis that the report's intervals leave out (session effect, drift,

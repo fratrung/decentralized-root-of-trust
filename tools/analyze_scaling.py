@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import math
 import sys
 from pathlib import Path
@@ -235,11 +236,32 @@ def sign(bounds) -> str:
 
 
 # -------------------------------------------------------------------- input --
+def require_published(campaign: Path, name: str) -> None:
+    """Refuse an aggregate that the campaign's aggregates.sha256 does not bind.
+
+    The harness writes aggregates.sha256 only after every campaign-level file
+    is in place, so without it an invocation stopped while publishing and the
+    file may be truncated; a different hash means it changed afterwards.
+    """
+    manifest = campaign / "aggregates.sha256"
+    if not manifest.is_file():
+        raise ValueError(f"{campaign}: no aggregates.sha256; the scaling files were not "
+                         "published completely, rerun the campaign with RESUME=1")
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, separator, listed = line.partition("  ")
+        if separator and listed == name:
+            if hashlib.sha256((campaign / name).read_bytes()).hexdigest() != digest:
+                raise ValueError(f"{campaign / name} does not match aggregates.sha256")
+            return
+    raise ValueError(f"{manifest}: {name} is not covered")
+
+
 def load(campaign: Path):
     """Read all-runs.csv into {n: {sweep: {target: {run: row}}}} and check it is balanced."""
     source = campaign / "all-runs.csv"
     if not source.is_file():
         raise ValueError(f"{source} not found: not a committee-scaling campaign with completed points")
+    require_published(campaign, source.name)
     with source.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         needed = {"n", "t", "list_entries", "sweep", "sweep_direction", "target", "run", "t_start",

@@ -8,6 +8,7 @@ tools/stats.awk, which the harness uses for the same interval.
 """
 
 import csv
+import hashlib
 import math
 import subprocess
 import sys
@@ -42,7 +43,14 @@ def campaign(folder: Path, values, sizes=(5, 10), sweeps=2, runs=4, drop=None) -
                         verify = ("", "") if target == "prover" else (elapsed, elapsed)
                         writer.writerow([n, 2 * n // 3 + 1, 1000, sweep, direction, 1, target, run, start,
                                          *(f"{v:.6f}" if v != "" else "" for v in (*prove, *verify))])
+    seal(folder)
     return folder
+
+
+def seal(folder: Path) -> None:
+    """Bind all-runs.csv the way the harness publishes it."""
+    digest = hashlib.sha256((folder / "all-runs.csv").read_bytes()).hexdigest()
+    (folder / "aggregates.sha256").write_text(f"{digest}  all-runs.csv\n", encoding="utf-8")
 
 
 def base(n, sweep, target, run):
@@ -208,6 +216,32 @@ class Campaigns(unittest.TestCase):
             done = subprocess.run([sys.executable, script, scratch], text=True, capture_output=True)
             self.assertEqual(done.returncode, 1)
             self.assertIn("all-runs.csv", done.stderr)
+
+    def test_unpublished_or_altered_runs_are_refused(self):
+        script = str(TOOLS / "analyze_scaling.py")
+        # No aggregates.sha256: the harness stopped while publishing.
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = campaign(Path(scratch), base)
+            (folder / "aggregates.sha256").unlink()
+            done = subprocess.run([sys.executable, script, str(folder)], text=True, capture_output=True)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn("no aggregates.sha256", done.stderr)
+            self.assertFalse((folder / "analysis").exists())
+        # A file changed after publication, here one run cut off at the end.
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = campaign(Path(scratch), base)
+            text = (folder / "all-runs.csv").read_text(encoding="utf-8")
+            (folder / "all-runs.csv").write_text(text[:-20], encoding="utf-8")
+            done = subprocess.run([sys.executable, script, str(folder)], text=True, capture_output=True)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn("does not match aggregates.sha256", done.stderr)
+        # A manifest that does not list the file binds nothing about it.
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = campaign(Path(scratch), base)
+            (folder / "aggregates.sha256").write_text("", encoding="utf-8")
+            done = subprocess.run([sys.executable, script, str(folder)], text=True, capture_output=True)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn("all-runs.csv is not covered", done.stderr)
 
 
 if __name__ == "__main__":

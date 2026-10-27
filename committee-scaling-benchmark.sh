@@ -245,19 +245,25 @@ fi
 mkdir -p "$OUTDIR"
 DECISION_FILE="$OUTDIR/memory-decision.txt"
 CONFIG_FILE="$OUTDIR/campaign-config.txt"
-MANIFEST="$OUTDIR/manifest.csv"
-SCALING_CSV="$OUTDIR/scaling.csv"
+# The campaign-level files are rebuilt by every invocation from the validated
+# sessions. They are written into AGGREGATE_STAGE and published together at the
+# end, bound by aggregates.sha256 (see "publish"), so these paths name the
+# staged copies.
+AGGREGATE_STAGE="$OUTDIR/.aggregates.partial"
+AGGREGATES=(signer.csv manifest.csv scaling.csv costs.csv comparisons.csv all-runs.csv report.txt)
+MANIFEST="$AGGREGATE_STAGE/manifest.csv"
+SCALING_CSV="$AGGREGATE_STAGE/scaling.csv"
 # Tidy companions of scaling.csv (see the aggregation section):
 #   costs.csv        elapsed and CPU cost of every role, per update and once per process
 #   comparisons.csv  paired differences between the three verifiers, on both clocks
 #   all-runs.csv     every measured run of every session, with its place in the campaign
-COSTS_CSV="$OUTDIR/costs.csv"
-COMPARISONS_CSV="$OUTDIR/comparisons.csv"
-ALL_RUNS_CSV="$OUTDIR/all-runs.csv"
-REPORT="$OUTDIR/report.txt"
+COSTS_CSV="$AGGREGATE_STAGE/costs.csv"
+COMPARISONS_CSV="$AGGREGATE_STAGE/comparisons.csv"
+ALL_RUNS_CSV="$AGGREGATE_STAGE/all-runs.csv"
+REPORT="$AGGREGATE_STAGE/report.txt"
 SIGNER_DIR="$OUTDIR/signer"
 SIGNER_BENCHMARK_DIR="$SIGNER_DIR/benchmark"
-SIGNER_CSV="$OUTDIR/signer.csv"
+SIGNER_CSV="$AGGREGATE_STAGE/signer.csv"
 
 # Resume the original N decision. The hard cap is recalculated from current
 # availability because it is a safety ceiling, not a treatment variable. A
@@ -607,11 +613,42 @@ log_event() { # directory event detail
   printf '%s,%s,%s,%s\n' "$(date -Is)" "${1#"$OUTDIR"/}" "$2" "${3//,/;}" >> "$SCHEDULE_CSV"
 }
 
+# Every CSV this script reads is written by benchmark.sh, so its columns are
+# found by header name, never copied as positions: a column inserted there would
+# otherwise shift each figure below onto its neighbour without any error.
+# Prefix an awk program with this and list the header names it reads in
+# `names`: each maps to `col[name]`, the header line is skipped, and a missing
+# name stops awk with status 2 before any other END block runs.
+CSV_COLUMNS='
+FNR == 1 {
+  split(names, wanted, " ")
+  for (i = 1; i <= NF; i++) at[$i] = i
+  for (j in wanted) {
+    if (!(wanted[j] in at)) {
+      printf "%s: no column %s\n", FILENAME, wanted[j] > "/dev/stderr"
+      missing = 1; exit 2
+    }
+    col[wanted[j]] = at[wanted[j]]
+  }
+  next
+}
+END { if (missing) exit 2 }
+'
+
 summary_value() {
   local file="$1" target="$2" metric="$3"
-  awk -F, -v target="$target" -v metric="$metric" '
-    NR > 1 && $1 == target && $2 == metric { print $7; exit }
+  awk -F, -v target="$target" -v metric="$metric" -v names=median "$CSV_COLUMNS"'
+    $1 == target && $2 == metric { print $(col["median"]); exit }
   ' "$file"
+}
+
+# Whether drift.csv flags a warning. One it cannot read counts as flagged, so
+# the stationarity gate fails closed.
+drift_warned() { # drift.csv
+  local rc=0
+  awk -F, -v names=status "$CSV_COLUMNS"'
+    $(col["status"]) == "warning" { bad = 1 } END { exit !bad }' "$1" || rc=$?
+  [ "$rc" -ne 1 ]
 }
 
 summary_rss() {
@@ -637,9 +674,10 @@ validate_campaign() { # directory, space-separated targets
       "$dir/runs.csv" "$dir/samples.csv"
 }
 
-# benchmark.sh requires a new or empty OUTDIR. A retried stage keeps its
-# previous attempt under a new name instead of overwriting it; the aggregation
-# globs (session-*/benchmark/) never read those.
+# benchmark.sh requires a new or empty OUTDIR, and freeze_bins.sh refuses to
+# overwrite a binary. A retried stage keeps its previous attempt under a new
+# name instead of deleting it; the aggregation globs (session-*/benchmark/)
+# never read those.
 set_aside_attempt() { # directory
   local dir="$1" kept
   [ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
@@ -686,7 +724,7 @@ elif set_aside_attempt "$SIGNER_BENCHMARK_DIR" &&
       write_status "$SIGNER_DIR" "benchmark_failed" "benchmark.sh produced no drift.csv"
       STOP_FURTHER=1; STOP_REASON="single-member signer benchmark produced no drift diagnostic"; OVERALL_STATUS=1
     elif [ "$STUDY_MODE" = publication ] &&
-       awk -F, 'NR>1 && $8=="warning" {bad=1} END{exit !bad}' "$SIGNER_BENCHMARK_DIR/drift.csv"; then
+       drift_warned "$SIGNER_BENCHMARK_DIR/drift.csv"; then
       write_status "$SIGNER_DIR" unstable "early/late drift exceeded 15%"
       STOP_FURTHER=1; STOP_REASON="signer campaign was not stationary"; OVERALL_STATUS=2
     else
@@ -755,9 +793,10 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
     # One frozen, hashed set of binaries per session: the fixtures and every
     # measured process of this session run from it, never from target/release,
     # which Cargo may not have written and a later build would overwrite. A
-    # retried session replaces its own set. See tools/freeze_bins.sh.
+    # retried session keeps the previous set beside its benchmark.attempt-*,
+    # as the record of what that attempt ran. See tools/freeze_bins.sh.
     session_bin="$session_dir/bin"
-    rm -rf "$session_bin"
+    set_aside_attempt "$session_bin"
     if ! run_guarded "$point_name/s$sweep build" "$session_dir/build.log" \
         env DROT_BENCH_N="$n" DROT_BENCH_T="$t" "$REPO/tools/freeze_bins.sh" "$session_bin" \
         "$REPO/Cargo.toml" prover verifier raw_agg committee_fixture check_prover_output; then
@@ -830,7 +869,7 @@ for ((sweep=1; sweep<=SWEEP_REPEATS; sweep++)); do
       continue
     fi
     if [ "$STUDY_MODE" = publication ] &&
-       awk -F, 'NR>1 && $8=="warning" {bad=1} END{exit !bad}' "$benchmark_dir/drift.csv"; then
+       drift_warned "$benchmark_dir/drift.csv"; then
       write_status "$session_dir" unstable "early/late drift exceeded 15%; no observations removed"
       STOP_FURTHER=1; STOP_REASON="$point_name session $sweep was not stationary"; OVERALL_STATUS=2
       continue
@@ -876,6 +915,11 @@ for n in "${SELECTED_SIZES[@]}"; do
   fi
 done
 
+# ----------------------------------------------------------- aggregation ----
+# A stage left by an interrupted invocation is reused: every aggregate below is
+# first written with `>`, so nothing the stage held survives into this set.
+mkdir -p "$AGGREGATE_STAGE"
+
 # Lift the signer rows to the campaign root. They deliberately remain separate
 # from scaling.csv, whose rows each describe one (N,t) point.
 if [ -f "$SIGNER_DIR/status.txt" ] &&
@@ -920,11 +964,12 @@ done
 # cannot be estimated (see tools/stats.awk).
 stats() { sort -g | awk -f "$REPO/tools/stats.awk"; }
 
-point_values() { # point_dir target column
+point_values() { # point_dir target runs.csv_column
   local point_dir="$1" target="$2" column="$3" file
   for file in "$point_dir"/session-*/benchmark/runs.csv; do
     [ -f "$file" ] || continue
-    awk -F, -v t="$target" -v c="$column" 'NR>1 && $1==t && $c!="" {print $c}' "$file"
+    awk -F, -v t="$target" -v names="$column" "$CSV_COLUMNS"'
+      $1==t && $(col[names])!="" {print $(col[names])}' "$file" || return 1
   done
 }
 
@@ -932,10 +977,10 @@ paired_values() { # point_dir delta|speedup|break_even|nonpositive
   local point_dir="$1" mode="$2" file
   for file in "$point_dir"/session-*/benchmark/runs.csv; do
     [ -f "$file" ] || continue
-    awk -F, -v mode="$mode" '
-      NR>1 && $1=="prover"   {p[$2]=$14}
-      NR>1 && $1=="verifier" {v[$2]=$44}
-      NR>1 && $1=="raw_agg"  {r[$2]=$44}
+    awk -F, -v mode="$mode" -v names="prove_med_ms decode_verify_med_ms" "$CSV_COLUMNS"'
+      $1=="prover"   {p[$2]=$(col["prove_med_ms"])}
+      $1=="verifier" {v[$2]=$(col["decode_verify_med_ms"])}
+      $1=="raw_agg"  {r[$2]=$(col["decode_verify_med_ms"])}
       END {for(i in p) if((i in v)&&(i in r)) {
         d=r[i]-v[i]
         if(mode=="delta") print d
@@ -945,7 +990,7 @@ paired_values() { # point_dir delta|speedup|break_even|nonpositive
           print ceiling
         }
         else if(mode=="nonpositive" && d<=0) print 1
-      }}' "$file"
+      }}' "$file" || return 1
   done
 }
 
@@ -957,41 +1002,41 @@ for n in "${SELECTED_SIZES[@]}"; do
   [ -f "$point_dir/status.txt" ] || continue
   [ "$(sed -n '1p' "$point_dir/status.txt")" = complete ] || continue
 
-  setup_stats="$(point_values "$point_dir" prover 4 | stats)"
-  prove_stats="$(point_values "$point_dir" prover 14 | stats)"
-  sv_stats="$(point_values "$point_dir" verifier 44 | stats)"
-  rv_stats="$(point_values "$point_dir" raw_agg 44 | stats)"
-  sd_stats="$(point_values "$point_dir" verifier 38 | stats)"
-  so_stats="$(point_values "$point_dir" verifier 20 | stats)"
-  rd_stats="$(point_values "$point_dir" raw_agg 38 | stats)"
-  ro_stats="$(point_values "$point_dir" raw_agg 20 | stats)"
-  sb_stats="$(point_values "$point_dir" prover 26 | stats)"
-  rb_stats="$(point_values "$point_dir" raw_agg 26 | stats)"
-  # Peak RSS comes from the kernel's ru_maxrss (runs.csv column 30) when every
-  # run of every role has that reading, and otherwise from the processes' own
-  # VmHWM (column 29) for all four roles, so one point never mixes sources. The
+  setup_stats="$(point_values "$point_dir" prover setup_ms | stats)"
+  prove_stats="$(point_values "$point_dir" prover prove_med_ms | stats)"
+  sv_stats="$(point_values "$point_dir" verifier decode_verify_med_ms | stats)"
+  rv_stats="$(point_values "$point_dir" raw_agg decode_verify_med_ms | stats)"
+  sd_stats="$(point_values "$point_dir" verifier decode_med_ms | stats)"
+  so_stats="$(point_values "$point_dir" verifier verify_med_ms | stats)"
+  rd_stats="$(point_values "$point_dir" raw_agg decode_med_ms | stats)"
+  ro_stats="$(point_values "$point_dir" raw_agg verify_med_ms | stats)"
+  sb_stats="$(point_values "$point_dir" prover artifact_med_bytes | stats)"
+  rb_stats="$(point_values "$point_dir" raw_agg artifact_med_bytes | stats)"
+  # Peak RSS comes from the kernel's ru_maxrss (runs.csv kernel_maxrss_mib) when
+  # every run of every role has that reading, and otherwise from the processes'
+  # own VmHWM (peak_rss_mib) for all four roles, so one point never mixes sources. The
   # source is recorded: without /usr/bin/time the kernel column is empty, and an
   # empty series must not be published as a peak of 0.
   expected_observations=$((RUNS * SWEEP_REPEATS))
-  peak_column=30; peak_source=kernel
+  peak_column=kernel_maxrss_mib; peak_source=kernel
   for role in prover verifier raw_agg mldsa_raw_agg; do
-    if [ "$(point_values "$point_dir" "$role" 30 | awk 'END { print NR + 0 }')" -ne "$expected_observations" ]; then
-      peak_column=29; peak_source=vmhwm
+    if [ "$(point_values "$point_dir" "$role" kernel_maxrss_mib | awk 'END { print NR + 0 }')" -ne "$expected_observations" ]; then
+      peak_column=peak_rss_mib; peak_source=vmhwm
     fi
   done
   pr_stats="$(point_values "$point_dir" prover "$peak_column" | stats)"
   sr_stats="$(point_values "$point_dir" verifier "$peak_column" | stats)"
   rr_stats="$(point_values "$point_dir" raw_agg "$peak_column" | stats)"
-  # Largest RSS sampled after each honest update (column 28): unlike a peak, it
+  # Largest RSS sampled after each honest update (rss_max_mib): unlike a peak, it
   # excludes whatever the process does after its measured loop.
-  pw_stats="$(point_values "$point_dir" prover 28 | stats)"
-  sw_stats="$(point_values "$point_dir" verifier 28 | stats)"
-  rw_stats="$(point_values "$point_dir" raw_agg 28 | stats)"
-  mw_stats="$(point_values "$point_dir" mldsa_raw_agg 28 | stats)"
-  md_stats="$(point_values "$point_dir" mldsa_raw_agg 38 | stats)"
-  mv_stats="$(point_values "$point_dir" mldsa_raw_agg 20 | stats)"
-  mt_stats="$(point_values "$point_dir" mldsa_raw_agg 44 | stats)"
-  mb_stats="$(point_values "$point_dir" mldsa_raw_agg 26 | stats)"
+  pw_stats="$(point_values "$point_dir" prover rss_max_mib | stats)"
+  sw_stats="$(point_values "$point_dir" verifier rss_max_mib | stats)"
+  rw_stats="$(point_values "$point_dir" raw_agg rss_max_mib | stats)"
+  mw_stats="$(point_values "$point_dir" mldsa_raw_agg rss_max_mib | stats)"
+  md_stats="$(point_values "$point_dir" mldsa_raw_agg decode_med_ms | stats)"
+  mv_stats="$(point_values "$point_dir" mldsa_raw_agg verify_med_ms | stats)"
+  mt_stats="$(point_values "$point_dir" mldsa_raw_agg decode_verify_med_ms | stats)"
+  mb_stats="$(point_values "$point_dir" mldsa_raw_agg artifact_med_bytes | stats)"
   mr_stats="$(point_values "$point_dir" mldsa_raw_agg "$peak_column" | stats)"
   delta_stats="$(paired_values "$point_dir" delta | stats)"
   speed_stats="$(paired_values "$point_dir" speedup | stats)"
@@ -1110,7 +1155,8 @@ ratio_values() { # point_dir target numerator_column denominator_column
   local file
   for file in "$1"/session-*/benchmark/runs.csv; do
     [ -f "$file" ] || continue
-    awk -F, -v t="$2" -v a="$3" -v b="$4" 'NR>1 && $1==t && $a!="" && $b+0>0 { printf "%.6f\n", $a / $b }' "$file"
+    awk -F, -v t="$2" -v a="$3" -v b="$4" -v names="$3 $4" "$CSV_COLUMNS"'
+      $1==t && $(col[a])!="" && $(col[b])+0>0 { printf "%.6f\n", $(col[a]) / $(col[b]) }' "$file" || return 1
   done
 }
 cost_row() { # n t point_dir role quantity clock per_run_statistic  then the values on stdin
@@ -1124,30 +1170,27 @@ cost_row() { # n t point_dir role quantity clock per_run_statistic  then the val
   printf '%d,%d,%s,%s,%s,%s,%s,ms,%s\n' "$1" "$2" "$WORKLOAD_LIST" "$4" "$5" "$6" "$7" \
     "$(awk -v OFS=, '{ $1 = $1; for (i = 1; i <= NF; i++) if ($i == "NA") $i = ""; print }' <<<"$st")" >> "$COSTS_CSV"
 }
-# runs.csv columns: 4 setup, 7 n_items, 14/15 prove median/mean, 44/45
-# decode+verify median/mean, 68/69 prove CPU median/total, 70/71 decode+verify
-# CPU median/total, 72 setup CPU, 73/74 ready elapsed/CPU.
 for n in "${SELECTED_SIZES[@]}"; do
   t="$(threshold_for "$n")"
   point_dir="$OUTDIR/N$(printf '%04d' "$n")-t$(printf '%04d' "$t")"
   [ "$(sed -n '1p' "$point_dir/status.txt" 2>/dev/null)" = complete ] || continue
-  point_values "$point_dir" prover 14 | cost_row "$n" "$t" "$point_dir" prover per_update elapsed median
-  point_values "$point_dir" prover 15 | cost_row "$n" "$t" "$point_dir" prover per_update elapsed mean
-  point_values "$point_dir" prover 68 | cost_row "$n" "$t" "$point_dir" prover per_update cpu median
-  ratio_values "$point_dir" prover 69 7 | cost_row "$n" "$t" "$point_dir" prover per_update cpu mean
-  point_values "$point_dir" prover 4 | cost_row "$n" "$t" "$point_dir" prover setup elapsed value
-  point_values "$point_dir" prover 72 | cost_row "$n" "$t" "$point_dir" prover setup cpu value
+  point_values "$point_dir" prover prove_med_ms | cost_row "$n" "$t" "$point_dir" prover per_update elapsed median
+  point_values "$point_dir" prover prove_mean_ms | cost_row "$n" "$t" "$point_dir" prover per_update elapsed mean
+  point_values "$point_dir" prover prove_cpu_med_ms | cost_row "$n" "$t" "$point_dir" prover per_update cpu median
+  ratio_values "$point_dir" prover prove_cpu_total_ms n_items | cost_row "$n" "$t" "$point_dir" prover per_update cpu mean
+  point_values "$point_dir" prover setup_ms | cost_row "$n" "$t" "$point_dir" prover setup elapsed value
+  point_values "$point_dir" prover setup_cpu_ms | cost_row "$n" "$t" "$point_dir" prover setup cpu value
   for pair in verifier:snark_verifier raw_agg:xmss_raw_verifier mldsa_raw_agg:mldsa_raw_verifier; do
     target="${pair%%:*}"; role="${pair#*:}"
-    point_values "$point_dir" "$target" 44 | cost_row "$n" "$t" "$point_dir" "$role" per_update elapsed median
-    point_values "$point_dir" "$target" 45 | cost_row "$n" "$t" "$point_dir" "$role" per_update elapsed mean
-    point_values "$point_dir" "$target" 70 | cost_row "$n" "$t" "$point_dir" "$role" per_update cpu median
-    ratio_values "$point_dir" "$target" 71 7 | cost_row "$n" "$t" "$point_dir" "$role" per_update cpu mean
-    point_values "$point_dir" "$target" 73 | cost_row "$n" "$t" "$point_dir" "$role" ready elapsed value
-    point_values "$point_dir" "$target" 74 | cost_row "$n" "$t" "$point_dir" "$role" ready cpu value
+    point_values "$point_dir" "$target" decode_verify_med_ms | cost_row "$n" "$t" "$point_dir" "$role" per_update elapsed median
+    point_values "$point_dir" "$target" decode_verify_mean_ms | cost_row "$n" "$t" "$point_dir" "$role" per_update elapsed mean
+    point_values "$point_dir" "$target" decode_verify_cpu_med_ms | cost_row "$n" "$t" "$point_dir" "$role" per_update cpu median
+    ratio_values "$point_dir" "$target" decode_verify_cpu_total_ms n_items | cost_row "$n" "$t" "$point_dir" "$role" per_update cpu mean
+    point_values "$point_dir" "$target" ready_ms | cost_row "$n" "$t" "$point_dir" "$role" ready elapsed value
+    point_values "$point_dir" "$target" ready_cpu_ms | cost_row "$n" "$t" "$point_dir" "$role" ready cpu value
   done
-  point_values "$point_dir" verifier 4 | cost_row "$n" "$t" "$point_dir" snark_verifier setup elapsed value
-  point_values "$point_dir" verifier 72 | cost_row "$n" "$t" "$point_dir" snark_verifier setup cpu value
+  point_values "$point_dir" verifier setup_ms | cost_row "$n" "$t" "$point_dir" snark_verifier setup elapsed value
+  point_values "$point_dir" verifier setup_cpu_ms | cost_row "$n" "$t" "$point_dir" snark_verifier setup cpu value
 done
 
 # ---------------------------------------------------------- comparisons ----
@@ -1168,10 +1211,10 @@ pair_values() { # point_dir a_target b_target column prove_column mode
   local file
   for file in "$1"/session-*/benchmark/runs.csv; do
     [ -f "$file" ] || continue
-    awk -F, -v ta="$2" -v tb="$3" -v c="$4" -v pc="$5" -v mode="$6" '
-      NR>1 && $1=="prover" { p[$2]=$pc }
-      NR>1 && $1==ta { a[$2]=$c }
-      NR>1 && $1==tb { b[$2]=$c }
+    awk -F, -v ta="$2" -v tb="$3" -v c="$4" -v pc="$5" -v mode="$6" -v names="$4 $5" "$CSV_COLUMNS"'
+      $1=="prover" { p[$2]=$(col[pc]) }
+      $1==ta { a[$2]=$(col[c]) }
+      $1==tb { b[$2]=$(col[c]) }
       END { for (i in a) if ((i in b) && a[i] != "" && b[i] != "") {
         d = a[i] - b[i]
         if (mode == "delta") printf "%.6f\n", d
@@ -1181,7 +1224,7 @@ pair_values() { # point_dir a_target b_target column prove_column mode
           x = p[i] / d; ceiling = int(x); if (ceiling < x) ceiling++
           print ceiling
         }
-      }}' "$file"
+      }}' "$file" || return 1
   done
 }
 role_name() { case "$1" in verifier) echo snark ;; raw_agg) echo xmss_raw ;; mldsa_raw_agg) echo mldsa_raw ;; esac; }
@@ -1192,7 +1235,11 @@ for n in "${SELECTED_SIZES[@]}"; do
   for comparison in raw_agg:verifier mldsa_raw_agg:verifier raw_agg:mldsa_raw_agg; do
     ta="${comparison%%:*}"; tb="${comparison#*:}"
     for clock in elapsed cpu; do
-      if [ "$clock" = elapsed ]; then column=44; prove_column=14; else column=70; prove_column=68; fi
+      if [ "$clock" = elapsed ]; then
+        column=decode_verify_med_ms; prove_column=prove_med_ms
+      else
+        column=decode_verify_cpu_med_ms; prove_column=prove_cpu_med_ms
+      fi
       d_stats="$(pair_values "$point_dir" "$ta" "$tb" "$column" "$prove_column" delta | stats)"
       r_stats="$(pair_values "$point_dir" "$ta" "$tb" "$column" "$prove_column" ratio | stats)"
       pairs="$(awk '{print $1}' <<<"$d_stats")"
@@ -1209,6 +1256,10 @@ for n in "${SELECTED_SIZES[@]}"; do
         d_high="$(awk -v m="$d_mean" -v c="$d_ci" 'BEGIN{printf "%.6f",m+c}')"
         sign="$(awk -v lo="$d_low" -v hi="$d_high" 'BEGIN{print (lo>0)?"a_slower":(hi<0)?"b_slower":"not_confirmed"}')"
       fi
+      # Assigned rather than substituted into printf's arguments, where a failed
+      # lookup would print an empty cell instead of stopping the report.
+      a_median="$(point_values "$point_dir" "$ta" "$column" | stats | awk '{print $4}')"
+      b_median="$(point_values "$point_dir" "$tb" "$column" | stats | awk '{print $4}')"
       prove_median=""; be=""; be_q1=""; be_q3=""
       if [ "$tb" = verifier ]; then
         prove_median="$(point_values "$point_dir" prover "$prove_column" | stats | awk '{print $4}')"
@@ -1219,8 +1270,7 @@ for n in "${SELECTED_SIZES[@]}"; do
       fi
       printf '%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$n" "$t" "$WORKLOAD_LIST" \
         "$(role_name "$ta")" "$(role_name "$tb")" "$clock" "$pairs" \
-        "$(point_values "$point_dir" "$ta" "$column" | stats | awk '{print $4}')" \
-        "$(point_values "$point_dir" "$tb" "$column" | stats | awk '{print $4}')" \
+        "$a_median" "$b_median" \
         "$d_mean" "$d_low" "$d_high" "$sign" \
         "$(awk '{print $4}' <<<"$r_stats")" "$(awk '{print $3}' <<<"$r_stats")" "$(awk '{print $5}' <<<"$r_stats")" \
         "$nonpositive" "$prove_median" "$be" "$be_q1" "$be_q3" >> "$COMPARISONS_CSV"
@@ -1478,16 +1528,29 @@ fi
   echo "Sweep design: $SWEEP_DESIGN."
 } | tee "$REPORT"
 
+# ---------------------------------------------------------------- publish ----
+# Every aggregate exists in the stage. Unbind the previous set first, by moving
+# its manifest into the stage where the new one overwrites it: until the new
+# aggregates.sha256 is in place a reader finds none and refuses, instead of
+# pairing the old manifest with files already replaced. Each move and the final
+# manifest are renames within OUTDIR, so no reader sees a truncated file bound
+# as complete. tools/plot_benchmarks.py and tools/analyze_scaling.py check it.
+if [ -e "$OUTDIR/aggregates.sha256" ]; then
+  mv -f -- "$OUTDIR/aggregates.sha256" "$AGGREGATE_STAGE/aggregates.sha256"
+fi
+for name in "${AGGREGATES[@]}"; do
+  mv -f -- "$AGGREGATE_STAGE/$name" "$OUTDIR/$name"
+done
+(cd "$OUTDIR" && sha256sum -- "${AGGREGATES[@]}") > "$AGGREGATE_STAGE/aggregates.sha256"
+mv -f -- "$AGGREGATE_STAGE/aggregates.sha256" "$OUTDIR/aggregates.sha256"
+rmdir -- "$AGGREGATE_STAGE"
+
 echo
 echo "written:"
 echo "  $DECISION_FILE"
-echo "  $SIGNER_CSV"
-echo "  $MANIFEST"
-echo "  $SCALING_CSV"
-echo "  $COSTS_CSV"
-echo "  $COMPARISONS_CSV"
-echo "  $ALL_RUNS_CSV"
-echo "  $REPORT"
+for name in "${AGGREGATES[@]}" aggregates.sha256; do
+  echo "  $OUTDIR/$name"
+done
 
 trap - INT TERM EXIT
 exit "$OVERALL_STATUS"

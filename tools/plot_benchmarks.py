@@ -5,7 +5,8 @@ No third-party packages are required. The input directory may contain either a
 single fixed-committee benchmark (summary.csv) or a scaling campaign
 (scaling.csv, manifest.csv and signer.csv). A fixed benchmark is plotted only
 when its status.txt says `complete` and outputs.sha256 still matches every file
-it lists. Plotting never changes source CSVs.
+it lists; a scaling campaign, complete or partial, only when aggregates.sha256
+still matches. Plotting never changes source CSVs.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import csv
 import hashlib
 import math
 import sys
+import tempfile
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -115,16 +117,26 @@ def dot_plot(
     path: Path, title: str, subtitle: str, unit: str,
     points: list[tuple[str, float, float, float, int, str]],
 ) -> None:
-    """Horizontal logarithmic dot plot; quartile whiskers are between-run only."""
+    """Horizontal logarithmic dot plot; quartile whiskers are between-run only.
+
+    A measured 0 (a phase below the binaries' 0.001 ms resolution) has no
+    position on a logarithmic axis. It is drawn at the axis's left edge and
+    marked as such — a hollow dot, a dashed whisker and a note — rather than
+    dropped from the figure or allowed to stop every other figure.
+    """
     if not points:
         empty_plot(path, title)
         return
-    values = [x for _, median, q1, q3, _, _ in points for x in (median, q1, q3)]
-    lower, upper = decade_bounds(values)
-    width, height = 1110, 175 + 52 * len(points)
+    positive = [x for _, median, q1, q3, _, _ in points for x in (median, q1, q3) if x > 0]
+    lower, upper = decade_bounds(positive) if positive else (1.0, 10.0)
+    zeros = any(q1 <= 0 for _, _, q1, _, _, _ in points)
+    foot = 20 if zeros else 0
+    width, height = 1110, 175 + 52 * len(points) + foot
     left, right = 350, 880
 
     def x_pos(number: float) -> float:
+        if number <= 0:
+            return left
         return left + (math.log10(number) - math.log10(lower)) / (
             math.log10(upper) - math.log10(lower)
         ) * (right - left)
@@ -135,18 +147,25 @@ def dot_plot(
     while 10 ** power <= upper:
         tick = 10 ** power
         x = x_pos(tick)
-        out.append(f'<line x1="{x:.1f}" y1="83" x2="{x:.1f}" y2="{height-57}" class="grid"/>')
-        out.append(svg_text(x, height - 36, shown(tick, unit), 12, text_anchor="middle"))
+        out.append(f'<line x1="{x:.1f}" y1="83" x2="{x:.1f}" y2="{height-57-foot}" class="grid"/>')
+        out.append(svg_text(x, height - 36 - foot, shown(tick, unit), 12, text_anchor="middle"))
         power += 1
     for index, (label, median, q1, q3, n, color) in enumerate(points):
         y = 105 + index * 52
         out.append(svg_text(28, y + 5, label, 15))
-        if n > 1:
+        if n > 1 and q3 > 0:
+            dashed = ' stroke-dasharray="4 5"' if q1 <= 0 else ""
             out.append(f'<line x1="{x_pos(q1):.1f}" y1="{y}" x2="{x_pos(q3):.1f}" '
-                       f'y2="{y}" stroke="{color}" stroke-width="5" stroke-linecap="round"/>')
-        out.append(f'<circle cx="{x_pos(median):.1f}" cy="{y}" r="7" fill="{color}"/>')
+                       f'y2="{y}" stroke="{color}" stroke-width="5" stroke-linecap="round"{dashed}/>')
+        if median > 0:
+            out.append(f'<circle cx="{x_pos(median):.1f}" cy="{y}" r="7" fill="{color}"/>')
+        else:
+            out.append(f'<circle cx="{left}" cy="{y}" r="6" fill="#ffffff" stroke="{color}" stroke-width="2.5"/>')
         out.append(svg_text(905, y + 5, f'{shown(median, unit)} {unit}  (n={n})', 14))
-    out.append(svg_text(left, height - 13, "Logarithmic axis · dots: medians · lines: Q1–Q3 across runs", 12, class_="muted"))
+    out.append(svg_text(left, height - 13 - foot, "Logarithmic axis · dots: medians · lines: Q1–Q3 across runs", 12, class_="muted"))
+    if zeros:
+        out.append(svg_text(left, height - 13, "Hollow dot / dashed line: a value of 0, which has no logarithmic "
+                            "position; drawn at the left edge", 12, class_="muted"))
     write_svg(path, width, height, out)
 
 
@@ -237,6 +256,14 @@ def require_complete(folder: Path) -> None:
     manifest = folder / "outputs.sha256"
     if not manifest.is_file():
         raise ValueError(f"{folder}: complete campaign without outputs.sha256")
+    listed = checked_manifest(folder, manifest)
+    for required in ("summary.csv", "summary.txt", "runs.csv", "samples.csv"):
+        if required not in listed:
+            raise ValueError(f"{manifest}: {required} is not covered")
+
+
+def checked_manifest(folder: Path, manifest: Path) -> set[str]:
+    """The names a sha256sum manifest lists, after checking every one of them."""
     listed = set()
     for line in manifest.read_text(encoding="utf-8").splitlines():
         digest, separator, name = line.partition("  ")
@@ -244,11 +271,29 @@ def require_complete(folder: Path) -> None:
             raise ValueError(f"{manifest}: malformed line {line!r}")
         path = folder / name
         if not path.is_file() or fingerprint(path) != digest:
-            raise ValueError(f"{folder}: {name} does not match outputs.sha256; refusing to plot")
+            raise ValueError(f"{folder}: {name} does not match {manifest.name}; refusing to plot")
         listed.add(name)
-    for required in ("summary.csv", "summary.txt", "runs.csv", "samples.csv"):
-        if required not in listed:
-            raise ValueError(f"{manifest}: {required} is not covered")
+    return listed
+
+
+def require_published_aggregates(folder: Path) -> None:
+    """Refuse scaling aggregates that aggregates.sha256 does not bind.
+
+    committee-scaling-benchmark.sh rebuilds scaling.csv, manifest.csv,
+    signer.csv and its other campaign-level files on every invocation, moves
+    them into place together and only then writes aggregates.sha256. Without it
+    an invocation stopped while publishing, and the files may be a mixture or
+    truncated; a mismatch means a file changed afterwards. A partial campaign
+    is still plottable: its aggregates describe the points that completed.
+    """
+    manifest = folder / "aggregates.sha256"
+    if not manifest.is_file():
+        raise ValueError(f"{folder}: no aggregates.sha256; the scaling files were not "
+                         "published completely, rerun the campaign with RESUME=1")
+    listed = checked_manifest(folder, manifest)
+    for name in ("scaling.csv", "manifest.csv", "signer.csv"):
+        if name not in listed and (name == "scaling.csv" or (folder / name).exists()):
+            raise ValueError(f"{manifest}: {name} is not covered")
 
 
 def fixed_metadata(folder: Path) -> dict[str, str]:
@@ -286,11 +331,15 @@ def fixed_campaign(folder: Path, output: Path) -> list[Path]:
             row = indexed.get((target, metric))
             if row is None:
                 continue
-            median = value(row, "median", positive=True)
-            q1 = value(row, "q1", positive=True)
-            q3 = value(row, "q3", positive=True)
+            # Zero is a measurement (below the 0.001 ms resolution) and is drawn
+            # as one; a negative duration, size or RSS is not, and stops here.
+            median = value(row, "median")
+            q1 = value(row, "q1")
+            q3 = value(row, "q3")
             if median is None or q1 is None or q3 is None:
                 continue
+            if min(median, q1, q3) < 0:
+                raise ValueError(f"{source}: negative value for {target} {metric}")
             points.append((label, median, q1, q3, int(row["n"]), COLORS[target]))
         destination = output / filename
         labelled_title = f"{title} · {metadata['committee']}" if metadata.get("committee") else title
@@ -544,10 +593,21 @@ def main() -> int:
     if not scaling and not fixed:
         parser.error(f"no scaling.csv or summary.csv in {folder}")
     try:
-        if not scaling:
+        if scaling:
+            require_published_aggregates(folder)
+        else:
             require_complete(folder)
-        output.mkdir(parents=True, exist_ok=True)
-        figures = scaling_campaign(folder, output) if scaling else fixed_campaign(folder, output)
+        # Render beside the output and move the files only once every figure is
+        # written: an invalid value found halfway must not leave new figures
+        # mixed with the previous ones. Same filesystem, so each move is a rename.
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output.parent, prefix=".plots-") as scratch:
+            staged = Path(scratch)
+            figures = scaling_campaign(folder, staged) if scaling else fixed_campaign(folder, staged)
+            output.mkdir(exist_ok=True)
+            for item in staged.iterdir():
+                item.replace(output / item.name)
+        figures = [output / figure.name for figure in figures]
     except (OSError, ValueError, OverflowError) as exc:
         print(f"plot_benchmarks: {exc}", file=sys.stderr)
         return 1

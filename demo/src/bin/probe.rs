@@ -30,7 +30,7 @@ use drot_demo::wire::{self, Failure, Proposal, SignatureReply};
 use ssz::{Decode as _, Encode as _};
 
 fn main() {
-    let mode = Mode::from_env(); // snark proof or raw aggretation 
+    let mode = Mode::from_env(); // snark proof or raw aggregation
     let mut member: usize = 0;
     let mut label = String::from("probe");
     let mut version: Option<u32> = None;

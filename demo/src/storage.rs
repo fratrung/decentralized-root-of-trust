@@ -68,7 +68,11 @@ pub fn member_key_file(index: usize) -> PathBuf {
 /// Published objects have variable length, so this uses replacement rather than
 /// the durable counter's fixed-size, alternating-record journal.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    // `<name>.tmp`, not `with_extension`: replacing the extension would give
+    // `anchor.bin` and `anchor.ssz` one shared temporary file.
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;

@@ -35,7 +35,7 @@ typenum = "1"
 # do not use it.
 libc = "0.2"
 
-# Not used by the library: the local scratch binaries (`src/bin/my_test*.rs`,
+# Not used by the library: the local scratch examples (`examples/my_test*.rs`,
 # gitignored) build JCS-canonical JSON credentials with them.
 serde_json = "1.0"
 serde_jcs  = "0.2"

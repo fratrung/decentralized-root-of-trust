@@ -284,7 +284,10 @@ TARGET_CPU_IDS="$(awk -v list="$TARGET_AFFINITY" 'BEGIN {
 GOVERNORS="$({
   for cpu in $TARGET_CPU_IDS; do
     path="/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor"
-    [ -r "$path" ] && cat "$path"
+    # `if`, not `[ -r ] && cat`: as the loop's last command, an unreadable
+    # governor would give the loop status 1, which pipefail carries to this
+    # assignment and set -e turns into a silent exit before the n/a fallback.
+    if [ -r "$path" ]; then cat "$path"; fi
   done
 } | sort -u | paste -sd, -)"
 [ -n "$GOVERNORS" ] || GOVERNORS=n/a

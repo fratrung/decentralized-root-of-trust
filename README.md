@@ -624,8 +624,11 @@ signature sizes, signing phases and peak process RSS. The table includes every
 `summary.csv` metric with run count and between-run quartiles; a single run
 receives no uncertainty estimate. The plotter refuses a fixed benchmark whose
 `status.txt` is not `complete` or whose files no longer match
-`outputs.sha256`. Existing results can be plotted without rerunning the
-benchmark:
+`outputs.sha256`. A value of 0 (a phase below the 0.001 ms resolution) has no
+place on the logarithmic axis: it is drawn at the axis's left edge as a hollow
+dot or a dashed whisker, with a note. Figures are written to a temporary
+directory and moved into `plots/` only when all of them succeed. Existing
+results can be plotted without rerunning the benchmark:
 
 ```sh
 python3 tools/plot_benchmarks.py bench-<timestamp>
@@ -758,6 +761,11 @@ The top-level output contains:
   process start time, for analyses by block, by time or across sweeps;
 - `report.txt` — the tables above in readable form and the first observed
   points;
+- `aggregates.sha256` — binds `signer.csv`, `manifest.csv` and the five files
+  above. They are rebuilt by every invocation and moved into place together, and
+  this file is written last: without it the last invocation stopped while
+  publishing, and the plotting and analysis tools refuse the directory until a
+  `RESUME=1` run rebuilds the set;
 - `pressure.csv` — paging, memory-stall time and OOM kills during every guarded
   stage; the disk reserve is checked on every filesystem the campaign uses;
 - `Nxxxx-tyyyy/session-XX/benchmark/` — the complete `benchmark.sh` output for

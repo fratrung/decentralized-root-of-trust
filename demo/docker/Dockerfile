@@ -32,8 +32,8 @@ COPY --from=builder /src/demo/target/release/mldsa_holder    /usr/local/bin/mlds
 # has to be set here as well.
 ENV RUST_MIN_STACK=536870912
 
-# Line-buffered output, so `docker compose logs -f` shows a round as it happens
-# rather than when the pipe fills.
+# A panic in any role prints its backtrace to `docker compose logs`. Rust's
+# stdout is line-buffered even into a pipe, so the logs need no setting here.
 ENV RUST_BACKTRACE=1
 
 CMD ["signer"]

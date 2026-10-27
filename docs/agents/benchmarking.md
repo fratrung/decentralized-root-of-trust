@@ -392,7 +392,9 @@ one, and only the damaged one. `status-history.txt` keeps every outcome and
 `memory-decision.txt` appends each resume's block instead of replacing it.
 A retried signer or session benchmark moves its previous attempt to
 `benchmark.attempt-*` beside it, because `benchmark.sh` needs an empty
-directory; the aggregation globs never read those.
+directory; a retried session likewise moves its frozen binaries to
+`bin.attempt-*`, so the record of what the earlier attempt ran is kept rather
+than deleted. The aggregation globs never read those.
 
 A campaign has one list size (`LIST_ENTRIES`, in the resume fingerprint and
 in `scaling.csv` as `list_entries`): a sweep varies the committee, and list
@@ -403,7 +405,16 @@ typical update, `mean` for what a total is made of), with quartiles and the CI
 of the mean. `comparisons.csv`: the three verifiers two at a time on both
 clocks, with the paired delta, its CI, the confirmed sign and, against the
 SNARK verifier, the descriptive break-even. `all-runs.csv`: every run with its
-sweep, direction, position and start time. The report prints them as tables and
+sweep, direction, position and start time. Every invocation rebuilds these
+campaign-level files (`signer.csv`, `manifest.csv`, `scaling.csv`, the three
+tidy files and `report.txt`) in `OUTDIR/.aggregates.partial`, moves them into
+place together and only then writes `aggregates.sha256` over them, after
+removing the previous one. A stop while publishing therefore leaves no
+`aggregates.sha256`, and `tools/plot_benchmarks.py` and
+`tools/analyze_scaling.py` refuse a scaling directory without a matching one;
+`RESUME=1` rebuilds the set from the validated sessions without measuring
+again. Columns of `benchmark.sh`'s CSVs are read by header name, never by
+position. The report prints them as tables and
 chooses no threshold, unit or deployment scenario: it states measured
 quantities and the model `P + Sp/U + M(S + Sv/K) < M R` they feed.
 
